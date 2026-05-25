@@ -35,9 +35,15 @@ jobs:
         if: matrix.target.name == 'linux-x86_64'
         run: |
           cd /tmp/artifacts/${{ matrix.target.name }}
-          # Zip portable folder contents as "portable" distribution
+          chmod +x portable/poe2smoother portable/poe2smoother-gui
+          if [ -f poe2smoother-linux-x86_64 ]; then
+            chmod +x poe2smoother-linux-x86_64
+            tar --owner=0 --group=0 --numeric-owner -czf poe2smoother-linux-x86_64.tar.gz poe2smoother-linux-x86_64
+            rm -f poe2smoother-linux-x86_64
+          fi
+          # Tar portable folder contents so Linux executable bits survive artifact upload and download.
           pushd portable
-          zip ../poe2smoother-portable-linux-x86_64.zip poe2smoother poe2smoother-gui
+          tar --owner=0 --group=0 --numeric-owner -czf ../poe2smoother-portable-linux-x86_64.tar.gz poe2smoother poe2smoother-gui
           popd
           # Remove subdir, keep only release files at top level
           rm -rf portable
