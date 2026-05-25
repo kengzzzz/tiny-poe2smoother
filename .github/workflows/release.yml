@@ -77,6 +77,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: /tmp/release-artifacts
+          pattern: poe2smoother-*
           merge-multiple: true
 
       - name: List release files
