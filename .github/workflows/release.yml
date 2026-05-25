@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        target:
+          - name: linux-x86_64
+            docker-target: x86_64-unknown-linux-gnu
+          - name: windows-x86_64
+            docker-target: x86_64-pc-windows-gnu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build ${{ matrix.target.name }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          build-args: TARGET=${{ matrix.target.docker-target }}
+          outputs: type=local,dest=/tmp/artifacts/${{ matrix.target.name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Prepare Linux artifacts
+        if: matrix.target.name == 'linux-x86_64'
+        run: |
+          cd /tmp/artifacts/${{ matrix.target.name }}
+          # Zip portable folder contents as "portable" distribution
+          pushd portable
+          zip ../poe2smoother-portable-linux-x86_64.zip poe2smoother poe2smoother-gui
+          popd
+          # Remove subdir, keep only release files at top level
+          rm -rf portable
+
+      - name: Prepare Windows artifacts
+        if: matrix.target.name == 'windows-x86_64'
+        run: |
+          cd /tmp/artifacts/${{ matrix.target.name }}
+          # Zip portable folder contents as "portable" distribution
+          pushd portable
+          zip ../poe2smoother-portable-windows-x86_64.zip \
+              poe2smoother.exe \
+              poe2smoother-gui.exe \
+              libstdc++-6.dll \
+              libgcc_s_seh-1.dll \
+              libwinpthread-1.dll
+          popd
+          # Remove subdir, keep only release files at top level
+          rm -rf portable
+
+      - name: List artifacts
+        run: ls -laR /tmp/artifacts/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: poe2smoother-${{ matrix.target.name }}
+          path: /tmp/artifacts/${{ matrix.target.name }}/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/release-artifacts
+          merge-multiple: true
+
+      - name: List release files
+        run: ls -la /tmp/release-artifacts/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: /tmp/release-artifacts/*
+          generate_release_notes: true

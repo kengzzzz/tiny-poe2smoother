@@ -1,0 +1,5 @@
+target/
+.git/
+.agents/
+.codex/
+*.md
