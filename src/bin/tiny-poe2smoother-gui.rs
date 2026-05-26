@@ -1,4 +1,7 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
@@ -7,7 +10,9 @@ use tiny_poe2smoother::app::{
     apply_patches, load_status, restore_backup, AppStatus, ApplyReport, PatchRequest, RestoreReport,
 };
 use tiny_poe2smoother::install::{display_path, is_game_running};
-use tiny_poe2smoother::patches::{all_patches, PatchId};
+use tiny_poe2smoother::patches::{all_patches, parse_patch, PatchId};
+
+const PREFS_KEY: &str = "tiny-poe2smoother.gui.v1";
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -19,7 +24,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| {
             configure_theme(&cc.egui_ctx);
-            Ok(Box::new(GuiApp::default()))
+            Ok(Box::new(GuiApp::new(cc.storage)))
         }),
     )
 }
@@ -104,6 +109,13 @@ struct GuiApp {
     initialized: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GuiPrefs {
+    game_dir_input: String,
+    selected_patches: Vec<String>,
+    zoom: f64,
+}
+
 enum TaskResult {
     Status(Result<AppStatus, String>),
     Apply(Result<ApplyReport, String>),
@@ -132,6 +144,10 @@ impl Default for GuiApp {
 }
 
 impl eframe::App for GuiApp {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, PREFS_KEY, &self.prefs());
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if !self.initialized {
             self.initialized = true;
@@ -169,6 +185,54 @@ impl eframe::App for GuiApp {
 }
 
 impl GuiApp {
+    fn new(storage: Option<&dyn eframe::Storage>) -> Self {
+        storage
+            .and_then(|storage| eframe::get_value::<GuiPrefs>(storage, PREFS_KEY))
+            .map(Self::from_prefs)
+            .unwrap_or_default()
+    }
+
+    fn from_prefs(prefs: GuiPrefs) -> Self {
+        let selected_patches = prefs
+            .selected_patches
+            .iter()
+            .filter_map(|patch| parse_patch(patch))
+            .collect::<HashSet<_>>();
+        let selected_patches = if selected_patches.is_empty() {
+            [PatchId::Minimap, PatchId::Fog, PatchId::Rain]
+                .into_iter()
+                .collect()
+        } else {
+            selected_patches
+        };
+        Self {
+            game_dir_input: prefs.game_dir_input,
+            selected_patches,
+            zoom: prefs.zoom.clamp(1.2, 2.4),
+            status: None,
+            message: "Ready.".to_string(),
+            task: None,
+            busy_label: None,
+            confirm_apply: false,
+            confirm_restore: false,
+            show_game_running_dialog: false,
+            initialized: false,
+        }
+    }
+
+    fn prefs(&self) -> GuiPrefs {
+        let selected_patches = all_patches()
+            .iter()
+            .filter(|patch| self.selected_patches.contains(&patch.id))
+            .map(|patch| patch.name.to_string())
+            .collect();
+        GuiPrefs {
+            game_dir_input: self.game_dir_input.clone(),
+            selected_patches,
+            zoom: self.zoom,
+        }
+    }
+
     fn is_busy(&self) -> bool {
         self.task.is_some()
     }
@@ -367,6 +431,11 @@ impl GuiApp {
     fn draw_actions(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.add_space((ui.available_width() - 220.0).max(0.0));
+            let already_patched = self
+                .status
+                .as_ref()
+                .map(|status| status.has_backup)
+                .unwrap_or(false);
             let apply = egui::Button::new(
                 egui::RichText::new("Apply")
                     .color(egui::Color32::from_rgb(255, 255, 255))
@@ -375,7 +444,7 @@ impl GuiApp {
             .fill(egui::Color32::from_rgb(20, 184, 166))
             .corner_radius(6)
             .min_size(egui::vec2(100.0, 36.0));
-            if ui.add(apply).clicked() {
+            if ui.add_enabled(!already_patched, apply).clicked() {
                 match self.patch_request() {
                     Ok(_) => self.confirm_apply = true,
                     Err(err) => self.message = err,
@@ -559,5 +628,27 @@ impl GuiApp {
                 Err(err) => self.message = err,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefs_restore_valid_patch_names_and_ignore_unknown_entries() {
+        let app = GuiApp::from_prefs(GuiPrefs {
+            game_dir_input: r"D:\SteamLibrary\steamapps\common\Path of Exile 2".to_string(),
+            selected_patches: vec!["fog".to_string(), "unknown".to_string()],
+            zoom: 9.0,
+        });
+
+        assert_eq!(
+            app.game_dir_input,
+            r"D:\SteamLibrary\steamapps\common\Path of Exile 2"
+        );
+        assert!(app.selected_patches.contains(&PatchId::Fog));
+        assert_eq!(app.selected_patches.len(), 1);
+        assert_eq!(app.zoom, 2.4);
     }
 }

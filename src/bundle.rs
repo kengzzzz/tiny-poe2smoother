@@ -41,6 +41,20 @@ pub struct BundleFile {
     record_pos: usize,
 }
 
+#[cfg(test)]
+impl BundleFile {
+    pub(crate) fn for_test(bundle_name: &str, size: u32) -> Self {
+        Self {
+            hash: 0,
+            bundle_index: 0,
+            bundle_name: bundle_name.to_string(),
+            offset: 0,
+            size,
+            record_pos: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BundleIndex {
     raw_decompressed: Vec<u8>,
@@ -521,10 +535,16 @@ impl BundleIndex {
         pack_uncompressed_bundle(&self.raw_decompressed)
     }
 
+    pub fn has_bundle_prefix(&self, prefix: &str) -> bool {
+        self.bundles
+            .iter()
+            .any(|bundle| bundle.name.starts_with(prefix))
+    }
+
     pub fn create_custom_bundle(&mut self) -> Result<u32> {
         let mut ordinal = 0usize;
         loop {
-            let name = format!("LibGGPK3/{ordinal}");
+            let name = format!("TinyPoe2Smoother/{ordinal}");
             if !self.bundles.iter().any(|bundle| bundle.name == name) {
                 let bundle_index = u32::try_from(self.bundles.len())?;
                 let mut record = Vec::new();

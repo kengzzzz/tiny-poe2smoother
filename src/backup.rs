@@ -104,7 +104,7 @@ impl BackupStore {
             fs::write(&path, &entry.bytes)
                 .with_context(|| format!("failed to restore {}", path.display()))?;
         }
-        let custom_bundle_dir = game_dir.join("Bundles2/LibGGPK3");
+        let custom_bundle_dir = game_dir.join("Bundles2/TinyPoe2Smoother");
         match fs::remove_dir_all(&custom_bundle_dir) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -176,12 +176,19 @@ mod tests {
             .unwrap();
         fs::create_dir_all(game.join("Bundles2/LibGGPK3")).unwrap();
         fs::write(game.join("Bundles2/LibGGPK3/0.bundle.bin"), b"custom").unwrap();
+        fs::create_dir_all(game.join("Bundles2/TinyPoe2Smoother")).unwrap();
+        fs::write(
+            game.join("Bundles2/TinyPoe2Smoother/0.bundle.bin"),
+            b"custom",
+        )
+        .unwrap();
         fs::write(game.join("Bundles2/_.index.bin"), b"changed").unwrap();
         assert_eq!(store.restore(&game).unwrap(), 1);
         assert_eq!(
             fs::read(game.join("Bundles2/_.index.bin")).unwrap(),
             b"index"
         );
-        assert!(!game.join("Bundles2/LibGGPK3").exists());
+        assert!(game.join("Bundles2/LibGGPK3").exists());
+        assert!(!game.join("Bundles2/TinyPoe2Smoother").exists());
     }
 }

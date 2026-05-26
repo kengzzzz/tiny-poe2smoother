@@ -1,5 +1,5 @@
 use crate::bundle::{slice_file, BundleFile, BundleIndex, BundleStore};
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -120,19 +120,26 @@ pub fn compute_patch_set(
 ) -> Result<PatchSet> {
     crate::timing!("patch_scan_compute");
 
-    // Phase 1: collect all candidate (path, file) pairs
-    let mut candidates: Vec<(String, BundleFile)> = Vec::new();
+    let mut candidates = Vec::new();
     for patch in patches {
-        for path in patch_targets(index, *patch)? {
+        let targets = patch_targets(index, *patch)?;
+        if targets.is_empty() {
+            bail!(
+                "patch '{}' has no matching files in this game version;\n\
+                 verify game files or wait for a tiny-poe2smoother update",
+                patch_label(*patch)
+            );
+        }
+        for path in targets {
             let file = index
                 .file_by_path(&path)
-                .expect("target came from index")
+                .ok_or_else(|| anyhow!("patch target disappeared from index: {path}"))?
                 .clone();
             candidates.push((path, file));
         }
     }
+    let candidates = dedup_candidates(candidates);
 
-    // Phase 2: read all needed bundles (each bundle once, avoiding redundant decompress)
     crate::timing!("bundle_batch_read");
     let bundle_names: Vec<String> = {
         let mut names: Vec<String> = candidates
@@ -145,18 +152,17 @@ pub fn compute_patch_set(
     };
     let bundles = store.read_bundles_batch(&bundle_names)?;
 
-    // Phase 3: read file bytes from cached bundle data, deduplicating by path
     crate::timing!("patch_read_slice");
     let mut file_data: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     for (path, file) in &candidates {
-        if !file_data.contains_key(path) {
-            let bundle_data = bundles.get(&file.bundle_name).expect("bundle loaded above");
-            let bytes = slice_file(bundle_data, file)?;
-            file_data.insert(path.clone(), bytes);
-        }
+        let bundle_data = bundles.get(&file.bundle_name).with_context(|| {
+            format!("bundle loaded but missing from batch: {}", file.bundle_name)
+        })?;
+        let bytes = slice_file(bundle_data, file)
+            .with_context(|| format!("failed to read patch target from bundle: {path}"))?;
+        file_data.insert(path.clone(), bytes);
     }
 
-    // Phase 4: apply transforms sequentially (multiple patches may modify the same file)
     crate::timing!("patch_transform");
     let mut changed: BTreeMap<String, bool> = BTreeMap::new();
     for (path, _) in &candidates {
@@ -165,7 +171,9 @@ pub fn compute_patch_set(
     for patch in patches {
         for (path, _) in &candidates {
             if patch_applies(*patch, path) {
-                let before = file_data.get(path).expect("file loaded");
+                let before = file_data
+                    .get(path)
+                    .ok_or_else(|| anyhow!("patch target bytes missing after read: {path}"))?;
                 let after = transform(*patch, path, before, zoom)?;
                 if &after != before {
                     file_data.insert(path.clone(), after);
@@ -175,12 +183,21 @@ pub fn compute_patch_set(
         }
     }
 
-    // Phase 5: build result from actually-changed files
+    build_patch_set_from_changed(&candidates, &mut file_data, &changed)
+}
+
+fn build_patch_set_from_changed(
+    candidates: &[(String, BundleFile)],
+    file_data: &mut BTreeMap<String, Vec<u8>>,
+    changed: &BTreeMap<String, bool>,
+) -> Result<PatchSet> {
     let mut changes = Vec::new();
     let mut replacements: HashMap<String, Vec<(BundleFile, Vec<u8>)>> = HashMap::new();
-    for (path, file) in &candidates {
+    for (path, file) in candidates {
         if *changed.get(path).unwrap_or(&false) {
-            let bytes = file_data.remove(path).expect("changed file bytes");
+            let bytes = file_data
+                .remove(path)
+                .ok_or_else(|| anyhow!("changed patch target bytes missing: {path}"))?;
             changes.push(PatchChange {
                 path: path.clone(),
                 bundle_name: file.bundle_name.clone(),
@@ -198,6 +215,22 @@ pub fn compute_patch_set(
         changes,
         replacements,
     })
+}
+
+fn dedup_candidates(candidates: Vec<(String, BundleFile)>) -> Vec<(String, BundleFile)> {
+    candidates
+        .into_iter()
+        .collect::<BTreeMap<_, _>>()
+        .into_iter()
+        .collect()
+}
+
+fn patch_label(id: PatchId) -> &'static str {
+    all_patches()
+        .iter()
+        .find(|patch| patch.id == id)
+        .map(|patch| patch.name)
+        .unwrap_or("unknown")
 }
 
 fn patch_targets(index: &mut BundleIndex, patch: PatchId) -> Result<Vec<String>> {
@@ -807,5 +840,49 @@ mod tests {
         let out = strip_client_blocks(input, &keep);
         assert!(out.contains("AnimatedRender"));
         assert!(!out.contains("ParticleEffects"));
+    }
+
+    #[test]
+    fn changed_replacements_are_built_once_per_target_path() {
+        let file = BundleFile::for_test("env.bundle.bin", 6);
+        let candidates = vec![(
+            "metadata/environmentsettings/test.env".to_string(),
+            file.clone(),
+        )];
+        let mut file_data = BTreeMap::from([(
+            "metadata/environmentsettings/test.env".to_string(),
+            b"changed".to_vec(),
+        )]);
+        let changed = BTreeMap::from([("metadata/environmentsettings/test.env".to_string(), true)]);
+
+        let patch_set =
+            build_patch_set_from_changed(&candidates, &mut file_data, &changed).unwrap();
+
+        assert_eq!(patch_set.changes.len(), 1);
+        assert_eq!(
+            patch_set
+                .replacements
+                .get("env.bundle.bin")
+                .map(|entries| entries.len()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn duplicate_patch_candidates_collapse_to_one_target() {
+        let file = BundleFile::for_test("env.bundle.bin", 6);
+        let candidates = dedup_candidates(vec![
+            (
+                "metadata/environmentsettings/test.env".to_string(),
+                file.clone(),
+            ),
+            (
+                "metadata/environmentsettings/test.env".to_string(),
+                file.clone(),
+            ),
+        ]);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, "metadata/environmentsettings/test.env");
     }
 }

@@ -117,6 +117,15 @@ pub fn apply_patches(request: PatchRequest) -> Result<ApplyReport> {
 
     let game_dir = resolve_game_dir(request.game_dir)?;
     let store = BundleStore::new(&game_dir);
+    let backup = BackupStore::default()?;
+    if backup.has_backup() {
+        bail!(
+            "game is already patched;\n\
+             restore before applying a different patch selection\n\
+             Backup: {}",
+            backup.path().display()
+        );
+    }
 
     // Preflight checks
     if !store.index_path.exists() {
@@ -138,13 +147,10 @@ pub fn apply_patches(request: PatchRequest) -> Result<ApplyReport> {
     let patch_set = compute_patch_set(&store, &mut index, &request.patches, request.zoom)?;
 
     if patch_set.changes.is_empty() {
-        let backup = BackupStore::default()?;
-        return Ok(ApplyReport {
-            game_dir,
-            changed_files: 0,
-            touched_paths: Vec::new(),
-            backup_path: backup.path().to_path_buf(),
-        });
+        bail!(
+            "selected patches produced no changes;\n\
+             the game may already be patched or this game version may be unsupported"
+        );
     }
 
     // Verify each patch target exists before proceeding
@@ -161,7 +167,6 @@ pub fn apply_patches(request: PatchRequest) -> Result<ApplyReport> {
 
     let rel_paths = vec![PathBuf::from("Bundles2/_.index.bin")];
 
-    let backup = BackupStore::default()?;
     backup
         .ensure_originals(&game_dir, &rel_paths)
         .with_context(|| {
@@ -175,7 +180,7 @@ pub fn apply_patches(request: PatchRequest) -> Result<ApplyReport> {
         .with_context(|| {
             format!(
                 "failed to write generated bundle to {};\n  restore first if partially applied",
-                store.bundles_dir.join("LibGGPK3").display()
+                store.bundles_dir.join("TinyPoe2Smoother").display()
             )
         })?;
 
@@ -195,6 +200,21 @@ pub fn restore_backup(game_dir: Option<PathBuf>) -> Result<RestoreReport> {
         if backup.count()? == 0 {
             bail!(
                 "backup exists but is empty at {};\n  check file integrity",
+                backup.path().display()
+            );
+        }
+        let store = BundleStore::new(&game_dir);
+        let index = store.open_index().with_context(|| {
+            format!(
+                "failed to read current index before restore: {}",
+                store.index_path.display()
+            )
+        })?;
+        if !index.has_bundle_prefix("TinyPoe2Smoother/") && !index.has_bundle_prefix("LibGGPK3/") {
+            bail!(
+                "current game index does not look patched by tiny-poe2smoother;\n\
+                 refusing to restore a possibly stale backup from {};\n\
+                 verify game files in Steam instead",
                 backup.path().display()
             );
         }

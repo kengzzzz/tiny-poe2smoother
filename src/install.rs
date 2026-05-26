@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use sysinfo::System;
 
@@ -28,8 +29,8 @@ pub fn resolve_game_dir(explicit: Option<PathBuf>) -> Result<PathBuf> {
 
     bail!(
         "could not autodetect Path of Exile 2;\n\
-         pass --game-dir <path> or verify Steam is installed\n\
-         Searched: ~/.steam/steam, ~/.local/share/Steam, ~/.var/app/com.valvesoftware.Steam"
+         use Browse/--game-dir <path>, or verify Steam and its library folders\n\
+         Searched default Steam folders and configured Steam libraries"
     );
 }
 
@@ -88,7 +89,29 @@ fn steam_candidates() -> Vec<PathBuf> {
             out.push(PathBuf::from(program_files).join("Steam"));
         }
     }
+    expand_steam_libraries(out)
+}
+
+fn expand_steam_libraries(roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for root in roots {
+        push_unique(&mut out, &mut seen, root.clone());
+        let libraryfolders = root.join("steamapps").join("libraryfolders.vdf");
+        let Ok(text) = std::fs::read_to_string(&libraryfolders) else {
+            continue;
+        };
+        for library in parse_library_folders(&text) {
+            push_unique(&mut out, &mut seen, library);
+        }
+    }
     out
+}
+
+fn push_unique(out: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, path: PathBuf) {
+    if seen.insert(path.clone()) {
+        out.push(path);
+    }
 }
 
 fn parse_install_dir(manifest: &str) -> Option<String> {
@@ -99,6 +122,33 @@ fn parse_install_dir(manifest: &str) -> Option<String> {
             _ => None,
         }
     })
+}
+
+fn parse_library_folders(vdf: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for line in vdf.lines() {
+        let fields = quoted_fields(line);
+        match fields.as_slice() {
+            [key, value] if key == "path" => {
+                out.push(PathBuf::from(value.replace("\\\\", "\\")));
+            }
+            [key, value] if key.chars().all(|ch| ch.is_ascii_digit()) => {
+                if value.contains(':') || value.contains('/') || value.contains("\\\\") {
+                    out.push(PathBuf::from(value.replace("\\\\", "\\")));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn quoted_fields(line: &str) -> Vec<String> {
+    line.split('"')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_string)
+        .collect()
 }
 
 pub fn display_path(path: &Path) -> String {
@@ -115,6 +165,58 @@ mod tests {
         assert_eq!(
             parse_install_dir(manifest).as_deref(),
             Some("Path of Exile 2")
+        );
+    }
+
+    #[test]
+    fn parses_steam_library_folder_with_app_entry() {
+        let vdf = r#"
+"libraryfolders"
+{
+    "0"
+    {
+        "path"      "C:\\Program Files (x86)\\Steam"
+        "apps"
+        {
+            "123" "1"
+        }
+    }
+    "1"
+    {
+        "path"      "D:\\SteamLibrary"
+        "apps"
+        {
+            "2694490" "123456"
+        }
+    }
+}
+"#;
+
+        assert_eq!(
+            parse_library_folders(vdf),
+            vec![
+                PathBuf::from(r"C:\Program Files (x86)\Steam"),
+                PathBuf::from(r"D:\SteamLibrary")
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_legacy_steam_library_folder_entries() {
+        let vdf = r#"
+"LibraryFolders"
+{
+    "0" "C:\\Program Files (x86)\\Steam"
+    "1" "D:\\SteamLibrary"
+}
+"#;
+
+        assert_eq!(
+            parse_library_folders(vdf),
+            vec![
+                PathBuf::from(r"C:\Program Files (x86)\Steam"),
+                PathBuf::from(r"D:\SteamLibrary")
+            ]
         );
     }
 }
