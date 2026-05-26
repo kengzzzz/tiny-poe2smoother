@@ -1,46 +1,46 @@
 # tiny-poe2smoother
 
-CLI and GUI tool that patches Path of Exile 2 bundle files to disable visual effects for improved performance.
+GUI tool that patches Path of Exile 2 bundle files to disable visual effects for improved performance.
 
 ## Features
 
 - 12 optional patches: camera zoom, fog, rain, clouds, shadows, lighting, delirium effects, particles, minimap reveal, atlas fog, environment particles, client effect blocks
 - Camera zoom adjustment (1.2x -- 2.4x)
 - Safe modification via Oodle-compressed bundle patching with atomic writes
-- Automatic Steam install detection
+- Automatic Steam install detection, including secondary Steam library drives
+- Saved GUI options between launches
 - Backup and restore
+
+## Download
+
+Download the latest Windows executable or Linux archive from the [releases page](https://github.com/kengzzzz/tiny-poe2smoother/releases).
+
+Windows:
+
+- Run `poe2smoother-windows-x86_64.exe`.
+- If Windows SmartScreen warns about an unknown app, choose "More info" then "Run anyway".
+
+Linux:
+
+- Extract `poe2smoother-linux-x86_64.tar.gz`.
+- Run `./poe2smoother`.
 
 ## Usage
 
-```sh
-# Status
-tiny-poe2smoother status
+In the app:
 
-# List available patches
-tiny-poe2smoother list-patches
+1. Close Path of Exile 2.
+2. Let the app detect the game folder, or choose it with Browse.
+3. Select the patches you want.
+4. Click Apply.
+5. Use Restore before changing patch selection or before updating/verifying the game.
 
-# Preview changes
-tiny-poe2smoother dry-run --all
+## Safety notes
 
-# Apply all patches
-tiny-poe2smoother apply --all --yes
-
-# Apply a specific patch with custom zoom
-tiny-poe2smoother apply -p camera --zoom 2.0 --yes
-
-# Restore originals from backup
-tiny-poe2smoother restore --yes
-
-# Launch GUI
-tiny-poe2smoother-gui
-```
-
-All destructive commands require `--yes` and fail if the game is running.
-
-## Installation
-
-Download the Windows GUI executable or Linux GUI archive from the [releases page](https://github.com/kengzzzz/tiny-poe2smoother/releases).
-Linux releases are `.tar.gz` archives containing the GUI binary as `poe2smoother`.
+- Apply is one-shot. Restore first before applying a different patch selection.
+- Apply and restore are blocked while Path of Exile 2 is running.
+- If the game crashes after using an older smoother release, verify Path of Exile 2 files in Steam before applying again.
+- If a Path of Exile 2 update changes the bundle layout, the app may refuse to apply until tiny-poe2smoother is updated.
 
 ### Build from source
 
