@@ -30,6 +30,8 @@ jobs:
           outputs: type=local,dest=/tmp/artifacts/${{ matrix.target.name }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          provenance: false
+          sbom: false
 
       - name: Prepare Linux artifacts
         if: matrix.target.name == 'linux-x86_64'
@@ -41,6 +43,7 @@ jobs:
             exit 1
           fi
           cd "$artifact_dir"
+          rm -f provenance.json
           ls -la
           if [ ! -f poe2smoother-linux-x86_64.tar.gz ]; then
             echo "Expected poe2smoother-linux-x86_64.tar.gz in Linux artifact output" >&2
@@ -63,6 +66,7 @@ jobs:
             exit 1
           fi
           cd "$artifact_dir"
+          rm -f provenance.json
           ls -la
           if [ ! -f poe2smoother-windows-x86_64.exe ]; then
             echo "Expected poe2smoother-windows-x86_64.exe in Windows artifact output" >&2
