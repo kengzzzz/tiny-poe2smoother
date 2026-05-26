@@ -39,8 +39,8 @@ All destructive commands require `--yes` and fail if the game is running.
 
 ## Installation
 
-Download a portable archive or installer from the [releases page](https://github.com/kengzzzz/tiny-poe2smoother/releases).
-Linux releases are `.tar.gz` archives so the executable permissions survive download and extraction.
+Download the Windows GUI executable or Linux GUI archive from the [releases page](https://github.com/kengzzzz/tiny-poe2smoother/releases).
+Linux releases are `.tar.gz` archives containing the GUI binary as `poe2smoother`.
 
 ### Build from source
 

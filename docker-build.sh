@@ -69,71 +69,41 @@ build() {
 }
 
 export_binaries() {
-    mkdir -p /output/portable
+    mkdir -p /output
 
     case "$TARGET" in
         x86_64-pc-windows-gnu)
-            cp "target/$TARGET/release/tiny-poe2smoother.exe" /output/portable/poe2smoother.exe
-            cp "target/$TARGET/release/tiny-poe2smoother-gui.exe" /output/portable/poe2smoother-gui.exe
-
+            cp "target/$TARGET/release/tiny-poe2smoother-gui.exe" /output/poe2smoother-windows-x86_64.exe
             for dll_name in libstdc++-6 libwinpthread-1 libgcc_s_seh-1; do
-                dll_path=$(x86_64-w64-mingw32-g++ -print-file-name=${dll_name}.dll 2>/dev/null || true)
-                if [ -n "$dll_path" ] && [ -f "$dll_path" ]; then
-                    cp "$dll_path" /output/portable/ 2>/dev/null || true
+                if x86_64-w64-mingw32-objdump -p /output/poe2smoother-windows-x86_64.exe | grep -qi "DLL Name: ${dll_name}.dll"; then
+                    echo "Windows GUI exe imports ${dll_name}.dll; refusing to export a broken single-file release." >&2
+                    exit 1
                 fi
             done
-            for mingw_path in /usr/x86_64-w64-mingw32/lib /usr/lib/gcc/x86_64-w64-mingw32/*/ /usr/x86_64-w64-mingw32/bin/; do
-                if [ -d "$mingw_path" ]; then
-                    for dll_name in libstdc++-6 libwinpthread-1 libgcc_s_seh-1; do
-                        if [ -f "${mingw_path}/${dll_name}.dll" ] && [ ! -f /output/portable/${dll_name}.dll ]; then
-                            cp "${mingw_path}/${dll_name}.dll" /output/portable/ 2>/dev/null || true
-                        fi
-                    done
-                fi
-            done
-
-            if command -v makensis &>/dev/null && [ -f packaging/windows/single-gui-launcher.nsi ]; then
-                mkdir -p /tmp/nsis-stage
-                cp "target/$TARGET/release/tiny-poe2smoother-gui.exe" /tmp/nsis-stage/poe2smoother-gui.exe
-                for dll in /output/portable/*.dll; do
-                    [ -f "$dll" ] && cp "$dll" /tmp/nsis-stage/
-                done
-                cp packaging/windows/single-gui-launcher.nsi /tmp/nsis-stage/
-                pushd /tmp/nsis-stage >/dev/null
-                makensis -V2 single-gui-launcher.nsi
-                mv poe2smoother-windows-x86_64.exe /output/
-                popd >/dev/null
-                rm -rf /tmp/nsis-stage
-            fi
             ;;
 
         x86_64-unknown-linux-gnu)
-            mkdir -p /output/portable
-            cp "target/$TARGET/release/tiny-poe2smoother" /output/portable/poe2smoother
-            cp "target/$TARGET/release/tiny-poe2smoother-gui" /output/portable/poe2smoother-gui
+            mkdir -p /tmp/linux-release
+            cp "target/$TARGET/release/tiny-poe2smoother-gui" /tmp/linux-release/poe2smoother
+            chmod +x /tmp/linux-release/poe2smoother
+            cat > /tmp/linux-release/README.txt << 'READMEOF'
+poe2smoother Linux portable GUI
 
-            if command -v makeself &>/dev/null; then
-                mkdir -p /tmp/makeself-stage
-                cp "target/$TARGET/release/tiny-poe2smoother-gui" /tmp/makeself-stage/poe2smoother-gui
+Extract this archive, then run:
 
-                cat > /tmp/makeself-stage/launch.sh << 'LAUNCHEOF'
-#!/bin/bash
-set -e
-BUNDLE_DIR="$HOME/.local/share/poe2smoother/bundle"
-mkdir -p "$BUNDLE_DIR"
-cp "$(dirname "$0")/poe2smoother-gui" "$BUNDLE_DIR/"
-exec "$BUNDLE_DIR/poe2smoother-gui" "$@"
-LAUNCHEOF
-                chmod +x /tmp/makeself-stage/launch.sh
+  ./poe2smoother
 
-                makeself --notemp /tmp/makeself-stage /output/poe2smoother-linux-x86_64 "poe2smoother" ./launch.sh
-                rm -rf /tmp/makeself-stage
-            fi
+If your file manager or archive tool did not preserve executable permissions, run:
+
+  chmod +x poe2smoother
+  ./poe2smoother
+READMEOF
+            tar --owner=0 --group=0 --numeric-owner -czf /output/poe2smoother-linux-x86_64.tar.gz -C /tmp/linux-release poe2smoother README.txt
+            rm -rf /tmp/linux-release
             ;;
     esac
 
     ls -la /output/ 2>/dev/null || true
-    ls -la /output/portable/ 2>/dev/null || true
 }
 
 case "${1:-build}" in

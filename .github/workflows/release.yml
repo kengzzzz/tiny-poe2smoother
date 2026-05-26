@@ -35,34 +35,15 @@ jobs:
         if: matrix.target.name == 'linux-x86_64'
         run: |
           cd /tmp/artifacts/${{ matrix.target.name }}
-          chmod +x portable/poe2smoother portable/poe2smoother-gui
-          if [ -f poe2smoother-linux-x86_64 ]; then
-            chmod +x poe2smoother-linux-x86_64
-            tar --owner=0 --group=0 --numeric-owner -czf poe2smoother-linux-x86_64.tar.gz poe2smoother-linux-x86_64
-            rm -f poe2smoother-linux-x86_64
-          fi
-          # Tar portable folder contents so Linux executable bits survive artifact upload and download.
-          pushd portable
-          tar --owner=0 --group=0 --numeric-owner -czf ../poe2smoother-portable-linux-x86_64.tar.gz poe2smoother poe2smoother-gui
-          popd
-          # Remove subdir, keep only release files at top level
-          rm -rf portable
+          test -f poe2smoother-linux-x86_64.tar.gz
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 1
 
       - name: Prepare Windows artifacts
         if: matrix.target.name == 'windows-x86_64'
         run: |
           cd /tmp/artifacts/${{ matrix.target.name }}
-          # Zip portable folder contents as "portable" distribution
-          pushd portable
-          zip ../poe2smoother-portable-windows-x86_64.zip \
-              poe2smoother.exe \
-              poe2smoother-gui.exe \
-              libstdc++-6.dll \
-              libgcc_s_seh-1.dll \
-              libwinpthread-1.dll
-          popd
-          # Remove subdir, keep only release files at top level
-          rm -rf portable
+          test -f poe2smoother-windows-x86_64.exe
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 1
 
       - name: List artifacts
         run: ls -laR /tmp/artifacts/
