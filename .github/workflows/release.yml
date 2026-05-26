@@ -34,16 +34,46 @@ jobs:
       - name: Prepare Linux artifacts
         if: matrix.target.name == 'linux-x86_64'
         run: |
-          cd /tmp/artifacts/${{ matrix.target.name }}
-          test -f poe2smoother-linux-x86_64.tar.gz
-          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 1
+          artifact_dir="/tmp/artifacts/${{ matrix.target.name }}"
+          if [ ! -d "$artifact_dir" ]; then
+            echo "Expected Linux artifact directory $artifact_dir" >&2
+            ls -laR /tmp/artifacts 2>/dev/null || true
+            exit 1
+          fi
+          cd "$artifact_dir"
+          ls -la
+          if [ ! -f poe2smoother-linux-x86_64.tar.gz ]; then
+            echo "Expected poe2smoother-linux-x86_64.tar.gz in Linux artifact output" >&2
+            exit 1
+          fi
+          artifact_count="$(find . -maxdepth 1 -type f -printf '.' | wc -c)"
+          if [ "$artifact_count" -ne 1 ]; then
+            echo "Expected exactly one Linux release artifact, found $artifact_count:" >&2
+            find . -maxdepth 1 -type f -printf '%f\n' >&2
+            exit 1
+          fi
 
       - name: Prepare Windows artifacts
         if: matrix.target.name == 'windows-x86_64'
         run: |
-          cd /tmp/artifacts/${{ matrix.target.name }}
-          test -f poe2smoother-windows-x86_64.exe
-          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 1
+          artifact_dir="/tmp/artifacts/${{ matrix.target.name }}"
+          if [ ! -d "$artifact_dir" ]; then
+            echo "Expected Windows artifact directory $artifact_dir" >&2
+            ls -laR /tmp/artifacts 2>/dev/null || true
+            exit 1
+          fi
+          cd "$artifact_dir"
+          ls -la
+          if [ ! -f poe2smoother-windows-x86_64.exe ]; then
+            echo "Expected poe2smoother-windows-x86_64.exe in Windows artifact output" >&2
+            exit 1
+          fi
+          artifact_count="$(find . -maxdepth 1 -type f -printf '.' | wc -c)"
+          if [ "$artifact_count" -ne 1 ]; then
+            echo "Expected exactly one Windows release artifact, found $artifact_count:" >&2
+            find . -maxdepth 1 -type f -printf '%f\n' >&2
+            exit 1
+          fi
 
       - name: List artifacts
         run: ls -laR /tmp/artifacts/
