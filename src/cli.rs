@@ -1,7 +1,7 @@
 use crate::app::{
     apply_patches, backup_entries, find_paths as find_index_paths,
     inspect_path as inspect_index_path, load_status, parse_patch_names, patch_names,
-    preview_patches, restore_backup, PatchRequest,
+    preview_patches, restore_backup, PatchRequest, PatchState,
 };
 use crate::install::display_path;
 use crate::patches::{all_patches, PatchId};
@@ -99,10 +99,11 @@ fn status(game_dir: Option<PathBuf>) -> Result<()> {
     println!("Game dir: {}", display_path(&status.game_dir));
     println!("Bundle index: {}", display_path(&status.index_path));
     println!("Indexed paths: {}", status.indexed_paths);
+    println!("Patch state: {}", patch_state_label(status.patch_state));
     println!(
         "Backup: {} ({})",
         display_path(&status.backup_path),
-        if status.has_backup { "present" } else { "none" }
+        backup_label(status.patch_state)
     );
     Ok(())
 }
@@ -229,4 +230,22 @@ fn backup_info() -> Result<()> {
 
 fn selected_patches(args: &PatchArgs) -> Result<Vec<PatchId>> {
     parse_patch_names(&args.patches, args.all)
+}
+
+fn patch_state_label(state: PatchState) -> &'static str {
+    match state {
+        PatchState::Clean => "not patched",
+        PatchState::Patched => "patched",
+        PatchState::StaleBackup => "not patched (obsolete backup found)",
+        PatchState::PatchedMissingBackup => "patched (backup missing)",
+    }
+}
+
+fn backup_label(state: PatchState) -> &'static str {
+    match state {
+        PatchState::Clean => "none",
+        PatchState::Patched => "present",
+        PatchState::StaleBackup => "obsolete",
+        PatchState::PatchedMissingBackup => "missing",
+    }
 }

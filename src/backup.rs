@@ -40,6 +40,16 @@ impl BackupStore {
         self.path.exists()
     }
 
+    pub fn remove(&self) -> Result<()> {
+        match fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => {
+                Err(err).with_context(|| format!("failed to remove {}", self.path.display()))
+            }
+        }
+    }
+
     pub fn entries(&self) -> Result<Vec<BackupEntry>> {
         if !self.path.exists() {
             return Ok(Vec::new());
@@ -190,5 +200,19 @@ mod tests {
         );
         assert!(game.join("Bundles2/LibGGPK3").exists());
         assert!(!game.join("Bundles2/TinyPoe2Smoother").exists());
+    }
+
+    #[test]
+    fn remove_backup_ignores_missing_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BackupStore {
+            path: temp.path().join("poe2.bak"),
+        };
+
+        store.remove().unwrap();
+        fs::write(&store.path, b"backup").unwrap();
+        store.remove().unwrap();
+
+        assert!(!store.path.exists());
     }
 }

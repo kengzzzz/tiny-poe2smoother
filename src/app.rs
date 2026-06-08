@@ -1,9 +1,31 @@
 use crate::backup::{BackupEntry, BackupStore};
-use crate::bundle::{apply_bundle_replacements, BundleStore};
+use crate::bundle::{apply_bundle_replacements, BundleIndex, BundleStore};
 use crate::install::{ensure_game_not_running, resolve_game_dir};
 use crate::patches::{all_patches, compute_patch_set, parse_patch, PatchChange, PatchId};
 use anyhow::{anyhow, bail, Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchState {
+    Clean,
+    Patched,
+    StaleBackup,
+    PatchedMissingBackup,
+}
+
+impl PatchState {
+    pub fn is_currently_patched(self) -> bool {
+        matches!(self, Self::Patched | Self::PatchedMissingBackup)
+    }
+
+    pub fn can_restore(self) -> bool {
+        matches!(self, Self::Patched)
+    }
+
+    pub fn has_stale_backup(self) -> bool {
+        matches!(self, Self::StaleBackup)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct AppStatus {
@@ -12,6 +34,7 @@ pub struct AppStatus {
     pub indexed_paths: usize,
     pub backup_path: PathBuf,
     pub has_backup: bool,
+    pub patch_state: PatchState,
 }
 
 #[derive(Debug, Clone)]
@@ -63,13 +86,16 @@ pub fn load_status(game_dir: Option<PathBuf>) -> Result<AppStatus> {
     let mut index = store.open_index()?;
     let indexed_paths = index.ensure_paths_built()?.len();
     let backup = BackupStore::default()?;
+    let has_backup = backup.has_backup();
+    let patch_state = classify_patch_state(has_backup, index_is_patched(&index));
 
     Ok(AppStatus {
         game_dir,
         index_path: store.index_path,
         indexed_paths,
         backup_path: backup.path().to_path_buf(),
-        has_backup: backup.has_backup(),
+        has_backup,
+        patch_state,
     })
 }
 
@@ -118,16 +144,7 @@ pub fn apply_patches(request: PatchRequest) -> Result<ApplyReport> {
     let game_dir = resolve_game_dir(request.game_dir)?;
     let store = BundleStore::new(&game_dir);
     let backup = BackupStore::default()?;
-    if backup.has_backup() {
-        bail!(
-            "game is already patched;\n\
-             restore before applying a different patch selection\n\
-             Backup: {}",
-            backup.path().display()
-        );
-    }
 
-    // Preflight checks
     if !store.index_path.exists() {
         bail!(
             "index file not found at {};\nverify game install or pass --game-dir",
@@ -143,6 +160,8 @@ pub fn apply_patches(request: PatchRequest) -> Result<ApplyReport> {
             e
         ),
     };
+    let patch_state = classify_patch_state(backup.has_backup(), index_is_patched(&index));
+    ensure_can_apply(patch_state, backup.path())?;
 
     let patch_set = compute_patch_set(&store, &mut index, &request.patches, request.zoom)?;
 
@@ -163,6 +182,15 @@ pub fn apply_patches(request: PatchRequest) -> Result<ApplyReport> {
                 bundle_path.display()
             );
         }
+    }
+
+    if patch_state.has_stale_backup() {
+        backup.remove().with_context(|| {
+            format!(
+                "failed to remove obsolete backup at {}",
+                backup.path().display()
+            )
+        })?;
     }
 
     let rel_paths = vec![PathBuf::from("Bundles2/_.index.bin")];
@@ -210,11 +238,10 @@ pub fn restore_backup(game_dir: Option<PathBuf>) -> Result<RestoreReport> {
                 store.index_path.display()
             )
         })?;
-        if !index.has_bundle_prefix("TinyPoe2Smoother/") && !index.has_bundle_prefix("LibGGPK3/") {
+        if !index_is_patched(&index) {
             bail!(
-                "current game index does not look patched by tiny-poe2smoother;\n\
-                 refusing to restore a possibly stale backup from {};\n\
-                 verify game files in Steam instead",
+                "backup at {} is obsolete because the current game index is not patched;\n\
+                 apply patches again to replace it with a fresh backup",
                 backup.path().display()
             );
         }
@@ -234,6 +261,35 @@ pub fn restore_backup(game_dir: Option<PathBuf>) -> Result<RestoreReport> {
         game_dir,
         restored_files,
     })
+}
+
+fn classify_patch_state(has_backup: bool, index_is_patched: bool) -> PatchState {
+    match (has_backup, index_is_patched) {
+        (false, false) => PatchState::Clean,
+        (true, true) => PatchState::Patched,
+        (true, false) => PatchState::StaleBackup,
+        (false, true) => PatchState::PatchedMissingBackup,
+    }
+}
+
+fn index_is_patched(index: &BundleIndex) -> bool {
+    index.has_bundle_prefix("TinyPoe2Smoother/") || index.has_bundle_prefix("LibGGPK3/")
+}
+
+fn ensure_can_apply(patch_state: PatchState, backup_path: &Path) -> Result<()> {
+    match patch_state {
+        PatchState::Clean | PatchState::StaleBackup => Ok(()),
+        PatchState::Patched => bail!(
+            "game is already patched;\n\
+             restore before applying a different patch selection\n\
+             Backup: {}",
+            backup_path.display()
+        ),
+        PatchState::PatchedMissingBackup => bail!(
+            "game index is already patched by tiny-poe2smoother, but no backup was found;\n\
+             verify game files via Steam before applying again"
+        ),
+    }
 }
 
 pub fn backup_entries() -> Result<(PathBuf, Vec<BackupEntry>)> {
@@ -293,4 +349,43 @@ pub fn inspect_path(
         bytes: limited,
         text_preview,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn patch_state_classifies_backup_and_index_combinations() {
+        assert_eq!(classify_patch_state(false, false), PatchState::Clean);
+        assert_eq!(classify_patch_state(true, true), PatchState::Patched);
+        assert_eq!(classify_patch_state(true, false), PatchState::StaleBackup);
+        assert_eq!(
+            classify_patch_state(false, true),
+            PatchState::PatchedMissingBackup
+        );
+    }
+
+    #[test]
+    fn stale_backup_does_not_block_apply() {
+        let backup_path = Path::new("/tmp/poe2.bak");
+
+        assert!(ensure_can_apply(PatchState::Clean, backup_path).is_ok());
+        assert!(ensure_can_apply(PatchState::StaleBackup, backup_path).is_ok());
+    }
+
+    #[test]
+    fn currently_patched_index_blocks_apply() {
+        let backup_path = Path::new("/tmp/poe2.bak");
+
+        let with_backup = ensure_can_apply(PatchState::Patched, backup_path)
+            .unwrap_err()
+            .to_string();
+        let without_backup = ensure_can_apply(PatchState::PatchedMissingBackup, backup_path)
+            .unwrap_err()
+            .to_string();
+
+        assert!(with_backup.contains("already patched"));
+        assert!(without_backup.contains("no backup was found"));
+    }
 }

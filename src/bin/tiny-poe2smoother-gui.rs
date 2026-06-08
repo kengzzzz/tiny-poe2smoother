@@ -7,7 +7,8 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use tiny_poe2smoother::app::{
-    apply_patches, load_status, restore_backup, AppStatus, ApplyReport, PatchRequest, RestoreReport,
+    apply_patches, load_status, restore_backup, AppStatus, ApplyReport, PatchRequest, PatchState,
+    RestoreReport,
 };
 use tiny_poe2smoother::install::{display_path, is_game_running};
 use tiny_poe2smoother::patches::{all_patches, parse_patch, PatchId};
@@ -327,9 +328,17 @@ impl GuiApp {
                 );
                 ui.label(
                     egui::RichText::new(format!(
+                        "Patch state: {}",
+                        patch_state_label(status.patch_state)
+                    ))
+                    .size(12.0)
+                    .color(muted),
+                );
+                ui.label(
+                    egui::RichText::new(format!(
                         "Backup: {} ({})",
                         display_path(&status.backup_path),
-                        if status.has_backup { "present" } else { "none" }
+                        backup_label(status.patch_state)
                     ))
                     .size(12.0)
                     .color(muted),
@@ -434,7 +443,12 @@ impl GuiApp {
             let already_patched = self
                 .status
                 .as_ref()
-                .map(|status| status.has_backup)
+                .map(|status| status.patch_state.is_currently_patched())
+                .unwrap_or(false);
+            let can_restore = self
+                .status
+                .as_ref()
+                .map(|status| status.patch_state.can_restore())
                 .unwrap_or(false);
             let apply = egui::Button::new(
                 egui::RichText::new("Apply")
@@ -456,7 +470,7 @@ impl GuiApp {
             .fill(egui::Color32::from_rgb(40, 50, 70))
             .corner_radius(6)
             .min_size(egui::vec2(100.0, 36.0));
-            if ui.add(restore).clicked() {
+            if ui.add_enabled(can_restore, restore).clicked() {
                 self.confirm_restore = true;
             }
         });
@@ -628,6 +642,24 @@ impl GuiApp {
                 Err(err) => self.message = err,
             },
         }
+    }
+}
+
+fn patch_state_label(state: PatchState) -> &'static str {
+    match state {
+        PatchState::Clean => "not patched",
+        PatchState::Patched => "patched",
+        PatchState::StaleBackup => "not patched, obsolete backup found",
+        PatchState::PatchedMissingBackup => "patched, backup missing",
+    }
+}
+
+fn backup_label(state: PatchState) -> &'static str {
+    match state {
+        PatchState::Clean => "none",
+        PatchState::Patched => "present",
+        PatchState::StaleBackup => "obsolete",
+        PatchState::PatchedMissingBackup => "missing",
     }
 }
 
