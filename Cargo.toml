@@ -1,6 +1,6 @@
 [package]
 name = "tiny-poe2smoother"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 default-run = "tiny-poe2smoother"
 
@@ -12,6 +12,7 @@ dirs = "6.0"
 eframe = { version = "0.33", features = ["persistence"] }
 poe_bundle = "0.1.5"
 regex = "1.11"
+rayon = "1.10"
 rfd = "0.15"
 serde = { version = "1.0", features = ["derive"] }
 sysinfo = "0.37"

@@ -1,7 +1,9 @@
 use crate::backup::{BackupEntry, BackupStore};
 use crate::bundle::{apply_bundle_replacements, BundleIndex, BundleStore};
 use crate::install::{ensure_game_not_running, resolve_game_dir};
-use crate::patches::{all_patches, compute_patch_set, parse_patch, PatchChange, PatchId};
+use crate::patches::{
+    all_patches, all_presets, compute_patch_set, parse_patch, parse_preset, PatchChange, PatchId,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -42,6 +44,13 @@ pub struct PatchRequest {
     pub game_dir: Option<PathBuf>,
     pub patches: Vec<PatchId>,
     pub zoom: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PatchSelection {
+    pub patches: Vec<String>,
+    pub presets: Vec<String>,
+    pub all: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -104,16 +113,37 @@ pub fn list_patch_ids() -> Vec<PatchId> {
 }
 
 pub fn parse_patch_names(names: &[String], all: bool) -> Result<Vec<PatchId>> {
-    if all {
-        return Ok(list_patch_ids());
+    resolve_patch_selection(PatchSelection {
+        patches: names.to_vec(),
+        all,
+        ..PatchSelection::default()
+    })
+}
+
+pub fn resolve_patch_selection(selection: PatchSelection) -> Result<Vec<PatchId>> {
+    let mut out = Vec::new();
+
+    if selection.all {
+        for patch in all_patches() {
+            out.push(patch.id);
+        }
     }
-    if names.is_empty() {
-        bail!("select at least one --patch or use --all");
+
+    for name in &selection.presets {
+        let preset = parse_preset(name).ok_or_else(|| anyhow!("unknown preset: {name}"))?;
+        out.extend_from_slice(preset.patches);
     }
-    names
-        .iter()
-        .map(|name| parse_patch(name).ok_or_else(|| anyhow!("unknown patch: {name}")))
-        .collect()
+
+    for name in &selection.patches {
+        let patch = parse_patch(name).ok_or_else(|| anyhow!("unknown patch: {name}"))?;
+        out.push(patch);
+    }
+
+    if out.is_empty() {
+        bail!("select at least one --patch/--preset or use --all");
+    }
+
+    Ok(unique_patch_ids(out))
 }
 
 pub fn patch_names(ids: &[PatchId]) -> Vec<&'static str> {
@@ -121,6 +151,21 @@ pub fn patch_names(ids: &[PatchId]) -> Vec<&'static str> {
         .filter_map(|id| all_patches().iter().find(|patch| patch.id == *id))
         .map(|patch| patch.name)
         .collect()
+}
+
+pub fn preset_names() -> Vec<&'static str> {
+    all_presets().iter().map(|preset| preset.name).collect()
+}
+
+fn unique_patch_ids(ids: Vec<PatchId>) -> Vec<PatchId> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for id in ids {
+        if seen.insert(id) {
+            out.push(id);
+        }
+    }
+    out
 }
 
 pub fn preview_patches(request: PatchRequest) -> Result<PatchPreview> {
@@ -387,5 +432,79 @@ mod tests {
 
         assert!(with_backup.contains("already patched"));
         assert!(without_backup.contains("no backup was found"));
+    }
+
+    #[test]
+    fn all_selects_every_patch_including_capture_backed_ones() {
+        let patches = resolve_patch_selection(PatchSelection {
+            all: true,
+            ..PatchSelection::default()
+        })
+        .unwrap();
+
+        assert_eq!(patches.len(), all_patches().len());
+        assert!(patches.contains(&PatchId::Fog));
+        assert!(patches.contains(&PatchId::DisableSounds));
+        assert!(patches.contains(&PatchId::MtxSoft));
+    }
+
+    #[test]
+    fn sound_and_mtx_patches_resolve_without_any_opt_in() {
+        let resolved = resolve_patch_selection(PatchSelection {
+            patches: vec![
+                "disable-sounds".to_string(),
+                "skill-sounds".to_string(),
+                "monster-sounds".to_string(),
+                "mtx-soft".to_string(),
+            ],
+            ..PatchSelection::default()
+        })
+        .unwrap();
+
+        assert_eq!(
+            resolved,
+            vec![
+                PatchId::DisableSounds,
+                PatchId::SkillSounds,
+                PatchId::MonsterSounds,
+                PatchId::MtxSoft,
+            ]
+        );
+    }
+
+    #[test]
+    fn removed_destructive_patches_are_unknown() {
+        for name in [
+            "zero-effects",
+            "black-screen",
+            "remove-players",
+            "remove-monsters",
+            "clean-terrain",
+            "zero-materials",
+            "mtx-full",
+        ] {
+            let err = resolve_patch_selection(PatchSelection {
+                patches: vec![name.to_string()],
+                ..PatchSelection::default()
+            })
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("unknown patch"), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn presets_expand_and_aliases_resolve() {
+        let maps = resolve_patch_selection(PatchSelection {
+            presets: vec!["maps-revealed".to_string()],
+            patches: vec!["zero-particles".to_string()],
+            ..PatchSelection::default()
+        })
+        .unwrap();
+
+        assert_eq!(
+            maps,
+            vec![PatchId::Minimap, PatchId::AtlasFog, PatchId::Particles]
+        );
     }
 }

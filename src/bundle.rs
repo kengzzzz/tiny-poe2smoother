@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fs;
@@ -46,6 +47,17 @@ impl BundleFile {
     pub(crate) fn for_test(bundle_name: &str, size: u32) -> Self {
         Self {
             hash: 0,
+            bundle_index: 0,
+            bundle_name: bundle_name.to_string(),
+            offset: 0,
+            size,
+            record_pos: 0,
+        }
+    }
+
+    pub(crate) fn for_test_with_hash(hash: u64, bundle_name: &str, size: u32) -> Self {
+        Self {
+            hash,
             bundle_index: 0,
             bundle_name: bundle_name.to_string(),
             offset: 0,
@@ -343,16 +355,70 @@ impl BundleStore {
     }
 
     pub fn read_bundles_batch(&self, names: &[String]) -> Result<HashMap<String, Vec<u8>>> {
-        let mut map = HashMap::with_capacity(names.len());
-        for name in names {
-            let data = self.read_bundle(name)?;
-            map.insert(name.clone(), data);
-        }
-        Ok(map)
+        names
+            .par_iter()
+            .map(|name| {
+                self.read_bundle(name)
+                    .map(|data| (name.clone(), data))
+                    .with_context(|| format!("failed to read bundle batch entry: {name}"))
+            })
+            .collect()
     }
 }
 
 impl BundleIndex {
+    #[cfg(test)]
+    pub(crate) fn for_test_paths(paths: &[(&str, &str, u32)]) -> Self {
+        let mut bundle_names = Vec::<String>::new();
+        let mut bundles = Vec::new();
+        let mut files = HashMap::with_capacity(paths.len());
+        let mut file_order = Vec::with_capacity(paths.len());
+        for (path, bundle_name, size) in paths {
+            let bundle_index =
+                if let Some(index) = bundle_names.iter().position(|name| name == bundle_name) {
+                    index
+                } else {
+                    bundle_names.push((*bundle_name).to_string());
+                    bundles.push(BundleInfo {
+                        name: (*bundle_name).to_string(),
+                        uncompressed_size: 0,
+                        size_pos: 0,
+                    });
+                    bundles.len() - 1
+                };
+            let hash = fnv1a_bundle_hash(path);
+            file_order.push(hash);
+            files.insert(
+                hash,
+                BundleFile {
+                    hash,
+                    bundle_index: bundle_index as u32,
+                    bundle_name: (*bundle_name).to_string(),
+                    offset: 0,
+                    size: *size,
+                    record_pos: 0,
+                },
+            );
+        }
+
+        Self {
+            raw_decompressed: vec![0; 4],
+            bundles,
+            hash_mode: HashMode::Fnv1A,
+            files,
+            file_order,
+            file_count_pos: 4,
+            directory_bytes_compressed: Vec::new(),
+            directories: Vec::new(),
+            paths: Some(
+                paths
+                    .iter()
+                    .map(|(path, _, _)| (*path).to_string())
+                    .collect(),
+            ),
+        }
+    }
+
     pub fn parse(raw_decompressed: Vec<u8>) -> Result<Self> {
         let mut cursor = Cursor::new(raw_decompressed.as_slice());
         let bundle_count = cursor.read_u32::<LittleEndian>()? as usize;
@@ -457,21 +523,29 @@ impl BundleIndex {
         prefix: &str,
         extensions: &[&str],
     ) -> Result<Vec<IndexedPath>> {
-        self.ensure_paths_built()?;
-        let paths = self.paths.clone().unwrap_or_default();
-        let mut result = Vec::new();
-        for path in &paths {
+        self.matching_paths_by(|path| {
             let normalized = path.replace('\\', "/").to_ascii_lowercase();
-            if !normalized.starts_with(prefix) {
+            normalized.starts_with(prefix)
+                && extensions
+                    .iter()
+                    .any(|extension| normalized.ends_with(extension))
+        })
+    }
+
+    pub fn matching_paths_by<F>(&mut self, mut predicate: F) -> Result<Vec<IndexedPath>>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        self.ensure_paths_built()?;
+        let paths = self.paths.as_ref().expect("paths were just built");
+        let files = &self.files;
+        let hash_mode = self.hash_mode;
+        let mut result = Vec::new();
+        for path in paths {
+            if !predicate(path) {
                 continue;
             }
-            if !extensions
-                .iter()
-                .any(|extension| normalized.ends_with(extension))
-            {
-                continue;
-            }
-            if let Some(file) = self.file_by_path(path).cloned() {
+            if let Some(file) = files.get(&hash_path(hash_mode, path)).cloned() {
                 result.push(IndexedPath {
                     path: path.clone(),
                     file,
@@ -523,12 +597,32 @@ impl BundleIndex {
     }
 
     fn name_hash(&self, path: &str) -> u64 {
-        match self.hash_mode {
-            HashMode::Murmur64A => {
-                murmur_hash64a(path.trim_end_matches('/').to_ascii_lowercase().as_bytes())
+        hash_path(self.hash_mode, path)
+    }
+
+    pub fn indexed_paths(&mut self) -> Result<Vec<IndexedPath>> {
+        self.ensure_paths_built()?;
+        let paths = self.paths.as_ref().expect("paths were just built");
+        let files = &self.files;
+        let hash_mode = self.hash_mode;
+        let mut result = Vec::with_capacity(paths.len());
+        for path in paths {
+            if let Some(file) = files.get(&hash_path(hash_mode, path)).cloned() {
+                result.push(IndexedPath {
+                    path: path.clone(),
+                    file,
+                });
             }
-            HashMode::Fnv1A => fnv1a_bundle_hash(path),
         }
+        Ok(result)
+    }
+
+    pub fn file_order_map(&self) -> HashMap<u64, usize> {
+        self.file_order
+            .iter()
+            .enumerate()
+            .map(|(index, hash)| (*hash, index))
+            .collect()
     }
 
     pub fn packed_bytes(&self) -> Result<Vec<u8>> {
@@ -592,13 +686,8 @@ pub fn apply_bundle_replacements(
         .values()
         .flat_map(|items| items.iter().cloned())
         .collect::<Vec<_>>();
-    edits.sort_by_key(|(file, _)| {
-        index
-            .file_order
-            .iter()
-            .position(|hash| *hash == file.hash)
-            .unwrap_or(usize::MAX)
-    });
+    let file_order = index.file_order_map();
+    sort_edits_by_index_order(&mut edits, &file_order);
 
     for (file, replacement) in edits {
         let new_offset = custom_data.len();
@@ -640,6 +729,13 @@ pub fn apply_bundle_replacements(
     }
     touched.push(store.index_path.clone());
     Ok(touched)
+}
+
+fn sort_edits_by_index_order(
+    edits: &mut [(BundleFile, Vec<u8>)],
+    file_order: &HashMap<u64, usize>,
+) {
+    edits.sort_by_key(|(file, _)| file_order.get(&file.hash).copied().unwrap_or(usize::MAX));
 }
 
 pub fn decompress_bundle(src: &[u8]) -> Result<Vec<u8>> {
@@ -701,11 +797,10 @@ pub fn decompress_bundle(src: &[u8]) -> Result<Vec<u8>> {
 
 pub fn pack_uncompressed_bundle(data: &[u8]) -> Result<Vec<u8>> {
     crate::timing!("bundle_compress");
-    let chunk_count = data.len().div_ceil(BUNDLE_CHUNK_SIZE);
-    let mut chunks = Vec::with_capacity(chunk_count);
-    for chunk in data.chunks(BUNDLE_CHUNK_SIZE) {
-        chunks.push(compress_chunk(chunk)?);
-    }
+    let chunks = data
+        .par_chunks(BUNDLE_CHUNK_SIZE)
+        .map(compress_chunk)
+        .collect::<Result<Vec<_>>>()?;
 
     let compressed_len: usize = chunks.iter().map(Vec::len).sum();
     let head_size = BUNDLE_FIXED_HEAD_SIZE_AFTER_PREFIX + 4 * chunks.len();
@@ -833,6 +928,15 @@ fn fnv1a_bundle_hash(path: &str) -> u64 {
     hash_fnv1a(format!("{}++", path.trim_end_matches('/').to_ascii_lowercase()).as_bytes())
 }
 
+fn hash_path(hash_mode: HashMode, path: &str) -> u64 {
+    match hash_mode {
+        HashMode::Murmur64A => {
+            murmur_hash64a(path.trim_end_matches('/').to_ascii_lowercase().as_bytes())
+        }
+        HashMode::Fnv1A => fnv1a_bundle_hash(path),
+    }
+}
+
 fn hash_fnv1a(data: &[u8]) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     for byte in data {
@@ -926,5 +1030,32 @@ mod tests {
             filepath_hash("Metadata/Foo.ot"),
             filepath_hash("metadata/foo.ot")
         );
+    }
+
+    #[test]
+    fn replacement_edits_sort_by_index_order_map() {
+        let mut edits = vec![
+            (
+                BundleFile::for_test_with_hash(30, "a", 1),
+                b"third".to_vec(),
+            ),
+            (
+                BundleFile::for_test_with_hash(10, "a", 1),
+                b"first".to_vec(),
+            ),
+            (
+                BundleFile::for_test_with_hash(20, "a", 1),
+                b"second".to_vec(),
+            ),
+        ];
+        let order = HashMap::from([(10, 0), (20, 1), (30, 2)]);
+
+        sort_edits_by_index_order(&mut edits, &order);
+
+        let hashes = edits
+            .into_iter()
+            .map(|(file, _)| file.hash)
+            .collect::<Vec<_>>();
+        assert_eq!(hashes, vec![10, 20, 30]);
     }
 }

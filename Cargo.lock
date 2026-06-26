@@ -3473,7 +3473,7 @@ dependencies = [
 
 [[package]]
 name = "tiny-poe2smoother"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3482,6 +3482,7 @@ dependencies = [
  "dirs",
  "eframe",
  "poe_bundle",
+ "rayon",
  "regex",
  "rfd",
  "serde",

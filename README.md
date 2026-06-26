@@ -4,7 +4,8 @@ GUI tool that patches Path of Exile 2 bundle files to disable visual effects for
 
 ## Features
 
-- 12 optional patches: camera zoom, fog, rain, clouds, shadows, lighting, delirium effects, particles, minimap reveal, atlas fog, environment particles, client effect blocks
+- 16 optional patches: camera zoom, fog, rain, clouds, shadows, lighting, delirium effects, particles, minimap reveal, atlas fog, environment particles, client effect blocks, plus sound silencing (disable sounds, skill sounds, monster sounds) and microtransaction effect removal (mtx-soft)
+- Sound and MTX patches write ground-truth-derived, structurally valid bytes, so they never corrupt files or crash the game
 - Camera zoom adjustment (1.2x -- 2.4x)
 - Safe modification via Oodle-compressed bundle patching with atomic writes
 - Automatic Steam install detection, including secondary Steam library drives

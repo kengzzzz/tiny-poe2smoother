@@ -11,7 +11,7 @@ use tiny_poe2smoother::app::{
     RestoreReport,
 };
 use tiny_poe2smoother::install::{display_path, is_game_running};
-use tiny_poe2smoother::patches::{all_patches, parse_patch, PatchId};
+use tiny_poe2smoother::patches::{all_patches, all_presets, parse_patch, PatchId};
 
 const PREFS_KEY: &str = "tiny-poe2smoother.gui.v1";
 
@@ -363,6 +363,20 @@ impl GuiApp {
                 }
                 if ui.button("Select none").clicked() {
                     self.selected_patches.clear();
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new("Presets")
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(145, 160, 180)),
+                );
+                for preset in all_presets() {
+                    if ui.button(preset.name).clicked() {
+                        for patch in preset.patches {
+                            self.selected_patches.insert(*patch);
+                        }
+                    }
                 }
             });
             ui.add_space(6.0);

@@ -1,10 +1,11 @@
 use crate::app::{
     apply_patches, backup_entries, find_paths as find_index_paths,
     inspect_path as inspect_index_path, load_status, parse_patch_names, patch_names,
-    preview_patches, restore_backup, PatchRequest, PatchState,
+    preview_patches, resolve_patch_selection, restore_backup, PatchRequest,
+    PatchSelection, PatchState,
 };
 use crate::install::display_path;
-use crate::patches::{all_patches, PatchId};
+use crate::patches::{all_patches, all_presets, PatchId};
 use anyhow::{bail, Result};
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
@@ -36,6 +37,9 @@ enum Command {
 struct PatchArgs {
     #[arg(long = "patch", short = 'p')]
     patches: Vec<String>,
+
+    #[arg(long = "preset")]
+    presets: Vec<String>,
 
     #[arg(long)]
     all: bool,
@@ -109,8 +113,17 @@ fn status(game_dir: Option<PathBuf>) -> Result<()> {
 }
 
 fn list_patches() -> Result<()> {
+    println!("Patches:");
     for patch in all_patches() {
-        println!("{:<14} {}", patch.name, patch.description);
+        println!("{:<16} {}", patch.name, patch.description);
+    }
+    println!();
+    println!("Aliases:");
+    println!("{:<16} Alias for particles.", "zero-particles");
+    println!();
+    println!("Presets:");
+    for preset in all_presets() {
+        println!("{:<16} {}", preset.name, preset.description);
     }
     Ok(())
 }
@@ -229,7 +242,14 @@ fn backup_info() -> Result<()> {
 }
 
 fn selected_patches(args: &PatchArgs) -> Result<Vec<PatchId>> {
-    parse_patch_names(&args.patches, args.all)
+    if args.presets.is_empty() {
+        return parse_patch_names(&args.patches, args.all);
+    }
+    resolve_patch_selection(PatchSelection {
+        patches: args.patches.clone(),
+        presets: args.presets.clone(),
+        all: args.all,
+    })
 }
 
 fn patch_state_label(state: PatchState) -> &'static str {
