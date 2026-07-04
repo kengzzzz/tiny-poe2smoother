@@ -1,12 +1,16 @@
+use crate::backup::{BackupStore, GgpkBackupMeta};
+use crate::install::{detect_install_layout, InstallLayout};
 use anyhow::{anyhow, bail, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use ggpk::GGPK;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fs;
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::os::raw::{c_int, c_void};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 #[link(name = "libooz", kind = "static")]
@@ -107,35 +111,105 @@ pub struct IndexedPath {
     pub file: BundleFile,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BundleStore {
     pub game_dir: PathBuf,
     pub bundles_dir: PathBuf,
     pub index_path: PathBuf,
+    pub layout: InstallLayout,
+    content_path: PathBuf,
+    ggpk: Option<Arc<GGPK>>,
 }
 
-const CACHE_MAGIC: &[u8; 4] = b"2SIC";
+#[derive(Debug, Clone)]
+struct CacheKey {
+    source: String,
+    size: u64,
+    mtime: u128,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GgpkFileSpan {
+    begin: usize,
+    len: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct BundleWriteReport {
+    pub touched_paths: Vec<PathBuf>,
+}
+
+struct GgpkPatchPlan {
+    backup: GgpkBackupMeta,
+    append_bytes: Vec<u8>,
+    new_bundles2_offset: u64,
+}
+
+#[derive(Debug, Clone)]
+struct GgpkPdirRecord {
+    name: String,
+    offset: u64,
+    digest: [u8; 32],
+    entries: Vec<GgpkPdirEntry>,
+    parent_offset_pos: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct GgpkPdirEntry {
+    name: String,
+    name_hash: u32,
+    offset: u64,
+}
+
+const CACHE_MAGIC: &[u8; 4] = b"2SI2";
 
 impl BundleStore {
     pub fn new(game_dir: impl Into<PathBuf>) -> Self {
         let game_dir = game_dir.into();
         let bundles_dir = game_dir.join("Bundles2");
         let index_path = bundles_dir.join("_.index.bin");
+        let content_path = game_dir.join("Content.ggpk");
+        let layout = detect_install_layout(&game_dir).unwrap_or(InstallLayout::LooseBundles);
+        let ggpk = if matches!(layout, InstallLayout::ContentGgpk) {
+            GGPK::from_file(&content_path).ok().map(Arc::new)
+        } else {
+            None
+        };
         Self {
             game_dir,
             bundles_dir,
             index_path,
+            layout,
+            content_path,
+            ggpk,
         }
     }
 
-    fn cache_key(&self) -> Result<Option<(u64, u128)>> {
-        let meta = fs::metadata(&self.index_path)?;
+    fn cache_key(&self) -> Result<Option<CacheKey>> {
+        let (source_path, source_label) = if matches!(self.layout, InstallLayout::ContentGgpk) {
+            (
+                self.content_path.clone(),
+                format!("{}::Bundles2/_.index.bin", self.content_path.display()),
+            )
+        } else if self.index_path.exists() {
+            (
+                self.index_path.clone(),
+                self.index_path.to_string_lossy().into_owned(),
+            )
+        } else {
+            return Ok(None);
+        };
+        let meta = fs::metadata(&source_path)?;
         let size = meta.len();
-        let mtime = meta
+        Ok(meta
             .modified()
             .ok()
-            .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok());
-        Ok(mtime.map(|d| (size, d.as_nanos())))
+            .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|d| CacheKey {
+                source: source_label,
+                size,
+                mtime: d.as_nanos(),
+            }))
     }
 
     fn cache_path(&self) -> PathBuf {
@@ -155,9 +229,13 @@ impl BundleStore {
         if &magic != CACHE_MAGIC {
             return None;
         }
+        let source_len = c.read_u64::<LittleEndian>().ok()? as usize;
+        let mut source_bytes = vec![0u8; source_len];
+        c.read_exact(&mut source_bytes).ok()?;
+        let cached_source = String::from_utf8(source_bytes).ok()?;
         let cached_size: u64 = c.read_u64::<LittleEndian>().ok()?;
         let cached_mtime: u128 = c.read_u128::<LittleEndian>().ok()?;
-        if (cached_size, cached_mtime) != key {
+        if cached_source != key.source || cached_size != key.size || cached_mtime != key.mtime {
             return None;
         }
         let rd_len = c.read_u64::<LittleEndian>().ok()? as usize;
@@ -254,8 +332,10 @@ impl BundleStore {
         };
         let mut data = Vec::new();
         data.extend_from_slice(CACHE_MAGIC);
-        data.write_u64::<LittleEndian>(key.0).ok();
-        data.write_u128::<LittleEndian>(key.1).ok();
+        data.write_u64::<LittleEndian>(key.source.len() as u64).ok();
+        data.extend_from_slice(key.source.as_bytes());
+        data.write_u64::<LittleEndian>(key.size).ok();
+        data.write_u128::<LittleEndian>(key.mtime).ok();
         data.write_u64::<LittleEndian>(index.raw_decompressed.len() as u64)
             .ok();
         data.extend_from_slice(&index.raw_decompressed);
@@ -323,8 +403,7 @@ impl BundleStore {
             tracing::debug!("using cached index metadata");
             return Ok(cached);
         }
-        let bytes = fs::read(&self.index_path)
-            .with_context(|| format!("failed to read {}", self.index_path.display()))?;
+        let bytes = self.read_index_bytes()?;
         crate::timing!("index_decompress");
         let decompressed =
             decompress_bundle(&bytes).context("failed to decompress bundle index")?;
@@ -332,6 +411,25 @@ impl BundleStore {
         let index = BundleIndex::parse(decompressed)?;
         self.write_cache(&index);
         Ok(index)
+    }
+
+    pub fn read_index_bytes(&self) -> Result<Vec<u8>> {
+        self.read_storage_file("Bundles2/_.index.bin")
+            .with_context(|| format!("failed to read {}", self.index_display_path()))
+    }
+
+    pub fn index_exists(&self) -> Result<bool> {
+        self.storage_file_exists("Bundles2/_.index.bin")
+    }
+
+    pub fn index_display_path(&self) -> String {
+        if matches!(self.layout, InstallLayout::ContentGgpk) {
+            format!("{}::Bundles2/_.index.bin", self.content_path.display())
+        } else if self.index_path.exists() {
+            self.index_path.display().to_string()
+        } else {
+            self.index_path.display().to_string()
+        }
     }
 
     pub fn read_file(&self, index: &BundleIndex, path: &str) -> Result<Vec<u8>> {
@@ -343,15 +441,39 @@ impl BundleStore {
     }
 
     pub fn read_bundle(&self, bundle_name: &str) -> Result<Vec<u8>> {
-        let path = self.bundle_path(bundle_name);
-        let bytes =
-            fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-        decompress_bundle(&bytes)
-            .with_context(|| format!("failed to decompress {}", path.display()))
+        let storage_path = storage_bundle_path(bundle_name);
+        let bytes = self
+            .read_storage_file(&storage_path)
+            .with_context(|| format!("failed to read {}", self.bundle_display_path(bundle_name)))?;
+        decompress_bundle(&bytes).with_context(|| {
+            format!(
+                "failed to decompress {}",
+                self.bundle_display_path(bundle_name)
+            )
+        })
     }
 
     pub fn bundle_path(&self, bundle_name: &str) -> PathBuf {
         self.bundles_dir.join(format!("{bundle_name}.bundle.bin"))
+    }
+
+    pub fn bundle_exists(&self, bundle_name: &str) -> Result<bool> {
+        self.storage_file_exists(&storage_bundle_path(bundle_name))
+    }
+
+    pub fn bundle_display_path(&self, bundle_name: &str) -> String {
+        let loose = self.bundle_path(bundle_name);
+        if matches!(self.layout, InstallLayout::ContentGgpk) {
+            format!(
+                "{}::{}",
+                self.content_path.display(),
+                storage_bundle_path(bundle_name)
+            )
+        } else if loose.exists() {
+            loose.display().to_string()
+        } else {
+            loose.display().to_string()
+        }
     }
 
     pub fn read_bundles_batch(&self, names: &[String]) -> Result<HashMap<String, Vec<u8>>> {
@@ -364,6 +486,212 @@ impl BundleStore {
             })
             .collect()
     }
+
+    fn read_storage_file(&self, rel_path: &str) -> Result<Vec<u8>> {
+        if matches!(self.layout, InstallLayout::ContentGgpk) {
+            return self.read_ggpk_file(rel_path);
+        }
+        let loose = self.game_dir.join(rel_path);
+        if loose.exists() {
+            return fs::read(&loose).with_context(|| format!("failed to read {}", loose.display()));
+        }
+        fs::read(&loose).with_context(|| format!("failed to read {}", loose.display()))
+    }
+
+    fn storage_file_exists(&self, rel_path: &str) -> Result<bool> {
+        if matches!(self.layout, InstallLayout::ContentGgpk) {
+            return self.ggpk_file_span(rel_path).map(|span| span.is_some());
+        }
+        let loose = self.game_dir.join(rel_path);
+        if loose.exists() {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn read_ggpk_file(&self, rel_path: &str) -> Result<Vec<u8>> {
+        let span = self
+            .ggpk_file_span(rel_path)?
+            .ok_or_else(|| anyhow!("{} not found in {}", rel_path, self.content_path.display()))?;
+        let ggpk = self.open_ggpk()?;
+        let end = span.begin + span.len;
+        ggpk.mmap
+            .get(span.begin..end)
+            .map(|bytes| bytes.to_vec())
+            .ok_or_else(|| {
+                anyhow!(
+                    "{} points outside {}",
+                    rel_path,
+                    self.content_path.display()
+                )
+            })
+    }
+
+    fn ggpk_file_span(&self, rel_path: &str) -> Result<Option<GgpkFileSpan>> {
+        ggpk_find_file(self.open_ggpk()?.as_ref(), rel_path)
+    }
+
+    fn open_ggpk(&self) -> Result<Arc<GGPK>> {
+        self.ggpk
+            .clone()
+            .ok_or_else(|| anyhow!("failed to open {}", self.content_path.display()))
+    }
+
+    fn prepare_ggpk_patch(
+        &self,
+        custom_bundle_name: &str,
+        custom_bundle_bytes: &[u8],
+        index_bytes: &[u8],
+    ) -> Result<GgpkPatchPlan> {
+        let ggpk = self.open_ggpk()?;
+        let bundles2 = ggpk_find_pdir(ggpk.as_ref(), "Bundles2")?.ok_or_else(|| {
+            anyhow!(
+                "Bundles2 directory not found in {}",
+                self.content_path.display()
+            )
+        })?;
+        let bundles2_offset_pos = bundles2.parent_offset_pos.ok_or_else(|| {
+            anyhow!(
+                "Bundles2 has no parent pointer in {}",
+                self.content_path.display()
+            )
+        })?;
+        if custom_bundle_name.contains('/') || custom_bundle_name.contains('\\') {
+            bail!("standalone custom bundle name must be flat: {custom_bundle_name}");
+        }
+
+        let appended_start = fs::metadata(&self.content_path)?.len();
+        let index_record = ggpk_file_record("_.index.bin", index_bytes, ggpk.version.use_utf32())?;
+        let custom_file_name = format!("{custom_bundle_name}.bundle.bin");
+        let custom_record = ggpk_file_record(
+            &custom_file_name,
+            custom_bundle_bytes,
+            ggpk.version.use_utf32(),
+        )?;
+        let index_offset = appended_start;
+        let custom_offset = index_offset + u64::try_from(index_record.len())?;
+        let new_bundles2_offset = custom_offset + u64::try_from(custom_record.len())?;
+
+        let mut entries = bundles2.entries.clone();
+        let mut replaced_index = false;
+        for entry in &mut entries {
+            if entry.name.eq_ignore_ascii_case("_.index.bin") {
+                entry.offset = index_offset;
+                replaced_index = true;
+            }
+        }
+        if !replaced_index {
+            bail!(
+                "Bundles2/_.index.bin is missing from {}",
+                self.content_path.display()
+            );
+        }
+        entries.push(GgpkPdirEntry {
+            name: custom_file_name.clone(),
+            name_hash: ggpk_name_hash(&custom_file_name),
+            offset: custom_offset,
+        });
+        entries.sort_by_key(|entry| entry.name_hash);
+
+        let new_bundles2 = ggpk_pdir_record(
+            &bundles2.name,
+            &bundles2.digest,
+            &entries,
+            ggpk.version.use_utf32(),
+        )?;
+
+        let mut append_bytes = Vec::new();
+        append_bytes.extend_from_slice(&index_record);
+        append_bytes.extend_from_slice(&custom_record);
+        append_bytes.extend_from_slice(&new_bundles2);
+        let appended_end = appended_start + u64::try_from(append_bytes.len())?;
+
+        Ok(GgpkPatchPlan {
+            backup: GgpkBackupMeta {
+                bundles2_offset_pos,
+                original_bundles2_offset: bundles2.offset,
+                appended_start,
+                appended_end,
+            },
+            append_bytes,
+            new_bundles2_offset,
+        })
+    }
+
+    fn apply_ggpk_patch(&self, plan: &GgpkPatchPlan) -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.content_path)
+            .with_context(|| format!("failed to open {}", self.content_path.display()))?;
+        let current_len = file.metadata()?.len();
+        if current_len != plan.backup.appended_start {
+            bail!(
+                "{} changed while preparing patch; verify game files and retry",
+                self.content_path.display()
+            );
+        }
+
+        file.seek(SeekFrom::Start(plan.backup.appended_start))?;
+        file.write_all(&plan.append_bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+
+        file.seek(SeekFrom::Start(plan.backup.bundles2_offset_pos))?;
+        file.write_u64::<LittleEndian>(plan.new_bundles2_offset)?;
+        file.flush()?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    pub fn restore_ggpk_backup(&mut self, meta: GgpkBackupMeta) -> Result<()> {
+        self.ggpk = None;
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.content_path)
+            .with_context(|| format!("failed to open {}", self.content_path.display()))?;
+        file.seek(SeekFrom::Start(meta.bundles2_offset_pos))?;
+        file.write_u64::<LittleEndian>(meta.original_bundles2_offset)?;
+        file.flush()?;
+        file.sync_all()?;
+
+        if file.metadata()?.len() == meta.appended_end {
+            file.set_len(meta.appended_start)?;
+            file.sync_all()?;
+        }
+        Ok(())
+    }
+
+    pub fn remove_legacy_overlay_files(&self) -> Result<()> {
+        match fs::remove_file(&self.index_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to remove {}", self.index_path.display()));
+            }
+        }
+
+        let custom_bundle_dir = self.bundles_dir.join("TinyPoe2Smoother");
+        match fs::remove_dir_all(&custom_bundle_dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to remove generated bundle directory {}",
+                        custom_bundle_dir.display()
+                    )
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+fn storage_bundle_path(bundle_name: &str) -> String {
+    format!("Bundles2/{bundle_name}.bundle.bin")
 }
 
 impl BundleIndex {
@@ -635,10 +963,10 @@ impl BundleIndex {
             .any(|bundle| bundle.name.starts_with(prefix))
     }
 
-    pub fn create_custom_bundle(&mut self) -> Result<u32> {
+    pub fn create_custom_bundle(&mut self, name_prefix: &str) -> Result<u32> {
         let mut ordinal = 0usize;
         loop {
-            let name = format!("TinyPoe2Smoother/{ordinal}");
+            let name = format!("{name_prefix}{ordinal}");
             if !self.bundles.iter().any(|bundle| bundle.name == name) {
                 let bundle_index = u32::try_from(self.bundles.len())?;
                 let mut record = Vec::new();
@@ -674,11 +1002,16 @@ pub fn apply_bundle_replacements(
     store: &BundleStore,
     index: &mut BundleIndex,
     replacements: &HashMap<String, Vec<(BundleFile, Vec<u8>)>>,
-) -> Result<Vec<PathBuf>> {
+    backup: Option<&BackupStore>,
+) -> Result<BundleWriteReport> {
     crate::timing!("apply_replacements_total");
     let mut touched = Vec::new();
     let mut generated_bundle_paths: Vec<PathBuf> = Vec::new();
-    let custom_bundle_index = index.create_custom_bundle()?;
+    let custom_prefix = match store.layout {
+        InstallLayout::LooseBundles => "TinyPoe2Smoother/",
+        InstallLayout::ContentGgpk => "TinyPoe2Smoother_",
+    };
+    let custom_bundle_index = index.create_custom_bundle(custom_prefix)?;
     let custom_bundle_name = index.bundles[custom_bundle_index as usize].name.clone();
     let mut custom_data = Vec::new();
 
@@ -702,6 +1035,21 @@ pub fn apply_bundle_replacements(
     index.update_bundle_size(custom_bundle_index, u32::try_from(custom_data.len())?)?;
 
     let out = pack_uncompressed_bundle(&custom_data)?;
+    let index_bytes = index.packed_bytes()?;
+
+    if matches!(store.layout, InstallLayout::ContentGgpk) {
+        let plan = store.prepare_ggpk_patch(&custom_bundle_name, &out, &index_bytes)?;
+        let backup =
+            backup.ok_or_else(|| anyhow!("standalone GGPK patch requires a backup store"))?;
+        backup.ensure_ggpk_backup_meta(&store.game_dir, plan.backup)?;
+        store.apply_ggpk_patch(&plan)?;
+        store.remove_legacy_overlay_files()?;
+        touched.push(store.content_path.clone());
+        return Ok(BundleWriteReport {
+            touched_paths: touched,
+        });
+    }
+
     let custom_path = store.bundle_path(&custom_bundle_name);
     if let Some(parent) = custom_path.parent() {
         fs::create_dir_all(parent)?;
@@ -719,7 +1067,6 @@ pub fn apply_bundle_replacements(
     generated_bundle_paths.push(custom_path.clone());
     touched.push(custom_path);
 
-    let index_bytes = index.packed_bytes()?;
     if let Err(e) = atomic_write(&store.index_path, &index_bytes) {
         // Index replacement failed; remove the orphaned generated bundle
         for p in &generated_bundle_paths {
@@ -728,7 +1075,9 @@ pub fn apply_bundle_replacements(
         return Err(e.context("failed to replace index; generated bundle has been cleaned up"));
     }
     touched.push(store.index_path.clone());
-    Ok(touched)
+    Ok(BundleWriteReport {
+        touched_paths: touched,
+    })
 }
 
 fn sort_edits_by_index_order(
@@ -920,6 +1269,344 @@ fn read_nul_utf8(cursor: &mut Cursor<&[u8]>) -> Result<String> {
     String::from_utf8(bytes).context("path data is not UTF-8")
 }
 
+fn ggpk_find_file(ggpk: &GGPK, wanted: &str) -> Result<Option<GgpkFileSpan>> {
+    ggpk_find_record(ggpk, 0, "", wanted)
+}
+
+fn ggpk_find_pdir(ggpk: &GGPK, wanted: &str) -> Result<Option<GgpkPdirRecord>> {
+    ggpk_find_pdir_record(ggpk, 0, "", wanted, None)
+}
+
+fn ggpk_find_pdir_record(
+    ggpk: &GGPK,
+    offset: u64,
+    base: &str,
+    wanted: &str,
+    parent_offset_pos: Option<u64>,
+) -> Result<Option<GgpkPdirRecord>> {
+    if offset as usize + 8 > ggpk.mmap.len() {
+        bail!("GGPK record offset {offset} is outside Content.ggpk");
+    }
+    let mut cursor = Cursor::new(ggpk.mmap.as_ref());
+    cursor.set_position(offset);
+
+    let _record_size = cursor.read_u32::<LittleEndian>()? as u64;
+    let record_tag = read_ggpk_record_tag(&mut cursor)?;
+    match record_tag.as_str() {
+        "GGPK" => {
+            let _version = cursor.read_u32::<LittleEndian>()?;
+            let records = (_record_size.saturating_sub(12)) / 8;
+            for _ in 0..records {
+                let child_offset_pos = cursor.position();
+                let child_offset = cursor.read_u64::<LittleEndian>()?;
+                if let Some(record) =
+                    ggpk_find_pdir_record(ggpk, child_offset, base, wanted, Some(child_offset_pos))?
+                {
+                    return Ok(Some(record));
+                }
+            }
+            Ok(None)
+        }
+        "PDIR" => {
+            let _name_length = cursor.read_u32::<LittleEndian>()?;
+            let entries_len = cursor.read_u32::<LittleEndian>()?;
+            let mut digest = [0u8; 32];
+            cursor.read_exact(&mut digest)?;
+            let name = read_ggpk_string(&mut cursor, ggpk.version.use_utf32())?;
+            let path = join_ggpk_path(base, &name);
+            if path == wanted {
+                let entries_start = cursor.position();
+                let mut entries = Vec::with_capacity(entries_len as usize);
+                for i in 0..entries_len {
+                    let entry_pos = entries_start + u64::from(i) * 12;
+                    let mut entry = Cursor::new(ggpk.mmap.as_ref());
+                    entry.set_position(entry_pos);
+                    let name_hash = entry.read_u32::<LittleEndian>()?;
+                    let child_offset = entry.read_u64::<LittleEndian>()?;
+                    let child_name = ggpk_record_name(ggpk, child_offset)?;
+                    entries.push(GgpkPdirEntry {
+                        name: child_name,
+                        name_hash,
+                        offset: child_offset,
+                    });
+                }
+                return Ok(Some(GgpkPdirRecord {
+                    name,
+                    offset,
+                    digest,
+                    entries,
+                    parent_offset_pos,
+                }));
+            }
+            if !path_could_contain(&path, wanted) {
+                return Ok(None);
+            }
+
+            let entries_start = cursor.position();
+            for i in 0..entries_len {
+                let mut entry = Cursor::new(ggpk.mmap.as_ref());
+                entry.set_position(entries_start + u64::from(i) * 12 + 4);
+                let offset_pos = entry.position();
+                let child_offset = entry.read_u64::<LittleEndian>()?;
+                if let Some(record) =
+                    ggpk_find_pdir_record(ggpk, child_offset, &path, wanted, Some(offset_pos))?
+                {
+                    return Ok(Some(record));
+                }
+            }
+            Ok(None)
+        }
+        "FILE" | "FREE" => Ok(None),
+        other => bail!("unsupported GGPK record type {other}"),
+    }
+}
+
+fn ggpk_find_record(
+    ggpk: &GGPK,
+    offset: u64,
+    base: &str,
+    wanted: &str,
+) -> Result<Option<GgpkFileSpan>> {
+    if offset as usize + 8 > ggpk.mmap.len() {
+        bail!("GGPK record offset {offset} is outside Content.ggpk");
+    }
+    let mut cursor = Cursor::new(ggpk.mmap.as_ref());
+    cursor.set_position(offset);
+
+    let record_size = cursor.read_u32::<LittleEndian>()? as u64;
+    let record_tag = read_ggpk_record_tag(&mut cursor)?;
+    match record_tag.as_str() {
+        "GGPK" => {
+            let _version = cursor.read_u32::<LittleEndian>()?;
+            let records = (record_size.saturating_sub(12)) / 8;
+            for _ in 0..records {
+                let child_offset = cursor.read_u64::<LittleEndian>()?;
+                if let Some(span) = ggpk_find_record(ggpk, child_offset, base, wanted)? {
+                    return Ok(Some(span));
+                }
+            }
+            Ok(None)
+        }
+        "PDIR" => {
+            let _name_length = cursor.read_u32::<LittleEndian>()?;
+            let entries_len = cursor.read_u32::<LittleEndian>()?;
+            cursor.seek(SeekFrom::Current(32))?;
+            let name = read_ggpk_string(&mut cursor, ggpk.version.use_utf32())?;
+            let path = join_ggpk_path(base, &name);
+            if !path_could_contain(&path, wanted) {
+                return Ok(None);
+            }
+
+            let entries_start = cursor.position();
+            for i in 0..entries_len {
+                let mut entry = Cursor::new(ggpk.mmap.as_ref());
+                entry.set_position(entries_start + u64::from(i) * 12);
+                entry.seek(SeekFrom::Current(4))?;
+                let child_offset = entry.read_u64::<LittleEndian>()?;
+                if let Some(span) = ggpk_find_record(ggpk, child_offset, &path, wanted)? {
+                    return Ok(Some(span));
+                }
+            }
+            Ok(None)
+        }
+        "FILE" => {
+            let _name_length = cursor.read_u32::<LittleEndian>()?;
+            cursor.seek(SeekFrom::Current(32))?;
+            let filename = read_ggpk_string(&mut cursor, ggpk.version.use_utf32())?;
+            let path = join_ggpk_path(base, &filename);
+            if path != wanted {
+                return Ok(None);
+            }
+            let data_start = cursor.position() as usize;
+            let record_end = usize::try_from(offset + record_size)?;
+            if record_end < data_start || record_end > ggpk.mmap.len() {
+                bail!("GGPK file record for {wanted} has invalid bounds");
+            }
+            Ok(Some(GgpkFileSpan {
+                begin: data_start,
+                len: record_end - data_start,
+            }))
+        }
+        "FREE" => Ok(None),
+        other => bail!("unsupported GGPK record type {other}"),
+    }
+}
+
+fn ggpk_record_name(ggpk: &GGPK, offset: u64) -> Result<String> {
+    if offset as usize + 16 > ggpk.mmap.len() {
+        bail!("GGPK record offset {offset} is outside Content.ggpk");
+    }
+    let mut cursor = Cursor::new(ggpk.mmap.as_ref());
+    cursor.set_position(offset);
+    let _record_size = cursor.read_u32::<LittleEndian>()?;
+    let record_tag = read_ggpk_record_tag(&mut cursor)?;
+    match record_tag.as_str() {
+        "PDIR" => {
+            let _name_length = cursor.read_u32::<LittleEndian>()?;
+            let _entries_len = cursor.read_u32::<LittleEndian>()?;
+            cursor.seek(SeekFrom::Current(32))?;
+            read_ggpk_string(&mut cursor, ggpk.version.use_utf32())
+        }
+        "FILE" => {
+            let _name_length = cursor.read_u32::<LittleEndian>()?;
+            cursor.seek(SeekFrom::Current(32))?;
+            read_ggpk_string(&mut cursor, ggpk.version.use_utf32())
+        }
+        other => bail!("expected GGPK named record, found {other}"),
+    }
+}
+
+fn read_ggpk_record_tag(cursor: &mut Cursor<&[u8]>) -> Result<String> {
+    let mut bytes = [0u8; 4];
+    cursor.read_exact(&mut bytes)?;
+    String::from_utf8(bytes.to_vec()).context("GGPK record tag is not UTF-8")
+}
+
+fn read_ggpk_string(cursor: &mut Cursor<&[u8]>, utf32: bool) -> Result<String> {
+    if utf32 {
+        let mut chars = Vec::new();
+        loop {
+            let value = cursor.read_u32::<LittleEndian>()?;
+            if value == 0 {
+                break;
+            }
+            chars.push(std::char::from_u32(value).ok_or_else(|| {
+                anyhow!("GGPK path contains invalid UTF-32 scalar value {value:#x}")
+            })?);
+        }
+        Ok(chars.into_iter().collect())
+    } else {
+        let mut units = Vec::new();
+        loop {
+            let value = cursor.read_u16::<LittleEndian>()?;
+            if value == 0 {
+                break;
+            }
+            units.push(value);
+        }
+        String::from_utf16(&units).context("GGPK path is not valid UTF-16")
+    }
+}
+
+fn join_ggpk_path(base: &str, name: &str) -> String {
+    match (base.is_empty(), name.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => name.to_string(),
+        (false, true) => base.to_string(),
+        (false, false) => format!("{base}/{name}"),
+    }
+}
+
+fn ggpk_file_record(name: &str, data: &[u8], utf32: bool) -> Result<Vec<u8>> {
+    let name_bytes = ggpk_name_bytes(name, utf32);
+    let mut out = Vec::new();
+    out.write_u32::<LittleEndian>(u32::try_from(
+        4 + 4 + 4 + 32 + name_bytes.len() + data.len(),
+    )?)?;
+    out.extend_from_slice(b"FILE");
+    out.write_u32::<LittleEndian>(ggpk_name_units(name)?)?;
+    out.extend_from_slice(&[0; 32]);
+    out.extend_from_slice(&name_bytes);
+    out.extend_from_slice(data);
+    Ok(out)
+}
+
+fn ggpk_pdir_record(
+    name: &str,
+    digest: &[u8; 32],
+    entries: &[GgpkPdirEntry],
+    utf32: bool,
+) -> Result<Vec<u8>> {
+    let name_bytes = ggpk_name_bytes(name, utf32);
+    let mut out = Vec::new();
+    out.write_u32::<LittleEndian>(u32::try_from(
+        4 + 4 + 4 + 4 + 32 + name_bytes.len() + entries.len() * 12,
+    )?)?;
+    out.extend_from_slice(b"PDIR");
+    out.write_u32::<LittleEndian>(ggpk_name_units(name)?)?;
+    out.write_u32::<LittleEndian>(u32::try_from(entries.len())?)?;
+    out.extend_from_slice(digest);
+    out.extend_from_slice(&name_bytes);
+    for entry in entries {
+        out.write_u32::<LittleEndian>(entry.name_hash)?;
+        out.write_u64::<LittleEndian>(entry.offset)?;
+    }
+    Ok(out)
+}
+
+fn ggpk_name_units(name: &str) -> Result<u32> {
+    Ok(u32::try_from(name.chars().count() + 1)?)
+}
+
+fn ggpk_name_bytes(name: &str, utf32: bool) -> Vec<u8> {
+    if utf32 {
+        name.chars()
+            .map(|ch| ch as u32)
+            .chain(std::iter::once(0))
+            .flat_map(u32::to_le_bytes)
+            .collect()
+    } else {
+        name.encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    }
+}
+
+fn ggpk_name_hash(name: &str) -> u32 {
+    let lower = name.to_lowercase();
+    let bytes = lower
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    murmur2_32(&bytes)
+}
+
+fn murmur2_32(data: &[u8]) -> u32 {
+    let m = 0x5bd1_e995u32;
+    let r = 24u32;
+    let len = data.len() as u32;
+    let mut h = len;
+    let chunks = data.chunks_exact(4);
+    let rem = chunks.remainder();
+
+    for chunk in chunks {
+        let mut k = u32::from_le_bytes(chunk.try_into().expect("chunk size"));
+        k = k.wrapping_mul(m);
+        k ^= k >> r;
+        k = k.wrapping_mul(m);
+        h = h.wrapping_mul(m);
+        h ^= k;
+    }
+
+    match rem.len() {
+        3 => {
+            h ^= u32::from(rem[2]) << 16;
+            h ^= u32::from(rem[1]) << 8;
+            h ^= u32::from(rem[0]);
+            h = h.wrapping_mul(m);
+        }
+        2 => {
+            h ^= u32::from(rem[1]) << 8;
+            h ^= u32::from(rem[0]);
+            h = h.wrapping_mul(m);
+        }
+        1 => {
+            h ^= u32::from(rem[0]);
+            h = h.wrapping_mul(m);
+        }
+        _ => {}
+    }
+
+    h ^= h >> 13;
+    h = h.wrapping_mul(m);
+    h ^ (h >> 15)
+}
+
+fn path_could_contain(path: &str, wanted: &str) -> bool {
+    path.is_empty() || wanted == path || wanted.starts_with(&format!("{path}/"))
+}
+
 pub fn filepath_hash(path: &str) -> u64 {
     fnv1a_bundle_hash(path)
 }
@@ -992,6 +1679,8 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ggpk::GGPK;
+    use std::fs;
 
     #[test]
     fn uncompressed_bundle_round_trip() {
@@ -1033,6 +1722,72 @@ mod tests {
     }
 
     #[test]
+    fn content_ggpk_reader_ignores_loose_overlay_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game");
+        fs::create_dir_all(&game).unwrap();
+        write_test_ggpk(
+            &game.join("Content.ggpk"),
+            "Bundles2/_.index.bin",
+            b"ggpk-index",
+        );
+
+        let ggpk = GGPK::from_file(&game.join("Content.ggpk")).unwrap();
+        let span = ggpk_find_file(&ggpk, "Bundles2/_.index.bin")
+            .unwrap()
+            .unwrap();
+        assert_eq!(&ggpk.mmap[span.begin..span.begin + span.len], b"ggpk-index");
+
+        let store = BundleStore::new(&game);
+        assert_eq!(store.read_index_bytes().unwrap(), b"ggpk-index");
+
+        fs::create_dir_all(game.join("Bundles2")).unwrap();
+        fs::write(game.join("Bundles2/_.index.bin"), b"loose-index").unwrap();
+        let store = BundleStore::new(&game);
+        assert_eq!(store.read_index_bytes().unwrap(), b"ggpk-index");
+    }
+
+    #[test]
+    fn ggpk_patch_appends_records_and_restores_pointer() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game");
+        fs::create_dir_all(&game).unwrap();
+        let content = game.join("Content.ggpk");
+        write_test_ggpk_files(
+            &content,
+            "Bundles2",
+            &[
+                ("_.index.bin", b"old-index".as_slice()),
+                ("Base.bundle.bin", b"old-bundle".as_slice()),
+            ],
+        );
+        let original_len = fs::metadata(&content).unwrap().len();
+
+        let store = BundleStore::new(&game);
+        let plan = store
+            .prepare_ggpk_patch("TinyPoe2Smoother_0", b"new-bundle", b"new-index")
+            .unwrap();
+        assert_eq!(plan.backup.appended_start, original_len);
+        store.apply_ggpk_patch(&plan).unwrap();
+
+        let mut patched = BundleStore::new(&game);
+        assert_eq!(patched.read_index_bytes().unwrap(), b"new-index");
+        assert_eq!(
+            patched
+                .read_storage_file("Bundles2/TinyPoe2Smoother_0.bundle.bin")
+                .unwrap(),
+            b"new-bundle"
+        );
+        assert!(!game.join("Bundles2/_.index.bin").exists());
+
+        patched.restore_ggpk_backup(plan.backup).unwrap();
+        assert!(patched.ggpk.is_none());
+        let restored = BundleStore::new(&game);
+        assert_eq!(restored.read_index_bytes().unwrap(), b"old-index");
+        assert_eq!(fs::metadata(&content).unwrap().len(), original_len);
+    }
+
+    #[test]
     fn replacement_edits_sort_by_index_order_map() {
         let mut edits = vec![
             (
@@ -1057,5 +1812,86 @@ mod tests {
             .map(|(file, _)| file.hash)
             .collect::<Vec<_>>();
         assert_eq!(hashes, vec![10, 20, 30]);
+    }
+
+    fn write_test_ggpk(path: &Path, file_path: &str, data: &[u8]) {
+        let (dir_name, file_name) = file_path.split_once('/').unwrap();
+        write_test_ggpk_files(path, dir_name, &[(file_name, data)]);
+    }
+
+    fn write_test_ggpk_files(path: &Path, dir_name: &str, files: &[(&str, &[u8])]) {
+        let root_pdir_size = pdir_record_size("", 1);
+        let dir_pdir_size = pdir_record_size(dir_name, files.len());
+        let root_offset = 20u64;
+        let dir_offset = root_offset + root_pdir_size as u64;
+        let mut file_offsets = Vec::with_capacity(files.len());
+        let mut file_records = Vec::with_capacity(files.len());
+        let mut next_offset = dir_offset + dir_pdir_size as u64;
+        for (name, data) in files {
+            let record = file_record(name, data);
+            file_offsets.push(next_offset);
+            next_offset += record.len() as u64;
+            file_records.push(record);
+        }
+
+        let mut out = Vec::new();
+        out.write_u32::<LittleEndian>(20).unwrap();
+        out.extend_from_slice(b"GGPK");
+        out.write_u32::<LittleEndian>(3).unwrap();
+        out.write_u64::<LittleEndian>(root_offset).unwrap();
+        write_pdir_record(&mut out, "", &[(dir_name, dir_offset)]);
+        let children = files
+            .iter()
+            .zip(file_offsets)
+            .map(|((name, _), offset)| (*name, offset))
+            .collect::<Vec<_>>();
+        write_pdir_record(&mut out, dir_name, &children);
+        for record in file_records {
+            out.extend_from_slice(&record);
+        }
+
+        fs::write(path, out).unwrap();
+    }
+
+    fn pdir_record_size(name: &str, entries: usize) -> usize {
+        4 + 4 + 4 + 4 + 32 + utf16_nul_bytes(name).len() + entries * 12
+    }
+
+    fn write_pdir_record(out: &mut Vec<u8>, name: &str, children: &[(&str, u64)]) {
+        out.write_u32::<LittleEndian>(pdir_record_size(name, children.len()) as u32)
+            .unwrap();
+        out.extend_from_slice(b"PDIR");
+        out.write_u32::<LittleEndian>((name.len() + 1) as u32)
+            .unwrap();
+        out.write_u32::<LittleEndian>(children.len() as u32)
+            .unwrap();
+        out.extend_from_slice(&[0; 32]);
+        out.extend_from_slice(&utf16_nul_bytes(name));
+        for (child_name, offset) in children {
+            out.write_u32::<LittleEndian>(ggpk_name_hash(child_name))
+                .unwrap();
+            out.write_u64::<LittleEndian>(*offset).unwrap();
+        }
+    }
+
+    fn file_record(name: &str, data: &[u8]) -> Vec<u8> {
+        let name_bytes = utf16_nul_bytes(name);
+        let mut out = Vec::new();
+        out.write_u32::<LittleEndian>((4 + 4 + 4 + 32 + name_bytes.len() + data.len()) as u32)
+            .unwrap();
+        out.extend_from_slice(b"FILE");
+        out.write_u32::<LittleEndian>((name.len() + 1) as u32)
+            .unwrap();
+        out.extend_from_slice(&[0; 32]);
+        out.extend_from_slice(&name_bytes);
+        out.extend_from_slice(data);
+        out
+    }
+
+    fn utf16_nul_bytes(text: &str) -> Vec<u8> {
+        text.encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(u16::to_le_bytes)
+            .collect()
     }
 }

@@ -9,6 +9,8 @@ const MAGIC: u32 = 0x4B425332; // "2SBK"
 const VERSION: u32 = 2;
 const APP_NAME: &str = env!("CARGO_PKG_NAME");
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const GGPK_META_PATH: &str = "__tiny_poe2smoother/ggpk-meta-v1";
+const GGPK_META_MAGIC: u32 = 0x4D475032; // "2PGM"
 
 #[derive(Debug, Clone)]
 pub struct BackupEntry {
@@ -21,6 +23,14 @@ pub struct BackupStore {
     path: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GgpkBackupMeta {
+    pub bundles2_offset_pos: u64,
+    pub original_bundles2_offset: u64,
+    pub appended_start: u64,
+    pub appended_end: u64,
+}
+
 impl BackupStore {
     pub fn default() -> Result<Self> {
         let base = dirs::data_local_dir()
@@ -30,6 +40,11 @@ impl BackupStore {
         Ok(Self {
             path: dir.join("poe2.bak"),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_path(path: PathBuf) -> Self {
+        Self { path }
     }
 
     pub fn path(&self) -> &Path {
@@ -61,7 +76,40 @@ impl BackupStore {
         Ok(self.entries()?.len())
     }
 
+    pub fn ggpk_backup_meta(&self) -> Result<Option<GgpkBackupMeta>> {
+        Ok(self
+            .entries()?
+            .into_iter()
+            .find(|entry| is_ggpk_meta_path(&entry.rel_path))
+            .map(|entry| decode_ggpk_meta(&entry.bytes))
+            .transpose()?)
+    }
+
+    pub fn ensure_ggpk_backup_meta(&self, game_dir: &Path, meta: GgpkBackupMeta) -> Result<()> {
+        self.ensure_original_bytes(
+            game_dir,
+            &[(PathBuf::from(GGPK_META_PATH), encode_ggpk_meta(meta)?)],
+        )
+    }
+
     pub fn ensure_originals(&self, game_dir: &Path, rel_paths: &[PathBuf]) -> Result<()> {
+        let entries = rel_paths
+            .iter()
+            .map(|rel_path| {
+                let abs = game_dir.join(rel_path);
+                let bytes = fs::read(&abs)
+                    .with_context(|| format!("failed to backup {}", abs.display()))?;
+                Ok((rel_path.clone(), bytes))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.ensure_original_bytes(game_dir, &entries)
+    }
+
+    pub fn ensure_original_bytes(
+        &self,
+        game_dir: &Path,
+        entries: &[(PathBuf, Vec<u8>)],
+    ) -> Result<()> {
         let mut known = HashSet::new();
         if self.path.exists() {
             for entry in self.entries()? {
@@ -86,28 +134,39 @@ impl BackupStore {
             .open(&self.path)
             .with_context(|| format!("failed to open backup {}", self.path.display()))?;
 
-        for rel_path in rel_paths {
+        for (rel_path, bytes) in entries {
             if !known.insert(rel_path.clone()) {
                 continue;
             }
-            let abs = game_dir.join(rel_path);
-            let bytes =
-                fs::read(&abs).with_context(|| format!("failed to backup {}", abs.display()))?;
             let path_bytes = rel_path.to_string_lossy().as_bytes().to_vec();
             file.write_u32::<LittleEndian>(path_bytes.len() as u32)?;
             file.write_all(&path_bytes)?;
             file.write_u64::<LittleEndian>(bytes.len() as u64)?;
-            file.write_all(&bytes)?;
+            file.write_all(bytes)?;
         }
         file.flush()?;
         file.sync_all()?;
         Ok(())
     }
 
-    pub fn restore(&self, game_dir: &Path) -> Result<usize> {
+    pub fn restore(&self, game_dir: &Path, remove_overlay_index: bool) -> Result<usize> {
         let entries = self.entries()?;
         for entry in &entries {
+            if is_ggpk_meta_path(&entry.rel_path) {
+                continue;
+            }
             let path = game_dir.join(&entry.rel_path);
+            if remove_overlay_index && entry.rel_path == PathBuf::from("Bundles2/_.index.bin") {
+                match fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        return Err(err)
+                            .with_context(|| format!("failed to remove {}", path.display()));
+                    }
+                }
+                continue;
+            }
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -132,6 +191,33 @@ impl BackupStore {
         }
         Ok(entries.len())
     }
+}
+
+fn is_ggpk_meta_path(path: &Path) -> bool {
+    path == Path::new(GGPK_META_PATH)
+}
+
+fn encode_ggpk_meta(meta: GgpkBackupMeta) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    out.write_u32::<LittleEndian>(GGPK_META_MAGIC)?;
+    out.write_u64::<LittleEndian>(meta.bundles2_offset_pos)?;
+    out.write_u64::<LittleEndian>(meta.original_bundles2_offset)?;
+    out.write_u64::<LittleEndian>(meta.appended_start)?;
+    out.write_u64::<LittleEndian>(meta.appended_end)?;
+    Ok(out)
+}
+
+fn decode_ggpk_meta(bytes: &[u8]) -> Result<GgpkBackupMeta> {
+    let mut cursor = Cursor::new(bytes);
+    if cursor.read_u32::<LittleEndian>()? != GGPK_META_MAGIC {
+        bail!("backup contains invalid GGPK metadata");
+    }
+    Ok(GgpkBackupMeta {
+        bundles2_offset_pos: cursor.read_u64::<LittleEndian>()?,
+        original_bundles2_offset: cursor.read_u64::<LittleEndian>()?,
+        appended_start: cursor.read_u64::<LittleEndian>()?,
+        appended_end: cursor.read_u64::<LittleEndian>()?,
+    })
 }
 
 fn read_entries(path: &Path) -> Result<Vec<BackupEntry>> {
@@ -193,7 +279,7 @@ mod tests {
         )
         .unwrap();
         fs::write(game.join("Bundles2/_.index.bin"), b"changed").unwrap();
-        assert_eq!(store.restore(&game).unwrap(), 1);
+        assert_eq!(store.restore(&game, false).unwrap(), 1);
         assert_eq!(
             fs::read(game.join("Bundles2/_.index.bin")).unwrap(),
             b"index"
@@ -214,5 +300,52 @@ mod tests {
         store.remove().unwrap();
 
         assert!(!store.path.exists());
+    }
+
+    #[test]
+    fn standalone_overlay_restore_removes_index_overlay() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BackupStore {
+            path: temp.path().join("poe2.bak"),
+        };
+        let game = temp.path().join("game");
+        fs::create_dir_all(game.join("Bundles2/TinyPoe2Smoother")).unwrap();
+        store
+            .ensure_original_bytes(
+                &game,
+                &[(PathBuf::from("Bundles2/_.index.bin"), b"original".to_vec())],
+            )
+            .unwrap();
+        fs::write(game.join("Bundles2/_.index.bin"), b"patched").unwrap();
+        fs::write(
+            game.join("Bundles2/TinyPoe2Smoother/0.bundle.bin"),
+            b"custom",
+        )
+        .unwrap();
+
+        assert_eq!(store.restore(&game, true).unwrap(), 1);
+        assert!(!game.join("Bundles2/_.index.bin").exists());
+        assert!(!game.join("Bundles2/TinyPoe2Smoother").exists());
+    }
+
+    #[test]
+    fn ggpk_backup_meta_round_trips() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BackupStore {
+            path: temp.path().join("poe2.bak"),
+        };
+        let game = temp.path().join("game");
+        let meta = GgpkBackupMeta {
+            bundles2_offset_pos: 11,
+            original_bundles2_offset: 22,
+            appended_start: 33,
+            appended_end: 44,
+        };
+
+        store.ensure_ggpk_backup_meta(&game, meta).unwrap();
+
+        assert_eq!(store.ggpk_backup_meta().unwrap(), Some(meta));
+        assert_eq!(store.restore(&game, false).unwrap(), 1);
+        assert!(!store.has_backup());
     }
 }

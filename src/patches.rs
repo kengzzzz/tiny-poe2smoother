@@ -256,7 +256,8 @@ pub fn all_presets() -> &'static [PresetInfo] {
         },
         PresetInfo {
             name: "high-performance",
-            description: "Aggressive performance preset with effects, particles, sounds, and MTX reduced.",
+            description:
+                "Aggressive performance preset with effects, particles, sounds, and MTX reduced.",
             patches: &[
                 PatchId::Fog,
                 PatchId::Rain,
@@ -579,8 +580,7 @@ fn patch_targets_path(patch: PatchId, path: &str) -> bool {
         PatchId::MonsterSounds => {
             (starts_with_path_ci(path, "metadata/effects/spells/monsters_effects")
                 && is_metadata_anim_ext(path))
-                || (starts_with_path_ci(path, "metadata/monsters")
-                    && is_metadata_anim_ext(path))
+                || (starts_with_path_ci(path, "metadata/monsters") && is_metadata_anim_ext(path))
         }
         PatchId::MtxSoft => {
             starts_with_path_ci(path, "metadata/effects/microtransactions")
@@ -630,8 +630,7 @@ fn patch_applies_path(patch: PatchId, path: &str) -> bool {
         PatchId::MonsterSounds => {
             (starts_with_path_ci(path, "metadata/effects/spells/monsters_effects")
                 && is_metadata_anim_ext(path))
-                || (starts_with_path_ci(path, "metadata/monsters")
-                    && is_metadata_anim_ext(path))
+                || (starts_with_path_ci(path, "metadata/monsters") && is_metadata_anim_ext(path))
         }
         PatchId::MtxSoft => {
             starts_with_path_ci(path, "metadata/effects/microtransactions")
@@ -1485,12 +1484,10 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(paths.contains(&"metadata/effects/spells/fireball/fireball.ao".to_string()));
-        assert!(paths.contains(
-            &"metadata/effects/spells/monsters_effects/boss/roar.aoc".to_string()
-        ));
-        assert!(paths.contains(
-            &"metadata/effects/microtransactions/portal/portal.pet".to_string()
-        ));
+        assert!(
+            paths.contains(&"metadata/effects/spells/monsters_effects/boss/roar.aoc".to_string())
+        );
+        assert!(paths.contains(&"metadata/effects/microtransactions/portal/portal.pet".to_string()));
         assert!(paths.contains(&"metadata/monsters/foo/bar.ot".to_string()));
         // sound patches must not grab particle .pet files (that is the particles
         // patch's job); only .ao/.aoc/.ot/.otc are sound targets.
@@ -1604,8 +1601,7 @@ SoundEvents {}\r\n}";
             ("metadata/terrain/trees/tree.ao", "terrain", 12),
         ]);
 
-        let candidates =
-            collect_patch_targets(&mut index, &[PatchId::DisableSounds]).unwrap();
+        let candidates = collect_patch_targets(&mut index, &[PatchId::DisableSounds]).unwrap();
         let paths = dedup_candidates(candidates)
             .into_iter()
             .map(|(path, _)| path)

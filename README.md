@@ -8,7 +8,7 @@ GUI tool that patches Path of Exile 2 bundle files to disable visual effects for
 - Sound and MTX patches write ground-truth-derived, structurally valid bytes, so they never corrupt files or crash the game
 - Camera zoom adjustment (1.2x -- 2.4x)
 - Safe modification via Oodle-compressed bundle patching with atomic writes
-- Automatic Steam install detection, including secondary Steam library drives
+- Automatic Steam and standalone install detection, including secondary Steam library drives
 - Saved GUI options between launches
 - Backup and restore
 
@@ -40,18 +40,24 @@ In the app:
 
 - Apply is one-shot. Restore first before applying a different patch selection.
 - Apply and restore are blocked while Path of Exile 2 is running.
-- If the game crashes after using an older smoother release, verify Path of Exile 2 files in Steam before applying again.
+- If the game crashes after using an older smoother release, verify Path of Exile 2 files in Steam or the standalone launcher before applying again.
 - If a Path of Exile 2 update changes the bundle layout, the app may refuse to apply until tiny-poe2smoother is updated.
 
 ### Build from source
 
 ```sh
-cargo build --release
+cargo build --release --bin tiny-poe2smoother
 ```
+
+Use `cargo run --release` to launch the GUI directly from source.
 
 Linux build requires GTK3, XCB, and Wayland development libraries for the GUI binary.
 
 Cross-compilation for Windows and Linux via Docker is supported (see `Dockerfile`).
+
+## Credits
+
+The GUI embeds the [Inter](https://github.com/rsms/inter) typeface, licensed under the [SIL Open Font License 1.1](assets/fonts/OFL.txt).
 
 ## How it works
 
