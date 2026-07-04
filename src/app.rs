@@ -76,6 +76,7 @@ pub struct ApplyReport {
 pub struct RestoreReport {
     pub game_dir: PathBuf,
     pub restored_files: usize,
+    pub backup_removed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -244,32 +245,42 @@ pub fn apply_patches(request: PatchRequest) -> Result<ApplyReport> {
         })?;
     }
 
-    let rel_paths = vec![(
-        PathBuf::from("Bundles2/_.index.bin"),
-        store.read_index_bytes()?,
-    )];
+    if !matches!(store.layout, InstallLayout::ContentGgpk) {
+        let rel_paths = vec![(
+            PathBuf::from("Bundles2/_.index.bin"),
+            store.read_index_bytes()?,
+        )];
 
-    backup
-        .ensure_original_bytes(&game_dir, &rel_paths)
-        .with_context(|| {
-            format!(
-                "failed to create backup at {};\n  check disk space and permissions",
-                backup.path().display()
-            )
-        })?;
+        backup
+            .ensure_original_bytes(&game_dir, &rel_paths)
+            .with_context(|| {
+                format!(
+                    "failed to create backup at {};\n  check disk space and permissions",
+                    backup.path().display()
+                )
+            })?;
+    }
 
-    let touched_paths = apply_bundle_replacements(&store, &mut index, &patch_set.replacements)
-        .with_context(|| {
-            format!(
-                "failed to write generated bundle to {};\n  restore first if partially applied",
-                store.bundles_dir.join("TinyPoe2Smoother").display()
-            )
-        })?;
+    let write_target = match store.layout {
+        InstallLayout::ContentGgpk => store.index_display_path(),
+        InstallLayout::LooseBundles => store
+            .bundles_dir
+            .join("TinyPoe2Smoother")
+            .display()
+            .to_string(),
+    };
+    let write_report =
+        apply_bundle_replacements(&store, &mut index, &patch_set.replacements, Some(&backup))
+            .with_context(|| {
+                format!(
+                    "failed to write generated bundle to {write_target};\n  restore first if partially applied"
+                )
+            })?;
 
     Ok(ApplyReport {
         game_dir,
         changed_files: patch_set.changes.len(),
-        touched_paths,
+        touched_paths: write_report.touched_paths,
         backup_path: backup.path().to_path_buf(),
     })
 }
@@ -278,6 +289,10 @@ pub fn restore_backup(game_dir: Option<PathBuf>) -> Result<RestoreReport> {
     ensure_game_not_running()?;
     let game_dir = resolve_game_dir(game_dir)?;
     let backup = BackupStore::default()?;
+    restore_backup_with_store(game_dir, backup)
+}
+
+fn restore_backup_with_store(game_dir: PathBuf, backup: BackupStore) -> Result<RestoreReport> {
     let restored_files = if backup.has_backup() {
         if backup.count()? == 0 {
             bail!(
@@ -285,7 +300,7 @@ pub fn restore_backup(game_dir: Option<PathBuf>) -> Result<RestoreReport> {
                 backup.path().display()
             );
         }
-        let store = BundleStore::new(&game_dir);
+        let mut store = BundleStore::new(&game_dir);
         let index = store.open_index().with_context(|| {
             format!(
                 "failed to read current index before restore: {}",
@@ -293,16 +308,34 @@ pub fn restore_backup(game_dir: Option<PathBuf>) -> Result<RestoreReport> {
             )
         })?;
         if !index_is_patched(&index) {
-            bail!(
-                "backup at {} is obsolete because the current game index is not patched;\n\
-                 apply patches again to replace it with a fresh backup",
-                backup.path().display()
-            );
+            backup.remove().with_context(|| {
+                format!(
+                    "failed to remove obsolete backup at {}",
+                    backup.path().display()
+                )
+            })?;
+            store.clear_cache();
+            return Ok(RestoreReport {
+                game_dir,
+                restored_files: 0,
+                backup_removed: true,
+            });
         }
         let overlay_restore = matches!(
             detect_install_layout(&game_dir)?,
             InstallLayout::ContentGgpk
         );
+        if overlay_restore {
+            if let Some(meta) = backup.ggpk_backup_meta()? {
+                store.restore_ggpk_backup(meta).with_context(|| {
+                    format!(
+                        "failed to restore {};\n  backup may be corrupt",
+                        store.index_display_path()
+                    )
+                })?;
+                store.remove_legacy_overlay_files()?;
+            }
+        }
         backup
             .restore(&game_dir, overlay_restore)
             .with_context(|| {
@@ -320,6 +353,7 @@ pub fn restore_backup(game_dir: Option<PathBuf>) -> Result<RestoreReport> {
     Ok(RestoreReport {
         game_dir,
         restored_files,
+        backup_removed: restored_files > 0,
     })
 }
 
@@ -333,7 +367,9 @@ fn classify_patch_state(has_backup: bool, index_is_patched: bool) -> PatchState 
 }
 
 fn index_is_patched(index: &BundleIndex) -> bool {
-    index.has_bundle_prefix("TinyPoe2Smoother/") || index.has_bundle_prefix("LibGGPK3/")
+    index.has_bundle_prefix("TinyPoe2Smoother/")
+        || index.has_bundle_prefix("TinyPoe2Smoother_")
+        || index.has_bundle_prefix("LibGGPK3/")
 }
 
 fn ensure_can_apply(patch_state: PatchState, backup_path: &Path) -> Result<()> {
@@ -414,6 +450,9 @@ pub fn inspect_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backup::BackupStore;
+    use crate::bundle::pack_uncompressed_bundle;
+    use std::fs;
 
     #[test]
     fn patch_state_classifies_backup_and_index_combinations() {
@@ -424,6 +463,30 @@ mod tests {
             classify_patch_state(false, true),
             PatchState::PatchedMissingBackup
         );
+    }
+
+    #[test]
+    fn restore_removes_obsolete_backup_when_index_is_clean() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game");
+        fs::create_dir_all(game.join("Bundles2")).unwrap();
+        fs::write(game.join("Bundles2/_.index.bin"), test_index_bytes(&[])).unwrap();
+        let backup = BackupStore::for_path(temp.path().join("poe2.bak"));
+        backup
+            .ensure_original_bytes(
+                &game,
+                &[(
+                    PathBuf::from("Bundles2/_.index.bin"),
+                    test_index_bytes(&["TinyPoe2Smoother/0"]),
+                )],
+            )
+            .unwrap();
+
+        let report = restore_backup_with_store(game, backup.clone()).unwrap();
+
+        assert_eq!(report.restored_files, 0);
+        assert!(report.backup_removed);
+        assert!(!backup.has_backup());
     }
 
     #[test]
@@ -521,5 +584,22 @@ mod tests {
             maps,
             vec![PatchId::Minimap, PatchId::AtlasFog, PatchId::Particles]
         );
+    }
+
+    fn test_index_bytes(bundle_names: &[&str]) -> Vec<u8> {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&(bundle_names.len() as u32).to_le_bytes());
+        for bundle_name in bundle_names {
+            raw.extend_from_slice(&(bundle_name.len() as u32).to_le_bytes());
+            raw.extend_from_slice(bundle_name.as_bytes());
+            raw.extend_from_slice(&0u32.to_le_bytes());
+        }
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        raw.extend_from_slice(&1u32.to_le_bytes());
+        raw.extend_from_slice(&0x07E47507B4A92E53u64.to_le_bytes());
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        pack_uncompressed_bundle(&raw).unwrap()
     }
 }

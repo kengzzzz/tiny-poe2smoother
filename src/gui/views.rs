@@ -346,13 +346,6 @@ fn draw_action_bar(app: &mut GuiApp, ui: &mut egui::Ui) {
                                     .fill(palette::ACCENT)
                                     .corner_radius(2),
                             );
-                        } else {
-                            let color = match app.message_kind {
-                                MessageKind::Info => palette::TEXT_MUTED,
-                                MessageKind::Success => palette::SUCCESS,
-                                MessageKind::Error => palette::ERROR,
-                            };
-                            ui.label(egui::RichText::new(&app.message).size(11.5).color(color));
                         }
                     });
                 });

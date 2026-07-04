@@ -67,7 +67,10 @@ struct GuiPrefs {
 enum TaskResult {
     Status(Result<AppStatus, String>),
     Apply(Result<ApplyReport, String>),
-    Restore(Result<RestoreReport, String>),
+    Restore {
+        result: Result<RestoreReport, String>,
+        status: Result<AppStatus, String>,
+    },
 }
 
 impl Default for GuiApp {
@@ -207,7 +210,9 @@ impl GuiApp {
     fn spawn_restore(&mut self) {
         let game_dir = self.game_dir();
         self.spawn("Restoring backup...", move || {
-            TaskResult::Restore(restore_backup(game_dir).map_err(|err| err.to_string()))
+            let result = restore_backup(game_dir.clone()).map_err(|err| err.to_string());
+            let status = load_status(game_dir).map_err(|err| err.to_string());
+            TaskResult::Restore { result, status }
         });
     }
 
@@ -236,9 +241,8 @@ impl GuiApp {
         match result {
             TaskResult::Status(result) => match result {
                 Ok(status) => {
-                    self.game_dir_input = display_path(&status.game_dir);
+                    self.apply_status(status);
                     self.set_message("Install detected.", MessageKind::Success);
-                    self.status = Some(status);
                 }
                 Err(err) => self.set_message(err, MessageKind::Error),
             },
@@ -257,17 +261,31 @@ impl GuiApp {
                 }
                 Err(err) => self.set_message(err, MessageKind::Error),
             },
-            TaskResult::Restore(result) => match result {
-                Ok(report) => {
-                    self.set_message(
-                        format!("Restored {} file(s).", report.restored_files),
-                        MessageKind::Success,
-                    );
-                    self.spawn_status();
+            TaskResult::Restore { result, status } => {
+                match status {
+                    Ok(status) => self.apply_status(status),
+                    Err(_) => self.status = None,
                 }
-                Err(err) => self.set_message(err, MessageKind::Error),
-            },
+                match result {
+                    Ok(report) => {
+                        let message = if report.backup_removed && report.restored_files == 0 {
+                            "Removed obsolete backup.".to_string()
+                        } else if report.restored_files == 0 {
+                            "No backup found.".to_string()
+                        } else {
+                            format!("Restored {} file(s).", report.restored_files)
+                        };
+                        self.set_message(message, MessageKind::Success);
+                    }
+                    Err(err) => self.set_message(err, MessageKind::Error),
+                }
+            }
         }
+    }
+
+    fn apply_status(&mut self, status: AppStatus) {
+        self.game_dir_input = display_path(&status.game_dir);
+        self.status = Some(status);
     }
 }
 
