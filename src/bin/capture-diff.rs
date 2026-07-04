@@ -115,7 +115,10 @@ struct Change {
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 4 {
-        eprintln!("usage: {} <before_game_dir> <after_game_dir> <out_dir>", args[0]);
+        eprintln!(
+            "usage: {} <before_game_dir> <after_game_dir> <out_dir>",
+            args[0]
+        );
         std::process::exit(2);
     }
     let before_dir = PathBuf::from(&args[1]);
@@ -147,17 +150,24 @@ fn main() -> Result<()> {
     // DUMP_NEEDLE (writes <out>/dump/<i>.{path,before,after}). For rule derivation.
     if let Ok(needle) = std::env::var("DUMP_NEEDLE") {
         let needle = needle.to_ascii_lowercase();
-        let n: usize = std::env::var("DUMP_N").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+        let n: usize = std::env::var("DUMP_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20);
         let mut hits: Vec<&String> = after
             .files
             .keys()
             .filter(|p| {
                 let pl = p.to_ascii_lowercase();
                 pl.contains(&needle)
-                    && before.files.get(*p).map(|bf| {
-                        let af = &after.files[*p];
-                        bf.bundle_name != af.bundle_name || bf.size != af.size
-                    }).unwrap_or(false)
+                    && before
+                        .files
+                        .get(*p)
+                        .map(|bf| {
+                            let af = &after.files[*p];
+                            bf.bundle_name != af.bundle_name || bf.size != af.size
+                        })
+                        .unwrap_or(false)
             })
             .collect();
         hits.sort();
@@ -187,7 +197,10 @@ fn main() -> Result<()> {
     }
 
     // Pass 1: index-record diff. Classify each after path; collect bundles to read.
-    eprintln!("classifying {} after paths via index records…", after.files.len());
+    eprintln!(
+        "classifying {} after paths via index records…",
+        after.files.len()
+    );
     let mut definite: Vec<(String, &'static str)> = Vec::new(); // path, status (changed/added)
     let mut maybe: Vec<String> = Vec::new(); // same bundle + same size -> needs byte compare
     for (path, af) in &after.files {
@@ -222,8 +235,14 @@ fn main() -> Result<()> {
     }
     eprintln!(
         "decompressing {} after bundles + {} before bundles (present-only)…",
-        after_needed.iter().filter(|n| after.present.contains(*n)).count(),
-        before_needed.iter().filter(|n| before.present.contains(*n)).count(),
+        after_needed
+            .iter()
+            .filter(|n| after.present.contains(*n))
+            .count(),
+        before_needed
+            .iter()
+            .filter(|n| before.present.contains(*n))
+            .count(),
     );
     let after_bundles = decompress_present(&after, &after_needed);
     let before_bundles = decompress_present(&before, &before_needed);
@@ -270,8 +289,8 @@ fn main() -> Result<()> {
         // mismatch buckets:
         let mut mm_pet = 0usize; // mtx .pet: we write "0"; the reference keeps a template.
         let mut mm_idempotent = 0usize; // sound file: our output is a *superset* of the reference.
-        // (re-running our transform on captured bytes is a no-op => we agree on sound blocks,
-        //  the size diff is other-option content we correctly leave alone)
+                                        // (re-running our transform on captured bytes is a no-op => we agree on sound blocks,
+                                        //  the size diff is other-option content we correctly leave alone)
         let mut mm_other: Vec<(String, usize, usize)> = Vec::new(); // anything unexplained (must be 0)
         for (path, _) in &all {
             let Some(before_bytes) = read(&before, &before_bundles, path) else {
@@ -286,7 +305,8 @@ fn main() -> Result<()> {
                     targeted += 1;
                     if out == after_bytes {
                         matched += 1;
-                    } else if patch == PatchId::MtxSoft && path.to_ascii_lowercase().ends_with(".pet")
+                    } else if patch == PatchId::MtxSoft
+                        && path.to_ascii_lowercase().ends_with(".pet")
                     {
                         mm_pet += 1;
                     } else if audit_transform(patch, path, &after_bytes)
@@ -371,12 +391,19 @@ fn main() -> Result<()> {
     fs::write(out_dir.join("manifest.csv"), manifest)?;
     fs::write(
         out_dir.join("removed.txt"),
-        removed.iter().map(|p| p.as_str()).collect::<Vec<_>>().join("\n"),
+        removed
+            .iter()
+            .map(|p| p.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
     )?;
     let mut blob_seen: HashSet<u64> = HashSet::new();
     for c in &sorted {
         if blob_seen.insert(c.content_hash) {
-            fs::write(blobs_dir.join(format!("{:016x}.bin", c.content_hash)), &c.bytes)?;
+            fs::write(
+                blobs_dir.join(format!("{:016x}.bin", c.content_hash)),
+                &c.bytes,
+            )?;
         }
     }
 
@@ -399,8 +426,15 @@ fn main() -> Result<()> {
     }
     let total_blob_bytes: usize = blob_size.values().sum();
     println!("\n==== capture-diff summary ====");
-    println!("changed: {n_changed}   added: {n_added}   removed: {}", removed.len());
-    println!("unique content blobs: {}  (total {} bytes)", blob_refs.len(), total_blob_bytes);
+    println!(
+        "changed: {n_changed}   added: {n_added}   removed: {}",
+        removed.len()
+    );
+    println!(
+        "unique content blobs: {}  (total {} bytes)",
+        blob_refs.len(),
+        total_blob_bytes
+    );
     println!("\nby extension (changed / added):");
     for (ext, (ch, ad)) in &by_ext {
         let e = if ext.is_empty() { "(none)" } else { ext };

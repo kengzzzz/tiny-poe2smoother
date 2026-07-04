@@ -1,7 +1,6 @@
 pub mod app;
 pub mod backup;
 pub mod bundle;
-pub mod cli;
 pub mod install;
 pub mod patches;
 

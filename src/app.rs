@@ -1,6 +1,8 @@
 use crate::backup::{BackupEntry, BackupStore};
 use crate::bundle::{apply_bundle_replacements, BundleIndex, BundleStore};
-use crate::install::{ensure_game_not_running, resolve_game_dir};
+use crate::install::{
+    detect_install_layout, ensure_game_not_running, resolve_game_dir, InstallLayout,
+};
 use crate::patches::{
     all_patches, all_presets, compute_patch_set, parse_patch, parse_preset, PatchChange, PatchId,
 };
@@ -33,6 +35,8 @@ impl PatchState {
 pub struct AppStatus {
     pub game_dir: PathBuf,
     pub index_path: PathBuf,
+    pub index_display_path: String,
+    pub install_layout: InstallLayout,
     pub indexed_paths: usize,
     pub backup_path: PathBuf,
     pub has_backup: bool,
@@ -97,10 +101,13 @@ pub fn load_status(game_dir: Option<PathBuf>) -> Result<AppStatus> {
     let backup = BackupStore::default()?;
     let has_backup = backup.has_backup();
     let patch_state = classify_patch_state(has_backup, index_is_patched(&index));
+    let index_display_path = store.index_display_path();
 
     Ok(AppStatus {
         game_dir,
         index_path: store.index_path,
+        index_display_path,
+        install_layout: store.layout,
         indexed_paths,
         backup_path: backup.path().to_path_buf(),
         has_backup,
@@ -190,18 +197,18 @@ pub fn apply_patches(request: PatchRequest) -> Result<ApplyReport> {
     let store = BundleStore::new(&game_dir);
     let backup = BackupStore::default()?;
 
-    if !store.index_path.exists() {
+    if !store.index_exists()? {
         bail!(
-            "index file not found at {};\nverify game install or pass --game-dir",
-            store.index_path.display()
+            "index file not found at {};\nverify game install or choose the game folder with Browse",
+            store.index_display_path()
         );
     }
 
     let mut index = match store.open_index() {
         Ok(idx) => idx,
         Err(e) => bail!(
-            "failed to read/decode {};\n  cause: {}\nverify game files via Steam",
-            store.index_path.display(),
+            "failed to read/decode {};\n  cause: {}\nverify game files with Steam or the standalone launcher",
+            store.index_display_path(),
             e
         ),
     };
@@ -219,12 +226,11 @@ pub fn apply_patches(request: PatchRequest) -> Result<ApplyReport> {
 
     // Verify each patch target exists before proceeding
     for change in &patch_set.changes {
-        let bundle_path = store.bundle_path(&change.bundle_name);
-        if !bundle_path.exists() {
+        if !store.bundle_exists(&change.bundle_name)? {
             bail!(
-                "bundle file required by '{}' not found: {};\nverify game files via Steam",
+                "bundle file required by '{}' not found: {};\nverify game files with Steam or the standalone launcher",
                 change.path,
-                bundle_path.display()
+                store.bundle_display_path(&change.bundle_name)
             );
         }
     }
@@ -238,10 +244,13 @@ pub fn apply_patches(request: PatchRequest) -> Result<ApplyReport> {
         })?;
     }
 
-    let rel_paths = vec![PathBuf::from("Bundles2/_.index.bin")];
+    let rel_paths = vec![(
+        PathBuf::from("Bundles2/_.index.bin"),
+        store.read_index_bytes()?,
+    )];
 
     backup
-        .ensure_originals(&game_dir, &rel_paths)
+        .ensure_original_bytes(&game_dir, &rel_paths)
         .with_context(|| {
             format!(
                 "failed to create backup at {};\n  check disk space and permissions",
@@ -280,7 +289,7 @@ pub fn restore_backup(game_dir: Option<PathBuf>) -> Result<RestoreReport> {
         let index = store.open_index().with_context(|| {
             format!(
                 "failed to read current index before restore: {}",
-                store.index_path.display()
+                store.index_display_path()
             )
         })?;
         if !index_is_patched(&index) {
@@ -290,12 +299,18 @@ pub fn restore_backup(game_dir: Option<PathBuf>) -> Result<RestoreReport> {
                 backup.path().display()
             );
         }
-        backup.restore(&game_dir).with_context(|| {
-            format!(
-                "restore from {} failed;\n  backup may be corrupt",
-                backup.path().display()
-            )
-        })?
+        let overlay_restore = matches!(
+            detect_install_layout(&game_dir)?,
+            InstallLayout::ContentGgpk
+        );
+        backup
+            .restore(&game_dir, overlay_restore)
+            .with_context(|| {
+                format!(
+                    "restore from {} failed;\n  backup may be corrupt",
+                    backup.path().display()
+                )
+            })?
     } else {
         eprintln!("No backup found at {}", backup.path().display());
         0
@@ -332,7 +347,7 @@ fn ensure_can_apply(patch_state: PatchState, backup_path: &Path) -> Result<()> {
         ),
         PatchState::PatchedMissingBackup => bail!(
             "game index is already patched by tiny-poe2smoother, but no backup was found;\n\
-             verify game files via Steam before applying again"
+             verify game files with Steam or the standalone launcher before applying again"
         ),
     }
 }

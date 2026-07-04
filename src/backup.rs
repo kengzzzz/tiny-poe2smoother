@@ -62,6 +62,23 @@ impl BackupStore {
     }
 
     pub fn ensure_originals(&self, game_dir: &Path, rel_paths: &[PathBuf]) -> Result<()> {
+        let entries = rel_paths
+            .iter()
+            .map(|rel_path| {
+                let abs = game_dir.join(rel_path);
+                let bytes = fs::read(&abs)
+                    .with_context(|| format!("failed to backup {}", abs.display()))?;
+                Ok((rel_path.clone(), bytes))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.ensure_original_bytes(game_dir, &entries)
+    }
+
+    pub fn ensure_original_bytes(
+        &self,
+        game_dir: &Path,
+        entries: &[(PathBuf, Vec<u8>)],
+    ) -> Result<()> {
         let mut known = HashSet::new();
         if self.path.exists() {
             for entry in self.entries()? {
@@ -86,28 +103,36 @@ impl BackupStore {
             .open(&self.path)
             .with_context(|| format!("failed to open backup {}", self.path.display()))?;
 
-        for rel_path in rel_paths {
+        for (rel_path, bytes) in entries {
             if !known.insert(rel_path.clone()) {
                 continue;
             }
-            let abs = game_dir.join(rel_path);
-            let bytes =
-                fs::read(&abs).with_context(|| format!("failed to backup {}", abs.display()))?;
             let path_bytes = rel_path.to_string_lossy().as_bytes().to_vec();
             file.write_u32::<LittleEndian>(path_bytes.len() as u32)?;
             file.write_all(&path_bytes)?;
             file.write_u64::<LittleEndian>(bytes.len() as u64)?;
-            file.write_all(&bytes)?;
+            file.write_all(bytes)?;
         }
         file.flush()?;
         file.sync_all()?;
         Ok(())
     }
 
-    pub fn restore(&self, game_dir: &Path) -> Result<usize> {
+    pub fn restore(&self, game_dir: &Path, remove_overlay_index: bool) -> Result<usize> {
         let entries = self.entries()?;
         for entry in &entries {
             let path = game_dir.join(&entry.rel_path);
+            if remove_overlay_index && entry.rel_path == PathBuf::from("Bundles2/_.index.bin") {
+                match fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        return Err(err)
+                            .with_context(|| format!("failed to remove {}", path.display()));
+                    }
+                }
+                continue;
+            }
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -193,7 +218,7 @@ mod tests {
         )
         .unwrap();
         fs::write(game.join("Bundles2/_.index.bin"), b"changed").unwrap();
-        assert_eq!(store.restore(&game).unwrap(), 1);
+        assert_eq!(store.restore(&game, false).unwrap(), 1);
         assert_eq!(
             fs::read(game.join("Bundles2/_.index.bin")).unwrap(),
             b"index"
@@ -214,5 +239,31 @@ mod tests {
         store.remove().unwrap();
 
         assert!(!store.path.exists());
+    }
+
+    #[test]
+    fn standalone_overlay_restore_removes_index_overlay() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BackupStore {
+            path: temp.path().join("poe2.bak"),
+        };
+        let game = temp.path().join("game");
+        fs::create_dir_all(game.join("Bundles2/TinyPoe2Smoother")).unwrap();
+        store
+            .ensure_original_bytes(
+                &game,
+                &[(PathBuf::from("Bundles2/_.index.bin"), b"original".to_vec())],
+            )
+            .unwrap();
+        fs::write(game.join("Bundles2/_.index.bin"), b"patched").unwrap();
+        fs::write(
+            game.join("Bundles2/TinyPoe2Smoother/0.bundle.bin"),
+            b"custom",
+        )
+        .unwrap();
+
+        assert_eq!(store.restore(&game, true).unwrap(), 1);
+        assert!(!game.join("Bundles2/_.index.bin").exists());
+        assert!(!game.join("Bundles2/TinyPoe2Smoother").exists());
     }
 }

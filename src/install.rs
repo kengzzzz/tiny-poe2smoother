@@ -5,6 +5,21 @@ use sysinfo::System;
 
 const POE2_APP_ID: &str = "2694490";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallLayout {
+    LooseBundles,
+    ContentGgpk,
+}
+
+impl InstallLayout {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::LooseBundles => "loose Bundles2",
+            Self::ContentGgpk => "standalone Content.ggpk",
+        }
+    }
+}
+
 pub fn resolve_game_dir(explicit: Option<PathBuf>) -> Result<PathBuf> {
     crate::timing!("resolve_game_dir");
     if let Some(path) = explicit {
@@ -27,23 +42,41 @@ pub fn resolve_game_dir(explicit: Option<PathBuf>) -> Result<PathBuf> {
         }
     }
 
+    for candidate in standalone_candidates() {
+        if candidate.exists() {
+            return validate_game_dir(candidate);
+        }
+    }
+
     bail!(
         "could not autodetect Path of Exile 2;\n\
-         use Browse/--game-dir <path>, or verify Steam and its library folders\n\
-         Searched default Steam folders and configured Steam libraries"
+         use Browse to choose the game folder, or verify Steam/standalone install paths\n\
+         Searched default Steam folders, configured Steam libraries, and standalone locations"
     );
 }
 
 pub fn validate_game_dir(path: PathBuf) -> Result<PathBuf> {
-    let index = path.join("Bundles2").join("_.index.bin");
-    if !index.exists() {
-        return Err(anyhow!(
-            "{} does not look like a POE2 install; missing {}",
-            path.display(),
-            index.display()
-        ));
-    }
+    detect_install_layout(&path)?;
     Ok(path)
+}
+
+pub fn detect_install_layout(path: &Path) -> Result<InstallLayout> {
+    let content = path.join("Content.ggpk");
+    if content.exists() {
+        return Ok(InstallLayout::ContentGgpk);
+    }
+
+    let index = path.join("Bundles2").join("_.index.bin");
+    if index.exists() {
+        return Ok(InstallLayout::LooseBundles);
+    }
+
+    Err(anyhow!(
+        "{} does not look like a POE2 install; missing {} or {}",
+        path.display(),
+        index.display(),
+        content.display()
+    ))
 }
 
 pub fn ensure_game_not_running() -> Result<()> {
@@ -90,6 +123,64 @@ fn steam_candidates() -> Vec<PathBuf> {
         }
     }
     expand_steam_libraries(out)
+}
+
+fn standalone_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(program_files_x86) = std::env::var_os("ProgramFiles(x86)") {
+            push_unique(
+                &mut out,
+                &mut seen,
+                PathBuf::from(program_files_x86)
+                    .join("Grinding Gear Games")
+                    .join("Path of Exile 2"),
+            );
+        }
+        if let Some(program_files) = std::env::var_os("ProgramFiles") {
+            push_unique(
+                &mut out,
+                &mut seen,
+                PathBuf::from(program_files)
+                    .join("Grinding Gear Games")
+                    .join("Path of Exile 2"),
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Some(prefix) = std::env::var_os("WINEPREFIX") {
+            push_wine_standalone_candidates(&mut out, &mut seen, PathBuf::from(prefix));
+        }
+        if let Some(home) = dirs::home_dir() {
+            push_wine_standalone_candidates(&mut out, &mut seen, home.join(".wine"));
+        }
+    }
+
+    out
+}
+
+#[cfg(not(target_os = "windows"))]
+fn push_wine_standalone_candidates(
+    out: &mut Vec<PathBuf>,
+    seen: &mut HashSet<PathBuf>,
+    prefix: PathBuf,
+) {
+    for program_dir in ["Program Files (x86)", "Program Files"] {
+        push_unique(
+            out,
+            seen,
+            prefix
+                .join("drive_c")
+                .join(program_dir)
+                .join("Grinding Gear Games")
+                .join("Path of Exile 2"),
+        );
+    }
 }
 
 fn expand_steam_libraries(roots: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -158,6 +249,60 @@ pub fn display_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    #[test]
+    fn validates_loose_bundle_install() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("Path of Exile 2");
+        fs::create_dir_all(game.join("Bundles2")).unwrap();
+        fs::write(game.join("Bundles2/_.index.bin"), b"index").unwrap();
+
+        assert_eq!(
+            detect_install_layout(&game).unwrap(),
+            InstallLayout::LooseBundles
+        );
+        assert_eq!(validate_game_dir(game.clone()).unwrap(), game);
+    }
+
+    #[test]
+    fn validates_standalone_content_ggpk_install() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("Path of Exile 2");
+        fs::create_dir_all(&game).unwrap();
+        fs::write(game.join("Content.ggpk"), b"ggpk").unwrap();
+
+        assert_eq!(
+            detect_install_layout(&game).unwrap(),
+            InstallLayout::ContentGgpk
+        );
+        assert_eq!(validate_game_dir(game.clone()).unwrap(), game);
+    }
+
+    #[test]
+    fn content_ggpk_layout_wins_when_overlay_index_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("Path of Exile 2");
+        fs::create_dir_all(game.join("Bundles2")).unwrap();
+        fs::write(game.join("Content.ggpk"), b"ggpk").unwrap();
+        fs::write(game.join("Bundles2/_.index.bin"), b"index").unwrap();
+
+        assert_eq!(
+            detect_install_layout(&game).unwrap(),
+            InstallLayout::ContentGgpk
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_install_layout() {
+        let temp = tempfile::tempdir().unwrap();
+        let err = validate_game_dir(temp.path().to_path_buf())
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("Bundles2"));
+        assert!(err.contains("Content.ggpk"));
+    }
 
     #[test]
     fn parses_steam_install_dir() {

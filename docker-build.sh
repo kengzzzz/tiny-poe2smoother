@@ -61,10 +61,10 @@ fetch() {
 
 build() {
     if [ "$TARGET" = "x86_64-unknown-linux-gnu" ]; then
-        cargo build --release --target "$TARGET"
+        cargo build --release --target "$TARGET" --bin tiny-poe2smoother
     else
         CMAKE_TOOLCHAIN_FILE=/cmake-toolchain.cmake \
-        cargo build --release --target "$TARGET"
+        cargo build --release --target "$TARGET" --bin tiny-poe2smoother
     fi
 }
 
@@ -73,7 +73,7 @@ export_binaries() {
 
     case "$TARGET" in
         x86_64-pc-windows-gnu)
-            cp "target/$TARGET/release/tiny-poe2smoother-gui.exe" /output/poe2smoother-windows-x86_64.exe
+            cp "target/$TARGET/release/tiny-poe2smoother.exe" /output/poe2smoother-windows-x86_64.exe
             for dll_name in libstdc++-6 libwinpthread-1 libgcc_s_seh-1; do
                 if x86_64-w64-mingw32-objdump -p /output/poe2smoother-windows-x86_64.exe | grep -qi "DLL Name: ${dll_name}.dll"; then
                     echo "Windows GUI exe imports ${dll_name}.dll; refusing to export a broken single-file release." >&2
@@ -84,7 +84,7 @@ export_binaries() {
 
         x86_64-unknown-linux-gnu)
             mkdir -p /tmp/linux-release
-            cp "target/$TARGET/release/tiny-poe2smoother-gui" /tmp/linux-release/poe2smoother
+            cp "target/$TARGET/release/tiny-poe2smoother" /tmp/linux-release/poe2smoother
             chmod +x /tmp/linux-release/poe2smoother
             cat > /tmp/linux-release/README.txt << 'READMEOF'
 poe2smoother Linux portable GUI
