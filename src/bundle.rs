@@ -2,7 +2,6 @@ use crate::backup::{BackupStore, GgpkBackupMeta};
 use crate::install::{detect_install_layout, InstallLayout};
 use anyhow::{anyhow, bail, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use ggpk::GGPK;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::convert::TryFrom;
@@ -28,6 +27,33 @@ extern "C" {
         lrm: *mut c_void,
     ) -> c_int;
     fn Ooz_GetCompressedBufferSizeNeeded(size: c_int) -> c_int;
+}
+
+pub struct GgpkArchive {
+    pub mmap: memmap2::Mmap,
+    utf32_paths: bool,
+}
+
+impl GgpkArchive {
+    pub fn from_file(path: &Path) -> Result<Self> {
+        let file = fs::File::open(path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        let mmap = unsafe { memmap2::Mmap::map(&file) }
+            .with_context(|| format!("failed to map {}", path.display()))?;
+        if mmap.len() < 12 {
+            bail!("{} is too small to be a GGPK archive", path.display());
+        }
+        let version = u32::from_le_bytes(mmap[8..12].try_into().expect("length checked"));
+        // Version ids 2 and 3 store names as UTF-16; 4 (and anything newer/unknown) as UTF-32.
+        Ok(Self {
+            mmap,
+            utf32_paths: !matches!(version, 2 | 3),
+        })
+    }
+
+    fn use_utf32(&self) -> bool {
+        self.utf32_paths
+    }
 }
 
 const BUNDLE_CHUNK_SIZE: usize = 0x40000;
@@ -117,7 +143,7 @@ pub struct BundleStore {
     pub index_path: PathBuf,
     pub layout: InstallLayout,
     content_path: PathBuf,
-    ggpk: Option<Arc<GGPK>>,
+    ggpk: Option<Arc<GgpkArchive>>,
 }
 
 #[derive(Debug, Clone)]
@@ -170,7 +196,7 @@ impl BundleStore {
         let content_path = game_dir.join("Content.ggpk");
         let layout = detect_install_layout(&game_dir).unwrap_or(InstallLayout::LooseBundles);
         let ggpk = if matches!(layout, InstallLayout::ContentGgpk) {
-            GGPK::from_file(&content_path).ok().map(Arc::new)
+            GgpkArchive::from_file(&content_path).ok().map(Arc::new)
         } else {
             None
         };
@@ -530,7 +556,7 @@ impl BundleStore {
         ggpk_find_file(self.open_ggpk()?.as_ref(), rel_path)
     }
 
-    fn open_ggpk(&self) -> Result<Arc<GGPK>> {
+    fn open_ggpk(&self) -> Result<Arc<GgpkArchive>> {
         self.ggpk
             .clone()
             .ok_or_else(|| anyhow!("failed to open {}", self.content_path.display()))
@@ -560,12 +586,12 @@ impl BundleStore {
         }
 
         let appended_start = fs::metadata(&self.content_path)?.len();
-        let index_record = ggpk_file_record("_.index.bin", index_bytes, ggpk.version.use_utf32())?;
+        let index_record = ggpk_file_record("_.index.bin", index_bytes, ggpk.use_utf32())?;
         let custom_file_name = format!("{custom_bundle_name}.bundle.bin");
         let custom_record = ggpk_file_record(
             &custom_file_name,
             custom_bundle_bytes,
-            ggpk.version.use_utf32(),
+            ggpk.use_utf32(),
         )?;
         let index_offset = appended_start;
         let custom_offset = index_offset + u64::try_from(index_record.len())?;
@@ -596,7 +622,7 @@ impl BundleStore {
             &bundles2.name,
             &bundles2.digest,
             &entries,
-            ggpk.version.use_utf32(),
+            ggpk.use_utf32(),
         )?;
 
         let mut append_bytes = Vec::new();
@@ -1268,16 +1294,16 @@ fn read_nul_utf8(cursor: &mut Cursor<&[u8]>) -> Result<String> {
     String::from_utf8(bytes).context("path data is not UTF-8")
 }
 
-fn ggpk_find_file(ggpk: &GGPK, wanted: &str) -> Result<Option<GgpkFileSpan>> {
+fn ggpk_find_file(ggpk: &GgpkArchive, wanted: &str) -> Result<Option<GgpkFileSpan>> {
     ggpk_find_record(ggpk, 0, "", wanted)
 }
 
-fn ggpk_find_pdir(ggpk: &GGPK, wanted: &str) -> Result<Option<GgpkPdirRecord>> {
+fn ggpk_find_pdir(ggpk: &GgpkArchive, wanted: &str) -> Result<Option<GgpkPdirRecord>> {
     ggpk_find_pdir_record(ggpk, 0, "", wanted, None)
 }
 
 fn ggpk_find_pdir_record(
-    ggpk: &GGPK,
+    ggpk: &GgpkArchive,
     offset: u64,
     base: &str,
     wanted: &str,
@@ -1311,7 +1337,7 @@ fn ggpk_find_pdir_record(
             let entries_len = cursor.read_u32::<LittleEndian>()?;
             let mut digest = [0u8; 32];
             cursor.read_exact(&mut digest)?;
-            let name = read_ggpk_string(&mut cursor, ggpk.version.use_utf32())?;
+            let name = read_ggpk_string(&mut cursor, ggpk.use_utf32())?;
             let path = join_ggpk_path(base, &name);
             if path == wanted {
                 let entries_start = cursor.position();
@@ -1361,7 +1387,7 @@ fn ggpk_find_pdir_record(
 }
 
 fn ggpk_find_record(
-    ggpk: &GGPK,
+    ggpk: &GgpkArchive,
     offset: u64,
     base: &str,
     wanted: &str,
@@ -1390,7 +1416,7 @@ fn ggpk_find_record(
             let _name_length = cursor.read_u32::<LittleEndian>()?;
             let entries_len = cursor.read_u32::<LittleEndian>()?;
             cursor.seek(SeekFrom::Current(32))?;
-            let name = read_ggpk_string(&mut cursor, ggpk.version.use_utf32())?;
+            let name = read_ggpk_string(&mut cursor, ggpk.use_utf32())?;
             let path = join_ggpk_path(base, &name);
             if !path_could_contain(&path, wanted) {
                 return Ok(None);
@@ -1411,7 +1437,7 @@ fn ggpk_find_record(
         "FILE" => {
             let _name_length = cursor.read_u32::<LittleEndian>()?;
             cursor.seek(SeekFrom::Current(32))?;
-            let filename = read_ggpk_string(&mut cursor, ggpk.version.use_utf32())?;
+            let filename = read_ggpk_string(&mut cursor, ggpk.use_utf32())?;
             let path = join_ggpk_path(base, &filename);
             if path != wanted {
                 return Ok(None);
@@ -1431,7 +1457,7 @@ fn ggpk_find_record(
     }
 }
 
-fn ggpk_record_name(ggpk: &GGPK, offset: u64) -> Result<String> {
+fn ggpk_record_name(ggpk: &GgpkArchive, offset: u64) -> Result<String> {
     if offset as usize + 16 > ggpk.mmap.len() {
         bail!("GGPK record offset {offset} is outside Content.ggpk");
     }
@@ -1444,12 +1470,12 @@ fn ggpk_record_name(ggpk: &GGPK, offset: u64) -> Result<String> {
             let _name_length = cursor.read_u32::<LittleEndian>()?;
             let _entries_len = cursor.read_u32::<LittleEndian>()?;
             cursor.seek(SeekFrom::Current(32))?;
-            read_ggpk_string(&mut cursor, ggpk.version.use_utf32())
+            read_ggpk_string(&mut cursor, ggpk.use_utf32())
         }
         "FILE" => {
             let _name_length = cursor.read_u32::<LittleEndian>()?;
             cursor.seek(SeekFrom::Current(32))?;
-            read_ggpk_string(&mut cursor, ggpk.version.use_utf32())
+            read_ggpk_string(&mut cursor, ggpk.use_utf32())
         }
         other => bail!("expected GGPK named record, found {other}"),
     }
@@ -1678,7 +1704,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ggpk::GGPK;
+
     use std::fs;
 
     #[test]
@@ -1731,7 +1757,7 @@ mod tests {
             b"ggpk-index",
         );
 
-        let ggpk = GGPK::from_file(&game.join("Content.ggpk")).unwrap();
+        let ggpk = GgpkArchive::from_file(&game.join("Content.ggpk")).unwrap();
         let span = ggpk_find_file(&ggpk, "Bundles2/_.index.bin")
             .unwrap()
             .unwrap();

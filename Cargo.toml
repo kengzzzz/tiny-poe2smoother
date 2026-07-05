@@ -8,7 +8,7 @@ default-run = "tiny-poe2smoother"
 anyhow = "1.0"
 byteorder = "1.5"
 dirs = "6.0"
-ggpk = "1.2.2"
+memmap2 = "0.9"
 regex = "1.11"
 rayon = "1.10"
 serde = { version = "1.0", features = ["derive"] }
@@ -53,7 +53,7 @@ panic = "abort"
 [profile.release.package."*"]
 opt-level = "z"
 
-[profile.release.package.ggpk]
+[profile.release.package.memmap2]
 opt-level = 3
 
 [profile.release.package.rayon]
@@ -86,5 +86,3 @@ opt-level = 3
 [profile.release.package.memchr]
 opt-level = 3
 
-[profile.release.package.memmap]
-opt-level = 3
