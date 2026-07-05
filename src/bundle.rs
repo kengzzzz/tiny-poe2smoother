@@ -13,10 +13,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-#[link(name = "libooz", kind = "static")]
+// Symbols from vendor/ooz, compiled by build.rs; the compression entry points
+// are unmangled wrappers from vendor/ooz/ooz_shim.cpp.
 extern "C" {
     fn Ooz_Decompress(src_buf: *const u8, src_len: u32, dst: *mut u8, dst_size: usize) -> i32;
-    #[link_name = "_Z13CompressBlockiPhS_iiPK15CompressOptionsS_P10LRMCascade"]
     fn Ooz_CompressBlock(
         codec_id: c_int,
         src_in: *mut u8,
@@ -27,7 +27,6 @@ extern "C" {
         src_window_base: *mut u8,
         lrm: *mut c_void,
     ) -> c_int;
-    #[link_name = "_Z29GetCompressedBufferSizeNeededi"]
     fn Ooz_GetCompressedBufferSizeNeeded(size: c_int) -> c_int;
 }
 

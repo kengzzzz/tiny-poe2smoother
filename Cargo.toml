@@ -9,7 +9,6 @@ anyhow = "1.0"
 byteorder = "1.5"
 dirs = "6.0"
 ggpk = "1.2.2"
-poe_bundle = "0.1.5"
 regex = "1.11"
 rayon = "1.10"
 serde = { version = "1.0", features = ["derive"] }
@@ -38,6 +37,9 @@ eframe = { version = "0.35", default-features = false, features = [
 ] }
 rfd = "0.17"
 
+[build-dependencies]
+cc = { version = "1", features = ["parallel"] }
+
 [dev-dependencies]
 assert_cmd = "2.0"
 
@@ -50,9 +52,6 @@ panic = "abort"
 
 [profile.release.package."*"]
 opt-level = "z"
-
-[profile.release.package.poe_bundle]
-opt-level = 3
 
 [profile.release.package.ggpk]
 opt-level = 3

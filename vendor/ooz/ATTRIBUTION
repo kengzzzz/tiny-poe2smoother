@@ -1,0 +1,19 @@
+ooz — open-source Oodle-compatible compression/decompression
+==============================================================
+
+Origin: Copyright (C) 2016, Powzix (https://github.com/powzix/ooz)
+License: GNU General Public License v3 (see the header of kraken.cpp)
+
+These sources are the subset of ooz that the poe_bundle crate v0.1.5
+(https://crates.io/crates/poe_bundle) vendored and built as `libooz`
+(the OOZ_SOURCES list in its ooz/CMakeLists.txt), copied here verbatim
+so the library can be compiled directly by build.rs with the `cc` crate
+instead of through poe_bundle's cmake build.
+
+ooz_shim.cpp is new (this project): thin extern "C" wrappers around
+CompressBlock and GetCompressedBufferSizeNeeded so Rust FFI binds
+unmangled symbol names.
+
+Note: this code was already statically linked into release binaries of
+this project via the poe_bundle crate; vendoring it here only makes the
+provenance visible in-repo.

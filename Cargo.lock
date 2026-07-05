@@ -620,15 +620,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cmake"
-version = "0.1.58"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
-dependencies = [
- "cc",
-]
-
-[[package]]
 name = "codespan-reporting"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2476,19 +2467,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "poe_bundle"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c777a4c69995996d354b29510d46a52448d5f757b35d17d206d570c29e9be8ba"
-dependencies = [
- "byteorder",
- "cmake",
- "ggpk",
- "libc",
- "log",
-]
-
-[[package]]
 name = "polling"
 version = "3.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3208,10 +3186,10 @@ dependencies = [
  "anyhow",
  "assert_cmd",
  "byteorder",
+ "cc",
  "dirs",
  "eframe",
  "ggpk",
- "poe_bundle",
  "rayon",
  "regex",
  "rfd",
