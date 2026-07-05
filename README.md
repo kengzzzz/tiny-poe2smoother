@@ -59,6 +59,8 @@ Cross-compilation for Windows and Linux via Docker is supported (see `Dockerfile
 
 The GUI embeds the [Inter](https://github.com/rsms/inter) typeface, licensed under the [SIL Open Font License 1.1](assets/fonts/OFL.txt).
 
+Oodle-compatible compression/decompression comes from [Powzix's ooz](https://github.com/powzix/ooz) (GPL-3), vendored under `vendor/ooz/` and statically linked into release binaries — see `vendor/ooz/ATTRIBUTION`.
+
 ## How it works
 
 The tool reads the game's Oodle-compressed bundle index (`Bundles2/_.index.bin`), locates shader, particle, and effect files within bundle data, applies targeted modifications (replacing UTF-16 LE values, zeroing particle files, stripping client blocks), and writes new compressed bundles atomically. Originals are backed up to `$XDG_DATA_HOME/tiny-poe2smoother/poe2.bak`.
