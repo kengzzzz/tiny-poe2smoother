@@ -461,14 +461,28 @@ impl BundleStore {
         let file = index
             .file_by_path(path)
             .ok_or_else(|| anyhow!("path not found in bundle index: {path}"))?;
-        let bundle = self.read_bundle(&file.bundle_name)?;
-        slice_file(&bundle, &file)
+        let compressed = self
+            .read_storage_file_cow(&storage_bundle_path(&file.bundle_name))
+            .with_context(|| {
+                format!(
+                    "failed to read {}",
+                    self.bundle_display_path(&file.bundle_name)
+                )
+            })?;
+        let mut slices = decompress_bundle_slices(&compressed, &[(file.offset, file.size)])
+            .with_context(|| {
+                format!(
+                    "failed to decompress {}",
+                    self.bundle_display_path(&file.bundle_name)
+                )
+            })?;
+        Ok(slices.pop().expect("one span requested"))
     }
 
     pub fn read_bundle(&self, bundle_name: &str) -> Result<Vec<u8>> {
         let storage_path = storage_bundle_path(bundle_name);
         let bytes = self
-            .read_storage_file(&storage_path)
+            .read_storage_file_cow(&storage_path)
             .with_context(|| format!("failed to read {}", self.bundle_display_path(bundle_name)))?;
         decompress_bundle(&bytes).with_context(|| {
             format!(
@@ -501,26 +515,72 @@ impl BundleStore {
         }
     }
 
-    pub fn read_bundles_batch(&self, names: &[String]) -> Result<HashMap<String, Vec<u8>>> {
-        names
+    /// Read the bytes of each target file, decompressing only the bundle
+    /// chunks that cover them. Results are keyed by the file's index hash.
+    pub fn read_files_batch(&self, files: &[BundleFile]) -> Result<HashMap<u64, Vec<u8>>> {
+        let mut by_bundle: HashMap<&str, Vec<&BundleFile>> = HashMap::new();
+        for file in files {
+            by_bundle
+                .entry(file.bundle_name.as_str())
+                .or_default()
+                .push(file);
+        }
+        let groups: Vec<_> = by_bundle.into_iter().collect();
+        let per_bundle: Vec<Vec<(u64, Vec<u8>)>> = groups
             .par_iter()
-            .map(|name| {
-                self.read_bundle(name)
-                    .map(|data| (name.clone(), data))
-                    .with_context(|| format!("failed to read bundle batch entry: {name}"))
+            .map(|(name, files)| {
+                let compressed = self
+                    .read_storage_file_cow(&storage_bundle_path(name))
+                    .with_context(|| {
+                        format!("failed to read {}", self.bundle_display_path(name))
+                    })?;
+                let spans: Vec<(u32, u32)> =
+                    files.iter().map(|file| (file.offset, file.size)).collect();
+                let slices = decompress_bundle_slices(&compressed, &spans).with_context(|| {
+                    format!("failed to decompress {}", self.bundle_display_path(name))
+                })?;
+                Ok(files
+                    .iter()
+                    .zip(slices)
+                    .map(|(file, bytes)| (file.hash, bytes))
+                    .collect())
             })
-            .collect()
+            .collect::<Result<_>>()?;
+        Ok(per_bundle.into_iter().flatten().collect())
     }
 
     fn read_storage_file(&self, rel_path: &str) -> Result<Vec<u8>> {
+        self.read_storage_file_cow(rel_path)
+            .map(std::borrow::Cow::into_owned)
+    }
+
+    /// Read a storage file without copying when possible: the GGPK layout
+    /// returns a borrowed slice of the archive mmap.
+    fn read_storage_file_cow(&self, rel_path: &str) -> Result<std::borrow::Cow<'_, [u8]>> {
         if matches!(self.layout, InstallLayout::ContentGgpk) {
-            return self.read_ggpk_file(rel_path);
+            let span = self.ggpk_file_span(rel_path)?.ok_or_else(|| {
+                anyhow!("{} not found in {}", rel_path, self.content_path.display())
+            })?;
+            let ggpk = self.ggpk.as_ref().ok_or_else(|| {
+                anyhow!("failed to open {}", self.content_path.display())
+            })?;
+            let end = span.begin + span.len;
+            return ggpk
+                .mmap
+                .get(span.begin..end)
+                .map(std::borrow::Cow::Borrowed)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "{} points outside {}",
+                        rel_path,
+                        self.content_path.display()
+                    )
+                });
         }
         let loose = self.game_dir.join(rel_path);
-        if loose.exists() {
-            return fs::read(&loose).with_context(|| format!("failed to read {}", loose.display()));
-        }
-        fs::read(&loose).with_context(|| format!("failed to read {}", loose.display()))
+        fs::read(&loose)
+            .map(std::borrow::Cow::Owned)
+            .with_context(|| format!("failed to read {}", loose.display()))
     }
 
     fn storage_file_exists(&self, rel_path: &str) -> Result<bool> {
@@ -532,24 +592,6 @@ impl BundleStore {
             return Ok(true);
         }
         Ok(false)
-    }
-
-    fn read_ggpk_file(&self, rel_path: &str) -> Result<Vec<u8>> {
-        let span = self
-            .ggpk_file_span(rel_path)?
-            .ok_or_else(|| anyhow!("{} not found in {}", rel_path, self.content_path.display()))?;
-        let ggpk = self.open_ggpk()?;
-        let end = span.begin + span.len;
-        ggpk.mmap
-            .get(span.begin..end)
-            .map(|bytes| bytes.to_vec())
-            .ok_or_else(|| {
-                anyhow!(
-                    "{} points outside {}",
-                    rel_path,
-                    self.content_path.display()
-                )
-            })
     }
 
     fn ggpk_file_span(&self, rel_path: &str) -> Result<Option<GgpkFileSpan>> {
@@ -1112,7 +1154,27 @@ fn sort_edits_by_index_order(
     edits.sort_by_key(|(file, _)| file_order.get(&file.hash).copied().unwrap_or(usize::MAX));
 }
 
-pub fn decompress_bundle(src: &[u8]) -> Result<Vec<u8>> {
+// Oodle decoders may write up to 64 bytes past the destination end; every
+// buffer chunks decompress into must carry this slack past the last byte.
+const OOZ_SAFE_SPACE: usize = 64;
+
+struct BundleHead {
+    uncompressed_size: usize,
+    chunk_unpacked_size: usize,
+    chunk_sizes: Vec<usize>,
+    data_offset: usize,
+}
+
+impl BundleHead {
+    /// Uncompressed size of chunk `index` (the last chunk is usually short).
+    fn chunk_dst_size(&self, index: usize) -> usize {
+        let start = index * self.chunk_unpacked_size;
+        self.chunk_unpacked_size
+            .min(self.uncompressed_size.saturating_sub(start))
+    }
+}
+
+fn parse_bundle_head(src: &[u8]) -> Result<BundleHead> {
     let mut cursor = Cursor::new(src);
     let _total_uncompressed_32 = cursor.read_u32::<LittleEndian>()?;
     let _total_compressed_32 = cursor.read_u32::<LittleEndian>()?;
@@ -1130,43 +1192,148 @@ pub fn decompress_bundle(src: &[u8]) -> Result<Vec<u8>> {
     for _ in 0..chunk_count {
         chunk_sizes.push(cursor.read_u32::<LittleEndian>()? as usize);
     }
-
-    let mut offset = 12 + head_size;
-    if offset < cursor.position() as usize {
+    let data_offset = 12 + head_size;
+    if data_offset < cursor.position() as usize {
         bail!("bundle head_size is smaller than chunk table");
     }
-    let mut out = Vec::with_capacity(uncompressed_size);
-    let mut remaining = uncompressed_size;
-    for size in chunk_sizes {
+    if chunk_count > 0 && chunk_unpacked_size == 0 {
+        bail!("bundle chunk size is zero");
+    }
+    Ok(BundleHead {
+        uncompressed_size,
+        chunk_unpacked_size,
+        chunk_sizes,
+        data_offset,
+    })
+}
+
+fn decompress_chunk_into(chunk: &[u8], dst: *mut u8, dst_size: usize) -> Result<()> {
+    let wrote = unsafe {
+        Ooz_Decompress(
+            chunk.as_ptr(),
+            u32::try_from(chunk.len())?,
+            dst,
+            dst_size,
+        )
+    };
+    // Anything short of the expected size would leave stale bytes in a shared
+    // output buffer, so treat it as corruption rather than tolerating it.
+    if wrote != i32::try_from(dst_size)? {
+        bail!("Oodle decompression wrote {wrote} bytes, expected {dst_size}");
+    }
+    Ok(())
+}
+
+pub fn decompress_bundle(src: &[u8]) -> Result<Vec<u8>> {
+    let head = parse_bundle_head(src)?;
+    let mut out = vec![0u8; head.uncompressed_size + OOZ_SAFE_SPACE];
+    let mut offset = head.data_offset;
+    let mut covered = 0usize;
+    // Chunks must decompress in order: each may spill up to OOZ_SAFE_SPACE
+    // bytes past its end into the next chunk's region, which the next
+    // iteration then overwrites. Do not parallelize within this buffer.
+    for (i, &size) in head.chunk_sizes.iter().enumerate() {
         if offset + size > src.len() {
             bail!("bundle chunk exceeds source length");
         }
-        let dst_size = remaining.min(chunk_unpacked_size);
-        let chunk = &src[offset..offset + size];
-        let mut chunk_out = vec![0; dst_size + 64];
-        let wrote = unsafe {
-            Ooz_Decompress(
-                chunk.as_ptr(),
-                u32::try_from(size)?,
-                chunk_out.as_mut_ptr(),
-                dst_size,
-            )
-        };
-        if wrote < 0 {
-            bail!("Oodle decompression failed with code {wrote}");
-        }
-        out.extend_from_slice(&chunk_out[..dst_size]);
-        remaining = remaining.saturating_sub(dst_size);
+        let dst_size = head.chunk_dst_size(i);
+        decompress_chunk_into(&src[offset..offset + size], unsafe {
+            out.as_mut_ptr().add(i * head.chunk_unpacked_size)
+        }, dst_size)?;
+        covered += dst_size;
         offset += size;
     }
-    if out.len() != uncompressed_size {
+    if covered != head.uncompressed_size {
         bail!(
             "bundle decompressed to {} bytes, expected {}",
-            out.len(),
-            uncompressed_size
+            covered,
+            head.uncompressed_size
         );
     }
+    out.truncate(head.uncompressed_size);
     Ok(out)
+}
+
+/// Decompress only the chunks of `src` (a compressed bundle) that cover the
+/// requested `(offset, size)` spans in uncompressed space, returning the bytes
+/// of each span in input order. Peak memory is proportional to the covered
+/// chunks rather than the whole bundle.
+pub fn decompress_bundle_slices(src: &[u8], spans: &[(u32, u32)]) -> Result<Vec<Vec<u8>>> {
+    let head = parse_bundle_head(src)?;
+
+    for &(offset, size) in spans {
+        if u64::from(offset) + u64::from(size) > head.uncompressed_size as u64 {
+            bail!(
+                "file span {offset}+{size} exceeds bundle uncompressed size {}",
+                head.uncompressed_size
+            );
+        }
+    }
+
+    // Absolute source offset of each chunk, bounds-checked once.
+    let mut chunk_offsets = Vec::with_capacity(head.chunk_sizes.len());
+    let mut src_offset = head.data_offset;
+    for &size in &head.chunk_sizes {
+        if src_offset + size > src.len() {
+            bail!("bundle chunk exceeds source length");
+        }
+        chunk_offsets.push(src_offset);
+        src_offset += size;
+    }
+
+    let mut needed = vec![false; head.chunk_sizes.len()];
+    for &(offset, size) in spans {
+        if size == 0 {
+            continue;
+        }
+        let first = offset as usize / head.chunk_unpacked_size;
+        let last = (offset as usize + size as usize - 1) / head.chunk_unpacked_size;
+        for slot in &mut needed[first..=last] {
+            *slot = true;
+        }
+    }
+
+    // Decompress each maximal run of contiguous needed chunks into one buffer.
+    // Chunks within a run must stay sequential (see decompress_bundle).
+    let mut runs: Vec<(usize, Vec<u8>)> = Vec::new(); // (first uncompressed byte, bytes)
+    let mut chunk = 0;
+    while chunk < needed.len() {
+        if !needed[chunk] {
+            chunk += 1;
+            continue;
+        }
+        let run_start = chunk;
+        while chunk < needed.len() && needed[chunk] {
+            chunk += 1;
+        }
+        let run_len: usize = (run_start..chunk).map(|i| head.chunk_dst_size(i)).sum();
+        let mut buf = vec![0u8; run_len + OOZ_SAFE_SPACE];
+        let mut written = 0usize;
+        for i in run_start..chunk {
+            let dst_size = head.chunk_dst_size(i);
+            let chunk_src = &src[chunk_offsets[i]..chunk_offsets[i] + head.chunk_sizes[i]];
+            decompress_chunk_into(chunk_src, unsafe { buf.as_mut_ptr().add(written) }, dst_size)?;
+            written += dst_size;
+        }
+        buf.truncate(run_len);
+        runs.push((run_start * head.chunk_unpacked_size, buf));
+    }
+
+    spans
+        .iter()
+        .map(|&(offset, size)| {
+            if size == 0 {
+                return Ok(Vec::new());
+            }
+            let (offset, size) = (offset as usize, size as usize);
+            // A span's chunks are contiguous, so it lies within a single run.
+            let (run_start, buf) = runs
+                .iter()
+                .find(|(start, buf)| offset >= *start && offset + size <= start + buf.len())
+                .ok_or_else(|| anyhow!("file span {offset}+{size} missing from decompressed runs"))?;
+            Ok(buf[offset - run_start..offset - run_start + size].to_vec())
+        })
+        .collect()
 }
 
 pub fn pack_uncompressed_bundle(data: &[u8]) -> Result<Vec<u8>> {
@@ -1713,6 +1880,50 @@ mod tests {
         let packed = pack_uncompressed_bundle(&data).unwrap();
         let unpacked = decompress_bundle(&packed).unwrap();
         assert_eq!(unpacked, data);
+    }
+
+    /// Varied, poorly-compressible bytes spanning a bit over two chunks.
+    fn multi_chunk_data() -> Vec<u8> {
+        let len = 2 * BUNDLE_CHUNK_SIZE + 12_345;
+        let mut state = 0x2545F491_u32;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                (state >> 24) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn partial_decompression_matches_full_decompression() {
+        let data = multi_chunk_data();
+        let packed = pack_uncompressed_bundle(&data).unwrap();
+        let total = u32::try_from(data.len()).unwrap();
+        let chunk = u32::try_from(BUNDLE_CHUNK_SIZE).unwrap();
+        let spans: [(u32, u32); 7] = [
+            (0, 10),
+            (chunk + 100, 500),      // inside the second chunk
+            (chunk - 3, 7),          // crosses the first chunk boundary
+            (total - 5, 5),          // tail of the bundle
+            (chunk, chunk),          // exactly chunk-aligned
+            (0, total),              // the whole bundle
+            (1234, 0),               // empty span
+        ];
+        let slices = decompress_bundle_slices(&packed, &spans).unwrap();
+        assert_eq!(slices.len(), spans.len());
+        for (&(offset, size), slice) in spans.iter().zip(&slices) {
+            let (offset, size) = (offset as usize, size as usize);
+            assert_eq!(slice, &data[offset..offset + size], "span {offset}+{size}");
+        }
+    }
+
+    #[test]
+    fn partial_decompression_rejects_out_of_range_span() {
+        let data = b"span check".repeat(1_000);
+        let packed = pack_uncompressed_bundle(&data).unwrap();
+        let total = u32::try_from(data.len()).unwrap();
+        assert!(decompress_bundle_slices(&packed, &[(total - 1, 2)]).is_err());
+        assert!(decompress_bundle_slices(&packed, &[(0, 1)]).is_ok());
     }
 
     #[test]
