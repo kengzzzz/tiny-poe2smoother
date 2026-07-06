@@ -336,6 +336,41 @@ fn first_quoted(line: &str) -> Option<&str> {
     Some(&line[open + 1..open + 1 + len])
 }
 
+/// Human-readable form of a raw `.csd` display string, matching what the
+/// game renders: `[Tag|Shown]` markup collapses to `Shown`, `[Tag]` to
+/// `Tag`, `{0}`-style value placeholders become `#`, and literal `\n`
+/// escapes become spaces. The editor uses this for row labels and search,
+/// so queries match the in-game wording rather than raw markup.
+pub fn display_stat_text(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(pos) = rest.find(['[', '{', '\\']) {
+        out.push_str(&rest[..pos]);
+        let tail = &rest[pos..];
+        if let Some(inner) = tail.strip_prefix('[').and_then(|t| t.split_once(']')) {
+            let (markup, after) = inner;
+            out.push_str(markup.rsplit('|').next().unwrap_or(markup));
+            rest = after;
+        } else if let Some((_, after)) = tail.strip_prefix('{').and_then(|t| t.split_once('}')) {
+            out.push('#');
+            rest = after;
+        } else if let Some(after) = tail.strip_prefix("\\n") {
+            out.push(' ');
+            rest = after;
+        } else {
+            // Unmatched opener; emit it verbatim (all three are ASCII).
+            out.push_str(&tail[..1]);
+            rest = &tail[1..];
+        }
+    }
+    out.push_str(rest);
+    // Collapse whitespace runs left over from `\n` replacement.
+    if out.contains("  ") {
+        out = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,5 +527,29 @@ description\r\n\
                 entry.stat_id
             );
         }
+    }
+
+    #[test]
+    fn display_stat_text_renders_like_the_game() {
+        assert_eq!(
+            display_stat_text(
+                "[ContainsRitual|Ritual] Favours in Map have {0}% increased chance to be [Omen|Omens]"
+            ),
+            "Ritual Favours in Map have #% increased chance to be Omens"
+        );
+        assert_eq!(
+            display_stat_text("{0}% of [Physical] damage causes [BloodLoss|Blood Loss]"),
+            "#% of Physical damage causes Blood Loss"
+        );
+        assert_eq!(
+            display_stat_text("Shrouded in Darkness \\nContains Omen Altars"),
+            "Shrouded in Darkness Contains Omen Altars"
+        );
+        // Unmatched openers pass through verbatim.
+        assert_eq!(
+            display_stat_text("broken [markup and {value"),
+            "broken [markup and {value"
+        );
+        assert_eq!(display_stat_text("plain text"), "plain text");
     }
 }

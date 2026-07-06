@@ -11,8 +11,8 @@ pub use catalog::{
     PatchInfo, PatchParams, PatchSet, PresetInfo,
 };
 pub use color_mods::{
-    default_color_mods, merge_with_defaults, parse_stat_catalog, ColorModEntry, StatCatalogEntry,
-    PRESET_COLORS,
+    default_color_mods, display_stat_text, merge_with_defaults, parse_stat_catalog, ColorModEntry,
+    StatCatalogEntry, PRESET_COLORS,
 };
 pub(crate) use text::decode_utf16;
 pub use transform::audit_transform;

@@ -14,8 +14,8 @@ use tiny_poe2smoother::app::{
 };
 use tiny_poe2smoother::install::display_path;
 use tiny_poe2smoother::patches::{
-    all_patches, default_color_mods, merge_with_defaults, parse_patch, ColorModEntry, PatchId,
-    PatchParams,
+    all_patches, default_color_mods, display_stat_text, merge_with_defaults, parse_patch,
+    ColorModEntry, PatchId, PatchParams,
 };
 
 const PREFS_KEY: &str = "tiny-poe2smoother.gui.v1";
@@ -69,8 +69,9 @@ struct GuiApp {
     initialized: bool,
 }
 
-/// A stat catalog entry with lowercase caches so per-keystroke filtering
-/// never re-lowercases the ~20k-entry catalog.
+/// A stat catalog entry. `text` is the human-readable form (markup already
+/// collapsed via `display_stat_text`); the lowercase caches mean
+/// per-keystroke filtering never re-lowercases the ~20k-entry catalog.
 struct CatalogRow {
     stat_id: String,
     text: String,
@@ -371,11 +372,14 @@ impl GuiApp {
                 .map(|entries| {
                     entries
                         .into_iter()
-                        .map(|entry| CatalogRow {
-                            stat_id_lower: entry.stat_id.to_lowercase(),
-                            text_lower: entry.text.to_lowercase(),
-                            stat_id: entry.stat_id,
-                            text: entry.text,
+                        .map(|entry| {
+                            let text = display_stat_text(&entry.text);
+                            CatalogRow {
+                                stat_id_lower: entry.stat_id.to_lowercase(),
+                                text_lower: text.to_lowercase(),
+                                stat_id: entry.stat_id,
+                                text,
+                            }
                         })
                         .collect()
                 })
@@ -430,10 +434,23 @@ impl GuiApp {
             catalog_len,
         );
         if self.color_filter_key.as_ref() != Some(&key) {
-            let query = key.0.as_str();
+            // Word-based matching: every query word must appear somewhere in
+            // the stat id or display text, in any order. This lets loose
+            // phrasings like "increase chance to be omen" find
+            // "...#% increased chance to be Omens".
+            let tokens: Vec<&str> = key.0.split_whitespace().collect();
+            let matches = |stat_id_lower: &str, text_lower: &str| {
+                tokens
+                    .iter()
+                    .all(|token| stat_id_lower.contains(token) || text_lower.contains(token))
+            };
             let mut rows = Vec::new();
             for (idx, entry) in self.color_mods.iter().enumerate() {
-                if query.is_empty() || entry.stat_id.to_lowercase().contains(query) {
+                let text_lower = self
+                    .catalog_text(&entry.stat_id)
+                    .map(str::to_lowercase)
+                    .unwrap_or_default();
+                if matches(&entry.stat_id.to_lowercase(), &text_lower) {
                     rows.push(ColorRowRef::Config(idx));
                 }
             }
@@ -447,10 +464,7 @@ impl GuiApp {
                     if configured.contains(row.stat_id.as_str()) {
                         continue;
                     }
-                    if query.is_empty()
-                        || row.stat_id_lower.contains(query)
-                        || row.text_lower.contains(query)
-                    {
+                    if matches(&row.stat_id_lower, &row.text_lower) {
                         rows.push(ColorRowRef::Catalog(idx));
                     }
                 }
@@ -508,5 +522,73 @@ mod tests {
         assert!(!edited.enabled);
         // Defaults the user never saw are appended.
         assert_eq!(app.color_mods.len(), default_color_mods().len());
+    }
+
+    fn catalog_row(stat_id: &str, text: &str) -> CatalogRow {
+        let text = display_stat_text(text);
+        CatalogRow {
+            stat_id_lower: stat_id.to_lowercase(),
+            text_lower: text.to_lowercase(),
+            stat_id: stat_id.to_string(),
+            text,
+        }
+    }
+
+    #[test]
+    fn color_filter_matches_query_words_in_any_order_against_display_text() {
+        let mut app = GuiApp::from_prefs(GuiPrefs {
+            game_dir_input: String::new(),
+            selected_patches: Vec::new(),
+            zoom: 2.4,
+            color_mods: Vec::new(),
+        });
+        app.stat_catalog = Some(vec![
+            catalog_row(
+                "map_ritual_omen_chance_+%",
+                "[ContainsRitual|Ritual] Favours in Map have {0}% increased chance to be [Omen|Omens]",
+            ),
+            catalog_row("map_monsters_life_+%", "{0}% more Monster Life"),
+        ]);
+
+        // Loose phrasing with markup-hidden words and different word forms.
+        app.color_search = "increase chance to be omen".to_string();
+        app.refresh_color_filter();
+        assert_eq!(app.color_filter_rows.len(), 1);
+        assert!(matches!(app.color_filter_rows[0], ColorRowRef::Catalog(0)));
+
+        // Configured entries match on their display text too, not just id.
+        app.color_mods = default_color_mods();
+        app.stat_catalog.as_mut().unwrap().push(catalog_row(
+            "map_monsters_damage_+%",
+            "{0}% more Monster Damage",
+        ));
+        app.stat_catalog
+            .as_mut()
+            .unwrap()
+            .sort_by(|a, b| a.stat_id.cmp(&b.stat_id));
+        app.color_search = "more damage monster".to_string();
+        app.color_filter_key = None;
+        app.refresh_color_filter();
+        assert!(app
+            .color_filter_rows
+            .iter()
+            .any(|row| matches!(row, ColorRowRef::Config(idx)
+                if app.color_mods[*idx].stat_id == "map_monsters_damage_+%")));
+
+        // Empty query shows everything.
+        app.color_search.clear();
+        app.refresh_color_filter();
+        let catalog_len = app.stat_catalog.as_ref().unwrap().len();
+        let configured_in_catalog = app
+            .stat_catalog
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|row| app.color_mods.iter().any(|e| e.stat_id == row.stat_id))
+            .count();
+        assert_eq!(
+            app.color_filter_rows.len(),
+            app.color_mods.len() + catalog_len - configured_in_catalog
+        );
     }
 }
