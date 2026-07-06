@@ -8,8 +8,6 @@ setup() {
     case "$TARGET" in
         x86_64-unknown-linux-gnu)
             apt-get update && apt-get install -y \
-                libsodium-dev \
-                libunistring-dev \
                 libgtk-3-dev \
                 libxcb1-dev \
                 libxcb-render0-dev \
@@ -27,18 +25,6 @@ setup() {
                 mingw-w64 \
             && rm -rf /var/lib/apt/lists/*
             rustup target add x86_64-pc-windows-gnu
-
-            # CMake toolchain file for MinGW cross-compilation
-            cat > /cmake-toolchain.cmake << 'CMAKEOF'
-set(CMAKE_SYSTEM_NAME Windows)
-set(CMAKE_C_COMPILER x86_64-w64-mingw32-gcc)
-set(CMAKE_CXX_COMPILER x86_64-w64-mingw32-g++)
-set(CMAKE_RC_COMPILER x86_64-w64-mingw32-windres)
-set(CMAKE_FIND_ROOT_PATH /usr/x86_64-w64-mingw32)
-set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
-set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
-set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
-CMAKEOF
 
             mkdir -p "$CARGO_HOME"
             cat >> "$CARGO_HOME/config.toml" << 'CARGOEOF'
@@ -60,12 +46,7 @@ fetch() {
 }
 
 build() {
-    if [ "$TARGET" = "x86_64-unknown-linux-gnu" ]; then
-        cargo build --release --target "$TARGET" --bin tiny-poe2smoother
-    else
-        CMAKE_TOOLCHAIN_FILE=/cmake-toolchain.cmake \
-        cargo build --release --target "$TARGET" --bin tiny-poe2smoother
-    fi
+    cargo build --release --target "$TARGET" --bin tiny-poe2smoother
 }
 
 export_binaries() {

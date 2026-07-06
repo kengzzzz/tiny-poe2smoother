@@ -620,15 +620,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cmake"
-version = "0.1.58"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
-dependencies = [
- "cc",
-]
-
-[[package]]
 name = "codespan-reporting"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1308,19 +1299,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ggpk"
-version = "1.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0bbe78d501342681c919a389de2e21c42d3948fcd3c9ebb8b392e506e65ae1f"
-dependencies = [
- "byteorder",
- "log",
- "memmap",
- "rayon",
- "widestring",
-]
-
-[[package]]
 name = "gl_generator"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1835,16 +1813,6 @@ name = "memchr"
 version = "2.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
-
-[[package]]
-name = "memmap"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6585fd95e7bb50d6cc31e20d4cf9afb4e2ba16c5846fc76793f11218da9c475b"
-dependencies = [
- "libc",
- "winapi",
-]
 
 [[package]]
 name = "memmap2"
@@ -2473,19 +2441,6 @@ dependencies = [
  "fdeflate",
  "flate2",
  "miniz_oxide",
-]
-
-[[package]]
-name = "poe_bundle"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c777a4c69995996d354b29510d46a52448d5f757b35d17d206d570c29e9be8ba"
-dependencies = [
- "byteorder",
- "cmake",
- "ggpk",
- "libc",
- "log",
 ]
 
 [[package]]
@@ -3208,10 +3163,10 @@ dependencies = [
  "anyhow",
  "assert_cmd",
  "byteorder",
+ "cc",
  "dirs",
  "eframe",
- "ggpk",
- "poe_bundle",
+ "memmap2",
  "rayon",
  "regex",
  "rfd",
@@ -3822,12 +3777,6 @@ dependencies = [
  "raw-window-handle",
  "web-sys",
 ]
-
-[[package]]
-name = "widestring"
-version = "1.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
 
 [[package]]
 name = "winapi"

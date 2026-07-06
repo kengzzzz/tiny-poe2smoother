@@ -1,5 +1,5 @@
-use crate::bundle::{slice_file, BundleFile, BundleIndex, BundleStore};
-use anyhow::{anyhow, bail, Context, Result};
+use crate::bundle::{BundleFile, BundleIndex, BundleStore};
+use anyhow::{anyhow, bail, Result};
 use rayon::prelude::*;
 use regex::Regex;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -328,36 +328,22 @@ pub fn compute_patch_set(
     let candidates = dedup_candidates(candidates);
 
     crate::timing!("bundle_batch_read");
-    let bundle_names: Vec<String> = {
-        let mut names: Vec<String> = candidates
-            .iter()
-            .map(|(_, f)| f.bundle_name.clone())
-            .collect();
-        names.sort();
-        names.dedup();
-        names
-    };
-    let bundles = store.read_bundles_batch(&bundle_names)?;
-
-    crate::timing!("patch_read_slice");
-    let mut file_data: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-    for (path, file) in &candidates {
-        let bundle_data = bundles.get(&file.bundle_name).with_context(|| {
-            format!("bundle loaded but missing from batch: {}", file.bundle_name)
-        })?;
-        let bytes = slice_file(bundle_data, file)
-            .with_context(|| format!("failed to read patch target from bundle: {path}"))?;
-        file_data.insert(path.clone(), bytes);
-    }
+    let files: Vec<BundleFile> = candidates.iter().map(|(_, file)| file.clone()).collect();
+    let mut by_hash = store.read_files_batch(&files)?;
+    let file_data: Vec<Vec<u8>> = candidates
+        .iter()
+        .map(|(path, file)| {
+            by_hash
+                .remove(&file.hash)
+                .ok_or_else(|| anyhow!("patch target bytes missing after read: {path}"))
+        })
+        .collect::<Result<_>>()?;
 
     crate::timing!("patch_transform");
     let transformed = candidates
         .par_iter()
-        .map(|(path, _)| -> Result<(String, Vec<u8>, bool)> {
-            let mut bytes = file_data
-                .get(path)
-                .ok_or_else(|| anyhow!("patch target bytes missing after read: {path}"))?
-                .clone();
+        .zip(file_data.into_par_iter())
+        .map(|((path, _), mut bytes)| -> Result<(String, Vec<u8>, bool)> {
             let mut changed = false;
             for &patch in &patches {
                 if patch_applies_path(patch, path) {
