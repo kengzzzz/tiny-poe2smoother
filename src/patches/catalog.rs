@@ -21,6 +21,7 @@ pub enum PatchId {
     SkillSounds,
     MonsterSounds,
     MtxSoft,
+    MonsterHpBar,
 }
 
 #[derive(Debug, Clone)]
@@ -155,6 +156,11 @@ pub fn all_patches() -> &'static [PatchInfo] {
             name: "mtx-soft",
             description: "Blank microtransaction effect/particle files.",
         },
+        PatchInfo {
+            id: PatchId::MonsterHpBar,
+            name: "monster-hp-bar",
+            description: "Always show monster HP bars.",
+        },
     ]
 }
 
@@ -239,6 +245,7 @@ pub fn all_presets() -> &'static [PresetInfo] {
                 PatchId::SkillSounds,
                 PatchId::MonsterSounds,
                 PatchId::MtxSoft,
+                PatchId::MonsterHpBar,
             ],
         },
     ]

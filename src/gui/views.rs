@@ -13,12 +13,7 @@ use crate::{ColorRowRef, GuiApp, MessageKind};
 const GROUPS: &[(&str, &[PatchId])] = &[
     (
         "Camera & Map",
-        &[
-            PatchId::Camera,
-            PatchId::Minimap,
-            PatchId::AtlasFog,
-            PatchId::ColorMods,
-        ],
+        &[PatchId::Camera, PatchId::Minimap, PatchId::AtlasFog],
     ),
     (
         "Environment",
@@ -48,10 +43,11 @@ const GROUPS: &[(&str, &[PatchId])] = &[
             PatchId::MonsterSounds,
         ],
     ),
+    ("Interface", &[PatchId::ColorMods, PatchId::MonsterHpBar]),
 ];
 
-// Column packing chosen to roughly balance row counts (4+4 vs 6+3).
-const COLUMNS: [&[usize]; 2] = [&[0, 2], &[1, 3]];
+// Column packing chosen to roughly balance row counts (3+4+2 vs 6+3).
+const COLUMNS: [&[usize]; 2] = [&[0, 2, 4], &[1, 3]];
 
 pub fn draw(app: &mut GuiApp, ui: &mut egui::Ui) {
     draw_header(app, ui);

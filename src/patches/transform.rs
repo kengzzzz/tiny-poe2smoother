@@ -103,6 +103,7 @@ pub(super) fn transform(
         PatchId::SkillSounds => strip_sounds(path, bytes),
         PatchId::MonsterSounds => strip_sounds(path, bytes),
         PatchId::MtxSoft => mtx_soft(path, bytes),
+        PatchId::MonsterHpBar => monster_hp_bar(bytes),
     }
 }
 
@@ -293,6 +294,37 @@ fn mtx_soft(path: &str, bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(bytes.to_vec())
 }
 
+/// Gives every monster 1 base energy shield/life via the shared
+/// `metadata/monsters/monster.ot` template, which makes the engine render HP
+/// bars permanently instead of only after the monster takes damage
+fn monster_hp_bar(bytes: &[u8]) -> Result<Vec<u8>> {
+    let text = decode_utf16(bytes)?;
+    if text.contains("base_maximum_energy_shield = 1") || text.contains("base_maximum_life = 1") {
+        return Ok(bytes.to_vec());
+    }
+    let mut lines: Vec<String> = text.split("\r\n").map(str::to_string).collect();
+    let insert_at = lines
+        .iter()
+        .position(|line| line.contains("item_drop_slots = 1"))
+        .map(|index| index + 1)
+        .or_else(|| stats_block_body_start(&lines));
+    let Some(index) = insert_at else {
+        return Ok(bytes.to_vec());
+    };
+    lines.insert(index, "\tbase_maximum_life = 1".to_string());
+    lines.insert(index, "\tbase_maximum_energy_shield = 1".to_string());
+    Ok(encode_utf16_bom(&lines.join("\r\n")))
+}
+
+/// Index of the first line inside the `Stats { ... }` block body, if present.
+fn stats_block_body_start(lines: &[String]) -> Option<usize> {
+    let stats = lines.iter().position(|line| line.trim() == "Stats")?;
+    let brace = lines[stats + 1..]
+        .iter()
+        .position(|line| line.trim() == "{")?;
+    Some(stats + 1 + brace + 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,6 +470,63 @@ SoundEvents {}\r\n}";
         )
         .unwrap();
         assert_eq!(ao, ao_in);
+    }
+
+    #[test]
+    fn monster_hp_bar_inserts_stats_after_drop_slots_anchor() {
+        let input = encode_utf16_bom(
+            "version 2\r\nextends \"Metadata/Base\"\r\n\r\nStats\r\n{\r\n\titem_drop_slots = 1\r\n\tset_monster_scale = 100\r\n}",
+        );
+        let out = transform(
+            PatchId::MonsterHpBar,
+            "metadata/monsters/monster.ot",
+            &input,
+            TransformCtx::default(),
+        )
+        .unwrap();
+
+        let expected = encode_utf16_bom(
+            "version 2\r\nextends \"Metadata/Base\"\r\n\r\nStats\r\n{\r\n\titem_drop_slots = 1\r\n\tbase_maximum_energy_shield = 1\r\n\tbase_maximum_life = 1\r\n\tset_monster_scale = 100\r\n}",
+        );
+        assert_eq!(out, expected);
+
+        // Re-applying to already-patched bytes changes nothing.
+        let again = transform(
+            PatchId::MonsterHpBar,
+            "metadata/monsters/monster.ot",
+            &out,
+            TransformCtx::default(),
+        )
+        .unwrap();
+        assert_eq!(again, out);
+    }
+
+    #[test]
+    fn monster_hp_bar_falls_back_to_stats_block_when_anchor_is_missing() {
+        let input =
+            encode_utf16_bom("version 2\r\n\r\nStats\r\n{\r\n\tset_monster_scale = 100\r\n}");
+        let out = transform(
+            PatchId::MonsterHpBar,
+            "metadata/monsters/monster.ot",
+            &input,
+            TransformCtx::default(),
+        )
+        .unwrap();
+        let text = decode_utf16(&out).unwrap();
+        assert!(text.contains(
+            "Stats\r\n{\r\n\tbase_maximum_energy_shield = 1\r\n\tbase_maximum_life = 1\r\n\tset_monster_scale = 100"
+        ));
+
+        // No anchor and no Stats block: leave the file untouched.
+        let bare = encode_utf16_bom("version 2\r\nextends \"Metadata/Base\"");
+        let untouched = transform(
+            PatchId::MonsterHpBar,
+            "metadata/monsters/monster.ot",
+            &bare,
+            TransformCtx::default(),
+        )
+        .unwrap();
+        assert_eq!(untouched, bare);
     }
 
     #[test]

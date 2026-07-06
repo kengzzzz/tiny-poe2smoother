@@ -61,6 +61,7 @@ pub(super) fn exact_patch_targets(patch: PatchId) -> &'static [&'static str] {
             "shaders/minimap_blending_pixel.hlsl",
         ],
         PatchId::AtlasFog => &["metadata/materials/environment/worldmap/worldmap_fogofwar.fxgraph"],
+        PatchId::MonsterHpBar => &["metadata/monsters/monster.ot"],
         _ => &[],
     }
 }
@@ -71,7 +72,7 @@ pub(super) fn patch_targets_path(patch: PatchId, path: &str) -> bool {
             starts_with_path_ci(path, "metadata/")
                 && (ends_with_path_ci(path, ".ot") || ends_with_path_ci(path, ".otc"))
         }
-        PatchId::Minimap | PatchId::AtlasFog => exact_patch_targets(patch)
+        PatchId::Minimap | PatchId::AtlasFog | PatchId::MonsterHpBar => exact_patch_targets(patch)
             .iter()
             .any(|target| eq_path_ci(path, target)),
         PatchId::ColorMods => is_stat_description_target(path),
@@ -162,6 +163,7 @@ pub(super) fn patch_applies_path(patch: PatchId, path: &str) -> bool {
             starts_with_path_ci(path, "metadata/effects/microtransactions")
                 && is_metadata_effect_ext(path)
         }
+        PatchId::MonsterHpBar => eq_path_ci(path, "metadata/monsters/monster.ot"),
     }
 }
 
@@ -282,5 +284,25 @@ mod tests {
         assert!(!is_startup_scene_protected(
             "metadata/effects/spells/fireball/fireball.ao"
         ));
+    }
+
+    #[test]
+    fn monster_hp_bar_targets_only_the_monster_template() {
+        for path in [
+            "metadata/monsters/monster.ot",
+            "Metadata/Monsters/Monster.ot",
+            "metadata\\monsters\\monster.ot",
+        ] {
+            assert!(patch_targets_path(PatchId::MonsterHpBar, path));
+            assert!(patch_applies_path(PatchId::MonsterHpBar, path));
+        }
+        for path in [
+            "metadata/monsters/monster.otc",
+            "metadata/monsters/bosses/monster.ot",
+            "metadata/characters/character.ot",
+        ] {
+            assert!(!patch_targets_path(PatchId::MonsterHpBar, path));
+            assert!(!patch_applies_path(PatchId::MonsterHpBar, path));
+        }
     }
 }
