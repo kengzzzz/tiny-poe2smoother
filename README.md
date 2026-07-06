@@ -2,6 +2,8 @@
 
 GUI tool that patches Path of Exile 2 bundle files to disable visual effects for improved performance.
 
+![tiny-poe2smoother GUI](assets/readme-screenshot.png)
+
 ## Features
 
 - 16 optional patches: camera zoom, fog, rain, clouds, shadows, lighting, delirium effects, particles, minimap reveal, atlas fog, environment particles, client effect blocks, plus sound silencing (disable sounds, skill sounds, monster sounds) and microtransaction effect removal (mtx-soft)
