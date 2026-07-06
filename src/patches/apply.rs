@@ -1,6 +1,7 @@
-use super::catalog::{patch_label, PatchChange, PatchId, PatchSet};
+use super::catalog::{patch_label, PatchChange, PatchId, PatchParams, PatchSet};
+use super::color_mods::ColorMatcher;
 use super::targeting::{exact_patch_targets, patch_applies_path, patch_targets_path};
-use super::transform::transform;
+use super::transform::{transform, TransformCtx};
 use crate::bundle::{BundleFile, BundleIndex, BundleStore};
 use anyhow::{anyhow, bail, Result};
 use rayon::prelude::*;
@@ -10,11 +11,16 @@ pub fn compute_patch_set(
     store: &BundleStore,
     index: &mut BundleIndex,
     patches: &[PatchId],
-    zoom: f64,
+    params: &PatchParams,
 ) -> Result<PatchSet> {
     crate::timing!("patch_scan_compute");
 
     let patches = unique_patches(patches);
+    let color_matcher = ColorMatcher::new(&params.color_mods);
+    let ctx = TransformCtx {
+        zoom: params.zoom,
+        color: color_matcher.as_ref(),
+    };
     let candidates = collect_patch_targets(index, &patches)?;
     let candidates = dedup_candidates(candidates);
 
@@ -34,19 +40,21 @@ pub fn compute_patch_set(
     let transformed = candidates
         .par_iter()
         .zip(file_data.into_par_iter())
-        .map(|((path, _), mut bytes)| -> Result<(String, Vec<u8>, bool)> {
-            let mut changed = false;
-            for &patch in &patches {
-                if patch_applies_path(patch, path) {
-                    let after = transform(patch, path, &bytes, zoom)?;
-                    if after != bytes {
-                        bytes = after;
-                        changed = true;
+        .map(
+            |((path, _), mut bytes)| -> Result<(String, Vec<u8>, bool)> {
+                let mut changed = false;
+                for &patch in &patches {
+                    if patch_applies_path(patch, path) {
+                        let after = transform(patch, path, &bytes, ctx)?;
+                        if after != bytes {
+                            bytes = after;
+                            changed = true;
+                        }
                     }
                 }
-            }
-            Ok((path.clone(), bytes, changed))
-        })
+                Ok((path.clone(), bytes, changed))
+            },
+        )
         .collect::<Vec<_>>()
         .into_iter()
         .collect::<Result<Vec<_>>>()?;

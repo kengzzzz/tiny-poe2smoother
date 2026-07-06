@@ -1,4 +1,5 @@
 use super::catalog::PatchId;
+use super::color_mods::ColorMatcher;
 use super::targeting::{
     ends_with_path_ci, is_startup_scene_protected, normalize_path, patch_applies_path,
     patch_targets_path, EFFECT_PROTECTED_PREFIXES, PARTICLE_PROTECTED_PREFIXES,
@@ -35,6 +36,23 @@ static EFFECT_KEEP_BLOCKS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
 static SOUND_EMPTY_BLOCKS: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| ["SoundEvents", "SoundParams"].into_iter().collect());
 
+/// Shared, per-request inputs for parameterized transforms. Built once in
+/// `compute_patch_set` and borrowed by every rayon transform task.
+#[derive(Clone, Copy)]
+pub(super) struct TransformCtx<'a> {
+    pub zoom: f64,
+    pub color: Option<&'a ColorMatcher>,
+}
+
+impl Default for TransformCtx<'_> {
+    fn default() -> Self {
+        Self {
+            zoom: 2.4,
+            color: None,
+        }
+    }
+}
+
 /// Whether `patch` would select `path` as a target, and (if so) the bytes it
 /// would write for it. Exposed for the `capture-diff` dev tool to verify the
 /// capture-driven transforms against reference output. Returns `None`
@@ -44,14 +62,23 @@ pub fn audit_transform(patch: PatchId, path: &str, bytes: &[u8]) -> Option<Resul
     if !patch_targets_path(patch, path) || !patch_applies_path(patch, path) {
         return None;
     }
-    Some(transform(patch, path, bytes, 2.4))
+    Some(transform(patch, path, bytes, TransformCtx::default()))
 }
 
-pub(super) fn transform(patch: PatchId, path: &str, bytes: &[u8], zoom: f64) -> Result<Vec<u8>> {
+pub(super) fn transform(
+    patch: PatchId,
+    path: &str,
+    bytes: &[u8],
+    ctx: TransformCtx<'_>,
+) -> Result<Vec<u8>> {
     match patch {
-        PatchId::Camera => camera(path, bytes, zoom),
+        PatchId::Camera => camera(path, bytes, ctx.zoom),
         PatchId::Minimap => minimap(path, bytes),
         PatchId::AtlasFog => atlas_fog(bytes),
+        PatchId::ColorMods => match ctx.color {
+            Some(matcher) => matcher.colorize(bytes),
+            None => Ok(bytes.to_vec()),
+        },
         PatchId::Fog => replace_utf16(bytes, &[("\"fog\"", "\"xog\"")]),
         PatchId::Rain => regex_utf16(bytes, &RAIN_INTENSITY_RE, "${1}0.0${3}"),
         PatchId::Clouds => regex_utf16(bytes, &CLOUDS_INTENSITY_RE, "${1}0.0${3}"),
@@ -295,7 +322,13 @@ mod tests {
         );
         let mut bytes = input;
         for patch in [PatchId::Fog, PatchId::Rain, PatchId::Clouds] {
-            bytes = transform(patch, "metadata/environmentsettings/test.env", &bytes, 2.4).unwrap();
+            bytes = transform(
+                patch,
+                "metadata/environmentsettings/test.env",
+                &bytes,
+                TransformCtx::default(),
+            )
+            .unwrap();
         }
         let text = decode_utf16(&bytes).unwrap();
 
@@ -339,7 +372,7 @@ SoundEvents {}\r\n}";
             PatchId::SkillSounds,
             "metadata/effects/spells/absolution_blast/aoe_explosion_01.ao",
             &encode_utf16_bom(before),
-            2.4,
+            TransformCtx::default(),
         )
         .unwrap();
 
@@ -357,7 +390,7 @@ SoundEvents {}\r\n}";
             PatchId::DisableSounds,
             "metadata/effects/spells/fireball/fireball.ao",
             &input,
-            2.4,
+            TransformCtx::default(),
         )
         .unwrap();
         let text = decode_utf16(&out).unwrap();
@@ -380,7 +413,7 @@ SoundEvents {}\r\n}";
             PatchId::MtxSoft,
             "metadata/effects/microtransactions/portal/portal.epk",
             &stuff,
-            2.4,
+            TransformCtx::default(),
         )
         .unwrap();
         assert_eq!(epk, vec![0xff, 0xfe]);
@@ -390,7 +423,7 @@ SoundEvents {}\r\n}";
                 PatchId::MtxSoft,
                 &format!("metadata/effects/microtransactions/portal/portal.{ext}"),
                 &stuff,
-                2.4,
+                TransformCtx::default(),
             )
             .unwrap();
             assert_eq!(out, encode_utf16_bom("0"));
@@ -401,7 +434,7 @@ SoundEvents {}\r\n}";
             PatchId::MtxSoft,
             "metadata/effects/microtransactions/portal/portal.ao",
             &ao_in,
-            2.4,
+            TransformCtx::default(),
         )
         .unwrap();
         assert_eq!(ao, ao_in);
@@ -414,7 +447,7 @@ SoundEvents {}\r\n}";
             PatchId::DisableSounds,
             "metadata/effects/misc/CharacterSelection/gallows.ao",
             &input,
-            2.4,
+            TransformCtx::default(),
         )
         .unwrap();
 

@@ -9,10 +9,14 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use tiny_poe2smoother::app::{
-    apply_patches, load_status, restore_backup, AppStatus, ApplyReport, PatchRequest, RestoreReport,
+    apply_patches, load_stat_catalog, load_status, restore_backup, AppStatus, ApplyReport,
+    PatchRequest, RestoreReport,
 };
 use tiny_poe2smoother::install::display_path;
-use tiny_poe2smoother::patches::{all_patches, parse_patch, PatchId};
+use tiny_poe2smoother::patches::{
+    all_patches, default_color_mods, merge_with_defaults, parse_patch, ColorModEntry, PatchId,
+    PatchParams,
+};
 
 const PREFS_KEY: &str = "tiny-poe2smoother.gui.v1";
 
@@ -46,6 +50,14 @@ struct GuiApp {
     game_dir_input: String,
     selected_patches: HashSet<PatchId>,
     zoom: f64,
+    color_mods: Vec<ColorModEntry>,
+    show_color_editor: bool,
+    color_search: String,
+    stat_catalog: Option<Vec<CatalogRow>>,
+    catalog_task: Option<Receiver<Result<Vec<CatalogRow>, String>>>,
+    catalog_error: Option<String>,
+    color_filter_key: Option<ColorFilterKey>,
+    color_filter_rows: Vec<ColorRowRef>,
     status: Option<AppStatus>,
     message: String,
     message_kind: MessageKind,
@@ -57,11 +69,36 @@ struct GuiApp {
     initialized: bool,
 }
 
+/// A stat catalog entry with lowercase caches so per-keystroke filtering
+/// never re-lowercases the ~20k-entry catalog.
+struct CatalogRow {
+    stat_id: String,
+    text: String,
+    stat_id_lower: String,
+    text_lower: String,
+}
+
+/// One visible row of the color editor list: either a configured entry
+/// (index into `color_mods`) or a not-yet-configured catalog suggestion
+/// (index into `stat_catalog`).
+#[derive(Clone, Copy)]
+enum ColorRowRef {
+    Config(usize),
+    Catalog(usize),
+}
+
+/// Filter cache key: query + config length + catalog length. Any of them
+/// changing (typing, promoting a catalog row, catalog finishing its load)
+/// invalidates the cached row list; color/enabled edits don't.
+type ColorFilterKey = (String, usize, usize);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GuiPrefs {
     game_dir_input: String,
     selected_patches: Vec<String>,
     zoom: f64,
+    #[serde(default)]
+    color_mods: Vec<ColorModEntry>,
 }
 
 enum TaskResult {
@@ -82,6 +119,14 @@ impl Default for GuiApp {
             game_dir_input: String::new(),
             selected_patches,
             zoom: 2.4,
+            color_mods: default_color_mods(),
+            show_color_editor: false,
+            color_search: String::new(),
+            stat_catalog: None,
+            catalog_task: None,
+            catalog_error: None,
+            color_filter_key: None,
+            color_filter_rows: Vec::new(),
             status: None,
             message: "Ready.".to_string(),
             message_kind: MessageKind::Info,
@@ -107,6 +152,7 @@ impl eframe::App for GuiApp {
         }
 
         self.poll_task(ctx);
+        self.poll_catalog(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -135,10 +181,20 @@ impl GuiApp {
         } else {
             selected_patches
         };
+        // An empty saved list is never a legitimate state (disabling is done
+        // via the flag, entries are never removed), so it means "no saved
+        // color config yet"; otherwise saved edits win and new defaults from
+        // app updates are appended.
+        let color_mods = if prefs.color_mods.is_empty() {
+            default_color_mods()
+        } else {
+            merge_with_defaults(prefs.color_mods)
+        };
         Self {
             game_dir_input: prefs.game_dir_input,
             selected_patches,
             zoom: prefs.zoom.clamp(1.2, 2.4),
+            color_mods,
             ..Self::default()
         }
     }
@@ -153,6 +209,7 @@ impl GuiApp {
             game_dir_input: self.game_dir_input.clone(),
             selected_patches,
             zoom: self.zoom,
+            color_mods: self.color_mods.clone(),
         }
     }
 
@@ -178,10 +235,20 @@ impl GuiApp {
             patches.retain(|patch| *patch != PatchId::Camera);
             patches.push(PatchId::Camera);
         }
+        if patches.contains(&PatchId::ColorMods)
+            && !self.color_mods.iter().any(|entry| entry.enabled)
+        {
+            return Err(
+                "Color mods is selected but no mods are enabled — use Edit colors…".to_string(),
+            );
+        }
         Ok(PatchRequest {
             game_dir: self.game_dir(),
             patches,
-            zoom: self.zoom,
+            params: PatchParams {
+                zoom: self.zoom,
+                color_mods: self.color_mods.clone(),
+            },
         })
     }
 
@@ -287,6 +354,111 @@ impl GuiApp {
         self.game_dir_input = display_path(&status.game_dir);
         self.status = Some(status);
     }
+
+    /// Kick off the background stat-catalog load for the color editor if it
+    /// hasn't run yet. Deliberately NOT `spawn`: that would set `is_busy()`
+    /// and lock the whole UI while the editor should stay usable.
+    fn ensure_catalog_loading(&mut self) {
+        if self.stat_catalog.is_some() || self.catalog_task.is_some() {
+            return;
+        }
+        self.catalog_error = None;
+        let game_dir = self.game_dir();
+        let (tx, rx) = mpsc::channel();
+        self.catalog_task = Some(rx);
+        thread::spawn(move || {
+            let result = load_stat_catalog(game_dir)
+                .map(|entries| {
+                    entries
+                        .into_iter()
+                        .map(|entry| CatalogRow {
+                            stat_id_lower: entry.stat_id.to_lowercase(),
+                            text_lower: entry.text.to_lowercase(),
+                            stat_id: entry.stat_id,
+                            text: entry.text,
+                        })
+                        .collect()
+                })
+                .map_err(|err| err.to_string());
+            let _ = tx.send(result);
+        });
+    }
+
+    fn poll_catalog(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.catalog_task else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(rows)) => {
+                self.catalog_task = None;
+                self.stat_catalog = Some(rows);
+            }
+            Ok(Err(err)) => {
+                self.catalog_task = None;
+                self.catalog_error = Some(err);
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                if self.show_color_editor {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(33));
+                }
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.catalog_task = None;
+                self.catalog_error = Some("mod catalog task failed".to_string());
+            }
+        }
+    }
+
+    /// English display text for a configured stat id, if the catalog knows it.
+    fn catalog_text(&self, stat_id: &str) -> Option<&str> {
+        let catalog = self.stat_catalog.as_ref()?;
+        let idx = catalog
+            .binary_search_by(|row| row.stat_id.as_str().cmp(stat_id))
+            .ok()?;
+        let text = catalog[idx].text.as_str();
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// Rebuild `color_filter_rows` (the editor's visible rows: configured
+    /// entries first, then catalog suggestions not yet configured) if stale.
+    /// Cached; rebuilt only when the query, config set, or catalog changes.
+    fn refresh_color_filter(&mut self) {
+        let catalog_len = self.stat_catalog.as_ref().map_or(0, Vec::len);
+        let key = (
+            self.color_search.to_lowercase(),
+            self.color_mods.len(),
+            catalog_len,
+        );
+        if self.color_filter_key.as_ref() != Some(&key) {
+            let query = key.0.as_str();
+            let mut rows = Vec::new();
+            for (idx, entry) in self.color_mods.iter().enumerate() {
+                if query.is_empty() || entry.stat_id.to_lowercase().contains(query) {
+                    rows.push(ColorRowRef::Config(idx));
+                }
+            }
+            if let Some(catalog) = &self.stat_catalog {
+                let configured: HashSet<&str> = self
+                    .color_mods
+                    .iter()
+                    .map(|entry| entry.stat_id.as_str())
+                    .collect();
+                for (idx, row) in catalog.iter().enumerate() {
+                    if configured.contains(row.stat_id.as_str()) {
+                        continue;
+                    }
+                    if query.is_empty()
+                        || row.stat_id_lower.contains(query)
+                        || row.text_lower.contains(query)
+                    {
+                        rows.push(ColorRowRef::Catalog(idx));
+                    }
+                }
+            }
+            self.color_filter_rows = rows;
+            self.color_filter_key = Some(key);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -299,6 +471,7 @@ mod tests {
             game_dir_input: r"D:\SteamLibrary\steamapps\common\Path of Exile 2".to_string(),
             selected_patches: vec!["fog".to_string(), "unknown".to_string()],
             zoom: 9.0,
+            color_mods: Vec::new(),
         });
 
         assert_eq!(
@@ -308,5 +481,32 @@ mod tests {
         assert!(app.selected_patches.contains(&PatchId::Fog));
         assert_eq!(app.selected_patches.len(), 1);
         assert_eq!(app.zoom, 2.4);
+        // No saved color config -> defaults, all enabled.
+        assert_eq!(app.color_mods, default_color_mods());
+    }
+
+    #[test]
+    fn prefs_merge_saved_color_mods_with_defaults() {
+        let saved = vec![ColorModEntry {
+            stat_id: "map_monsters_damage_+%".to_string(),
+            color: [1, 2, 3],
+            enabled: false,
+        }];
+        let app = GuiApp::from_prefs(GuiPrefs {
+            game_dir_input: String::new(),
+            selected_patches: vec!["fog".to_string()],
+            zoom: 2.4,
+            color_mods: saved,
+        });
+
+        let edited = app
+            .color_mods
+            .iter()
+            .find(|entry| entry.stat_id == "map_monsters_damage_+%")
+            .unwrap();
+        assert_eq!(edited.color, [1, 2, 3]);
+        assert!(!edited.enabled);
+        // Defaults the user never saw are appended.
+        assert_eq!(app.color_mods.len(), default_color_mods().len());
     }
 }

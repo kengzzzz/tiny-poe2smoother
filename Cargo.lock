@@ -3160,6 +3160,7 @@ dependencies = [
 name = "tiny-poe2smoother"
 version = "0.4.1"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "assert_cmd",
  "byteorder",

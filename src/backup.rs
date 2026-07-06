@@ -32,7 +32,7 @@ pub struct GgpkBackupMeta {
 }
 
 impl BackupStore {
-    pub fn default() -> Result<Self> {
+    pub fn from_default_location() -> Result<Self> {
         let base = dirs::data_local_dir()
             .or_else(dirs::data_dir)
             .ok_or_else(|| anyhow!("could not locate user data directory"))?;
@@ -77,12 +77,11 @@ impl BackupStore {
     }
 
     pub fn ggpk_backup_meta(&self) -> Result<Option<GgpkBackupMeta>> {
-        Ok(self
-            .entries()?
+        self.entries()?
             .into_iter()
             .find(|entry| is_ggpk_meta_path(&entry.rel_path))
             .map(|entry| decode_ggpk_meta(&entry.bytes))
-            .transpose()?)
+            .transpose()
     }
 
     pub fn ensure_ggpk_backup_meta(&self, game_dir: &Path, meta: GgpkBackupMeta) -> Result<()> {
@@ -156,7 +155,7 @@ impl BackupStore {
                 continue;
             }
             let path = game_dir.join(&entry.rel_path);
-            if remove_overlay_index && entry.rel_path == PathBuf::from("Bundles2/_.index.bin") {
+            if remove_overlay_index && entry.rel_path == *"Bundles2/_.index.bin" {
                 match fs::remove_file(&path) {
                     Ok(()) => {}
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -227,7 +226,7 @@ fn read_entries(path: &Path) -> Result<Vec<BackupEntry>> {
         bail!("{} is not a tiny-poe2smoother backup", path.display());
     }
     let version = cursor.read_u32::<LittleEndian>()?;
-    if version < 1 || version > VERSION {
+    if !(1..=VERSION).contains(&version) {
         bail!("unsupported backup version {version} in {}", path.display());
     }
     // Skip manifest string if version >= 2

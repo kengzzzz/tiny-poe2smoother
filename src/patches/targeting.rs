@@ -74,6 +74,7 @@ pub(super) fn patch_targets_path(patch: PatchId, path: &str) -> bool {
         PatchId::Minimap | PatchId::AtlasFog => exact_patch_targets(patch)
             .iter()
             .any(|target| eq_path_ci(path, target)),
+        PatchId::ColorMods => is_stat_description_target(path),
         PatchId::Fog
         | PatchId::Rain
         | PatchId::Clouds
@@ -124,6 +125,7 @@ pub(super) fn patch_applies_path(patch: PatchId, path: &str) -> bool {
             path,
             "metadata/materials/environment/worldmap/worldmap_fogofwar.fxgraph",
         ),
+        PatchId::ColorMods => is_stat_description_target(path),
         PatchId::Fog
         | PatchId::Rain
         | PatchId::Clouds
@@ -161,6 +163,10 @@ pub(super) fn patch_applies_path(patch: PatchId, path: &str) -> bool {
                 && is_metadata_effect_ext(path)
         }
     }
+}
+
+fn is_stat_description_target(path: &str) -> bool {
+    starts_with_path_ci(path, "data/statdescriptions") && ends_with_path_ci(path, ".csd")
 }
 
 pub(super) fn is_metadata_effect_ext(path: &str) -> bool {

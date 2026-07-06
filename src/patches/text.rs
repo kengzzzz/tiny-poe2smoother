@@ -15,8 +15,8 @@ pub(super) fn regex_utf16(bytes: &[u8], regex: &Regex, replacement: &str) -> Res
     Ok(encode_utf16_bom(&regex.replace_all(&text, replacement)))
 }
 
-pub(super) fn decode_utf16(bytes: &[u8]) -> Result<String> {
-    if bytes.len() % 2 != 0 {
+pub(crate) fn decode_utf16(bytes: &[u8]) -> Result<String> {
+    if !bytes.len().is_multiple_of(2) {
         bail!("UTF-16 file has odd byte length");
     }
     let units: Vec<u16> = bytes
@@ -28,7 +28,7 @@ pub(super) fn decode_utf16(bytes: &[u8]) -> Result<String> {
 }
 
 pub(super) fn decode_utf16_lossless(bytes: &[u8]) -> Result<Option<String>> {
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Ok(None);
     }
     match decode_utf16(bytes) {

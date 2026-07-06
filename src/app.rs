@@ -4,9 +4,12 @@ use crate::install::{
     detect_install_layout, ensure_game_not_running, resolve_game_dir, InstallLayout,
 };
 use crate::patches::{
-    all_patches, all_presets, compute_patch_set, parse_patch, parse_preset, PatchChange, PatchId,
+    all_patches, all_presets, compute_patch_set, parse_patch, parse_preset, parse_stat_catalog,
+    PatchChange, PatchId, PatchParams, StatCatalogEntry,
 };
 use anyhow::{anyhow, bail, Context, Result};
+use rayon::prelude::*;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,7 +50,7 @@ pub struct AppStatus {
 pub struct PatchRequest {
     pub game_dir: Option<PathBuf>,
     pub patches: Vec<PatchId>,
-    pub zoom: f64,
+    pub params: PatchParams,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -99,7 +102,7 @@ pub fn load_status(game_dir: Option<PathBuf>) -> Result<AppStatus> {
     let store = BundleStore::new(&game_dir);
     let mut index = store.open_index()?;
     let indexed_paths = index.ensure_paths_built()?.len();
-    let backup = BackupStore::default()?;
+    let backup = BackupStore::from_default_location()?;
     let has_backup = backup.has_backup();
     let patch_state = classify_patch_state(has_backup, index_is_patched(&index));
     let index_display_path = store.index_display_path();
@@ -181,7 +184,7 @@ pub fn preview_patches(request: PatchRequest) -> Result<PatchPreview> {
     let game_dir = resolve_game_dir(request.game_dir)?;
     let store = BundleStore::new(&game_dir);
     let mut index = store.open_index()?;
-    let patch_set = compute_patch_set(&store, &mut index, &request.patches, request.zoom)?;
+    let patch_set = compute_patch_set(&store, &mut index, &request.patches, &request.params)?;
 
     Ok(PatchPreview {
         game_dir,
@@ -196,7 +199,7 @@ pub fn apply_patches(request: PatchRequest) -> Result<ApplyReport> {
 
     let game_dir = resolve_game_dir(request.game_dir)?;
     let store = BundleStore::new(&game_dir);
-    let backup = BackupStore::default()?;
+    let backup = BackupStore::from_default_location()?;
 
     if !store.index_exists()? {
         bail!(
@@ -216,7 +219,7 @@ pub fn apply_patches(request: PatchRequest) -> Result<ApplyReport> {
     let patch_state = classify_patch_state(backup.has_backup(), index_is_patched(&index));
     ensure_can_apply(patch_state, backup.path())?;
 
-    let patch_set = compute_patch_set(&store, &mut index, &request.patches, request.zoom)?;
+    let patch_set = compute_patch_set(&store, &mut index, &request.patches, &request.params)?;
 
     if patch_set.changes.is_empty() {
         bail!(
@@ -288,7 +291,7 @@ pub fn apply_patches(request: PatchRequest) -> Result<ApplyReport> {
 pub fn restore_backup(game_dir: Option<PathBuf>) -> Result<RestoreReport> {
     ensure_game_not_running()?;
     let game_dir = resolve_game_dir(game_dir)?;
-    let backup = BackupStore::default()?;
+    let backup = BackupStore::from_default_location()?;
     restore_backup_with_store(game_dir, backup)
 }
 
@@ -389,7 +392,7 @@ fn ensure_can_apply(patch_state: PatchState, backup_path: &Path) -> Result<()> {
 }
 
 pub fn backup_entries() -> Result<(PathBuf, Vec<BackupEntry>)> {
-    let backup = BackupStore::default()?;
+    let backup = BackupStore::from_default_location()?;
     Ok((backup.path().to_path_buf(), backup.entries()?))
 }
 
@@ -413,6 +416,49 @@ pub fn find_paths(
             has_record: index.file_by_path(path).is_some(),
         })
         .collect())
+}
+
+/// Build the searchable stat catalog for the color-mods editor from the
+/// top-level `data/statdescriptions/*.csd` files of the user's install. The
+/// 560 `specific_skill_stat_descriptions/` files only re-describe ids already
+/// present in `stat_descriptions.csd`, so they are skipped. Runs off the UI
+/// thread (called from a background task in the GUI); never part of apply.
+pub fn load_stat_catalog(game_dir: Option<PathBuf>) -> Result<Vec<StatCatalogEntry>> {
+    crate::timing!("load_stat_catalog_total");
+    const PREFIX: &str = "data/statdescriptions/";
+    let game_dir = resolve_game_dir(game_dir)?;
+    let store = BundleStore::new(&game_dir);
+    let mut index = store.open_index()?;
+    let entries = index.matching_paths_by(|path| {
+        let normalized = path.replace('\\', "/").to_ascii_lowercase();
+        normalized
+            .strip_prefix(PREFIX)
+            .is_some_and(|rest| rest.ends_with(".csd") && !rest.contains('/'))
+    })?;
+    let files: Vec<_> = entries.iter().map(|entry| entry.file.clone()).collect();
+    let by_hash = store.read_files_batch(&files)?;
+
+    let parsed: Vec<Vec<StatCatalogEntry>> = files
+        .par_iter()
+        .map(|file| {
+            let Some(bytes) = by_hash.get(&file.hash) else {
+                return Vec::new();
+            };
+            let Ok(text) = crate::patches::decode_utf16(bytes) else {
+                return Vec::new();
+            };
+            parse_stat_catalog(&text)
+        })
+        .collect();
+
+    let mut seen = HashSet::new();
+    let mut catalog: Vec<StatCatalogEntry> = parsed
+        .into_iter()
+        .flatten()
+        .filter(|entry| seen.insert(entry.stat_id.clone()))
+        .collect();
+    catalog.sort_by(|a, b| a.stat_id.cmp(&b.stat_id));
+    Ok(catalog)
 }
 
 pub fn inspect_path(

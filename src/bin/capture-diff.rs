@@ -441,7 +441,7 @@ fn main() -> Result<()> {
         println!("  {e:12}  {ch:6} / {ad}");
     }
     let mut top: Vec<(u64, usize)> = blob_refs.iter().map(|(h, n)| (*h, *n)).collect();
-    top.sort_by(|a, b| b.1.cmp(&a.1));
+    top.sort_by_key(|item| std::cmp::Reverse(item.1));
     println!("\ntop 20 most-referenced blobs (hash  refs  size):");
     for (h, n) in top.iter().take(20) {
         println!("  {h:016x}  {n:6}  {} bytes", blob_size[h]);

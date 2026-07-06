@@ -211,16 +211,17 @@ impl BundleIndex {
     }
 
     pub fn ensure_paths_built(&mut self) -> Result<&[String]> {
-        if self.paths.is_some() {
-            return Ok(self.paths.as_ref().unwrap());
+        if self.paths.is_none() {
+            crate::timing!("dir_decompress");
+            let directory_bytes = decompress_bundle(&self.directory_bytes_compressed)
+                .context("failed to decompress index directory data")?;
+            crate::timing!("dir_build_paths");
+            self.paths = Some(build_paths_from_directories(
+                &directory_bytes,
+                &self.directories,
+            )?);
         }
-        crate::timing!("dir_decompress");
-        let directory_bytes = decompress_bundle(&self.directory_bytes_compressed)
-            .context("failed to decompress index directory data")?;
-        crate::timing!("dir_build_paths");
-        let paths = build_paths_from_directories(&directory_bytes, &self.directories)?;
-        self.paths = Some(paths);
-        Ok(self.paths.as_ref().unwrap())
+        Ok(self.paths.as_deref().expect("paths initialized"))
     }
 
     pub fn paths(&self) -> &[String] {

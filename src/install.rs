@@ -280,10 +280,11 @@ fn parse_library_folders(vdf: &str) -> Vec<PathBuf> {
             [key, value] if key == "path" => {
                 out.push(PathBuf::from(value.replace("\\\\", "\\")));
             }
-            [key, value] if key.chars().all(|ch| ch.is_ascii_digit()) => {
-                if value.contains(':') || value.contains('/') || value.contains("\\\\") {
-                    out.push(PathBuf::from(value.replace("\\\\", "\\")));
-                }
+            [key, value]
+                if key.chars().all(|ch| ch.is_ascii_digit())
+                    && (value.contains(':') || value.contains('/') || value.contains("\\\\")) =>
+            {
+                out.push(PathBuf::from(value.replace("\\\\", "\\")));
             }
             _ => {}
         }

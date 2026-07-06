@@ -299,8 +299,6 @@ impl BundleStore {
     pub fn index_display_path(&self) -> String {
         if matches!(self.layout, InstallLayout::ContentGgpk) {
             format!("{}::Bundles2/_.index.bin", self.content_path.display())
-        } else if self.index_path.exists() {
-            self.index_path.display().to_string()
         } else {
             self.index_path.display().to_string()
         }
@@ -357,8 +355,6 @@ impl BundleStore {
                 self.content_path.display(),
                 storage_bundle_path(bundle_name)
             )
-        } else if loose.exists() {
-            loose.display().to_string()
         } else {
             loose.display().to_string()
         }
@@ -410,9 +406,10 @@ impl BundleStore {
             let span = self.ggpk_file_span(rel_path)?.ok_or_else(|| {
                 anyhow!("{} not found in {}", rel_path, self.content_path.display())
             })?;
-            let ggpk = self.ggpk.as_ref().ok_or_else(|| {
-                anyhow!("failed to open {}", self.content_path.display())
-            })?;
+            let ggpk = self
+                .ggpk
+                .as_ref()
+                .ok_or_else(|| anyhow!("failed to open {}", self.content_path.display()))?;
             let end = span.begin + span.len;
             return ggpk
                 .mmap
@@ -479,11 +476,8 @@ impl BundleStore {
         let appended_start = fs::metadata(&self.content_path)?.len();
         let index_record = ggpk_file_record("_.index.bin", index_bytes, ggpk.use_utf32())?;
         let custom_file_name = format!("{custom_bundle_name}.bundle.bin");
-        let custom_record = ggpk_file_record(
-            &custom_file_name,
-            custom_bundle_bytes,
-            ggpk.use_utf32(),
-        )?;
+        let custom_record =
+            ggpk_file_record(&custom_file_name, custom_bundle_bytes, ggpk.use_utf32())?;
         let index_offset = appended_start;
         let custom_offset = index_offset + u64::try_from(index_record.len())?;
         let new_bundles2_offset = custom_offset + u64::try_from(custom_record.len())?;
@@ -509,12 +503,8 @@ impl BundleStore {
         });
         entries.sort_by_key(|entry| entry.name_hash);
 
-        let new_bundles2 = ggpk_pdir_record(
-            &bundles2.name,
-            &bundles2.digest,
-            &entries,
-            ggpk.use_utf32(),
-        )?;
+        let new_bundles2 =
+            ggpk_pdir_record(&bundles2.name, &bundles2.digest, &entries, ggpk.use_utf32())?;
 
         let mut append_bytes = Vec::new();
         append_bytes.extend_from_slice(&index_record);

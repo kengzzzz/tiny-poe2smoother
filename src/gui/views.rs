@@ -1,17 +1,24 @@
 use eframe::egui;
 use tiny_poe2smoother::app::PatchState;
 use tiny_poe2smoother::install::{display_path, is_game_running};
-use tiny_poe2smoother::patches::{all_patches, all_presets, PatchId, PatchInfo};
+use tiny_poe2smoother::patches::{
+    all_patches, all_presets, default_color_mods, ColorModEntry, PatchId, PatchInfo, PRESET_COLORS,
+};
 
 use super::icon;
 use super::theme::{self, palette};
 use super::widgets;
-use crate::{GuiApp, MessageKind};
+use crate::{ColorRowRef, GuiApp, MessageKind};
 
 const GROUPS: &[(&str, &[PatchId])] = &[
     (
         "Camera & Map",
-        &[PatchId::Camera, PatchId::Minimap, PatchId::AtlasFog],
+        &[
+            PatchId::Camera,
+            PatchId::Minimap,
+            PatchId::AtlasFog,
+            PatchId::ColorMods,
+        ],
     ),
     (
         "Environment",
@@ -43,7 +50,7 @@ const GROUPS: &[(&str, &[PatchId])] = &[
     ),
 ];
 
-// Column packing chosen to roughly balance row counts (3+4 vs 6+3).
+// Column packing chosen to roughly balance row counts (4+4 vs 6+3).
 const COLUMNS: [&[usize]; 2] = [&[0, 2], &[1, 3]];
 
 pub fn draw(app: &mut GuiApp, ui: &mut egui::Ui) {
@@ -265,7 +272,25 @@ fn draw_patch_group(app: &mut GuiApp, ui: &mut egui::Ui, title: &str, patch_ids:
             if patch_id == PatchId::Camera {
                 draw_zoom_row(app, ui);
             }
+            if patch_id == PatchId::ColorMods {
+                draw_color_mods_row(app, ui);
+            }
         }
+    });
+}
+
+fn draw_color_mods_row(app: &mut GuiApp, ui: &mut egui::Ui) {
+    if !app.selected_patches.contains(&PatchId::ColorMods) {
+        return;
+    }
+    ui.horizontal(|ui| {
+        ui.add_space(26.0);
+        if small_action(ui, "Edit colors…") {
+            app.show_color_editor = true;
+            app.ensure_catalog_loading();
+        }
+        let enabled = app.color_mods.iter().filter(|entry| entry.enabled).count();
+        ui.label(theme::caption_text(&format!("{enabled} mod(s) enabled")));
     });
 }
 
@@ -422,6 +447,10 @@ fn draw_modals(app: &mut GuiApp, ctx: &egui::Context) {
         }
     }
 
+    if app.show_color_editor {
+        draw_color_editor(app, ctx);
+    }
+
     if app.show_game_running_dialog {
         let modal = confirm_modal(ctx, "game_running", |ui| {
             ui.label(
@@ -450,6 +479,160 @@ fn draw_modals(app: &mut GuiApp, ctx: &egui::Context) {
             app.show_game_running_dialog = false;
         }
     }
+}
+
+const COLOR_ROW_HEIGHT: f32 = 26.0;
+
+/// The color-mods editor: search box over the configured entries plus the
+/// stat catalog parsed from the game files, one row per mod with an enabled
+/// checkbox, preset swatches, and a custom RGB picker. Wider than
+/// `confirm_modal`, hence its own modal.
+fn draw_color_editor(app: &mut GuiApp, ctx: &egui::Context) {
+    let modal = egui::Modal::new(egui::Id::new("color_mods_editor"))
+        .frame(widgets::card().inner_margin(20))
+        .backdrop_color(egui::Color32::from_black_alpha(140))
+        .show(ctx, |ui| {
+            ui.set_width(640.0);
+            ui.label(theme::heading_text("Color mods"));
+            ui.add_space(2.0);
+            ui.label(theme::caption_text(
+                "Colorize modifier text wherever it appears in game — waystones, items, tablets.",
+            ));
+            ui.add_space(8.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut app.color_search)
+                    .hint_text("Search stat id or text…")
+                    .desired_width(f32::INFINITY)
+                    .margin(egui::Margin::symmetric(10, 8)),
+            );
+            ui.add_space(6.0);
+            if app.catalog_task.is_some() {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().color(palette::ACCENT));
+                    ui.label(theme::caption_text("Loading mod catalog from game files…"));
+                });
+                ui.add_space(4.0);
+            } else if let Some(error) = app.catalog_error.clone() {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("Mod catalog unavailable: {error}"))
+                            .size(11.5)
+                            .color(palette::WARNING),
+                    );
+                    if small_action(ui, "Retry") {
+                        app.catalog_error = None;
+                        app.ensure_catalog_loading();
+                    }
+                });
+                ui.add_space(4.0);
+            }
+
+            app.refresh_color_filter();
+            let row_count = app.color_filter_rows.len();
+            egui::ScrollArea::vertical()
+                .max_height(380.0)
+                .auto_shrink([false, true])
+                .show_rows(ui, COLOR_ROW_HEIGHT, row_count, |ui, range| {
+                    for i in range {
+                        let row = app.color_filter_rows[i];
+                        draw_color_mod_list_row(app, ui, row);
+                    }
+                });
+
+            ui.add_space(10.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add(widgets::primary_button("Close")).clicked() {
+                    app.show_color_editor = false;
+                }
+                if ui
+                    .add(widgets::secondary_button("Reset to defaults"))
+                    .clicked()
+                {
+                    app.color_mods = default_color_mods();
+                    app.color_filter_key = None;
+                }
+            });
+        })
+        .should_close();
+    if modal {
+        app.show_color_editor = false;
+    }
+}
+
+fn draw_color_mod_list_row(app: &mut GuiApp, ui: &mut egui::Ui, row: ColorRowRef) {
+    match row {
+        ColorRowRef::Config(idx) => {
+            let text = app
+                .catalog_text(&app.color_mods[idx].stat_id)
+                .map(str::to_string);
+            color_row_ui(ui, &mut app.color_mods[idx], text.as_deref());
+        }
+        ColorRowRef::Catalog(idx) => {
+            // Not configured yet: render an ephemeral disabled entry; any
+            // interaction (checkbox, swatch, picker) promotes it into the
+            // config as enabled. That is the whole "add custom mod" flow.
+            let Some(catalog) = &app.stat_catalog else {
+                return;
+            };
+            let catalog_row = &catalog[idx];
+            let mut entry = ColorModEntry {
+                stat_id: catalog_row.stat_id.clone(),
+                color: PRESET_COLORS[0].1,
+                enabled: false,
+            };
+            let text = (!catalog_row.text.is_empty()).then(|| catalog_row.text.clone());
+            if color_row_ui(ui, &mut entry, text.as_deref()) {
+                entry.enabled = true;
+                app.color_mods.push(entry);
+            }
+        }
+    }
+}
+
+/// One editor row; returns true when the user changed anything.
+fn color_row_ui(ui: &mut egui::Ui, entry: &mut ColorModEntry, text: Option<&str>) -> bool {
+    let mut changed = false;
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), COLOR_ROW_HEIGHT),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            changed |= ui.checkbox(&mut entry.enabled, "").changed();
+            for (name, color) in PRESET_COLORS {
+                let selected = entry.color == color;
+                let swatch = widgets::color_swatch(
+                    ui,
+                    egui::Color32::from_rgb(color[0], color[1], color[2]),
+                    selected,
+                )
+                .on_hover_text(name);
+                if swatch.clicked() && !selected {
+                    entry.color = color;
+                    changed = true;
+                }
+            }
+            changed |= ui.color_edit_button_srgb(&mut entry.color).changed();
+            ui.add_space(4.0);
+            // Show only the human-readable text; fall back to the stat id
+            // when the catalog has no text for it (or is still loading).
+            // Truncated so long entries never widen the row while scrolling.
+            let display = text.unwrap_or(&entry.stat_id);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(display)
+                        .size(11.5)
+                        .color(if entry.enabled {
+                            palette::TEXT
+                        } else {
+                            palette::TEXT_MUTED
+                        }),
+                )
+                .truncate(),
+            )
+            .on_hover_text(&entry.stat_id);
+        },
+    );
+    changed
 }
 
 /// Shows a modal with shared styling; returns true when it should close

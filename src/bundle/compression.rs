@@ -80,14 +80,8 @@ fn parse_bundle_head(src: &[u8]) -> Result<BundleHead> {
 }
 
 fn decompress_chunk_into(chunk: &[u8], dst: *mut u8, dst_size: usize) -> Result<()> {
-    let wrote = unsafe {
-        Ooz_Decompress(
-            chunk.as_ptr(),
-            u32::try_from(chunk.len())?,
-            dst,
-            dst_size,
-        )
-    };
+    let wrote =
+        unsafe { Ooz_Decompress(chunk.as_ptr(), u32::try_from(chunk.len())?, dst, dst_size) };
     // Anything short of the expected size would leave stale bytes in a shared
     // output buffer, so treat it as corruption rather than tolerating it.
     if wrote != i32::try_from(dst_size)? {
@@ -109,9 +103,11 @@ pub fn decompress_bundle(src: &[u8]) -> Result<Vec<u8>> {
             bail!("bundle chunk exceeds source length");
         }
         let dst_size = head.chunk_dst_size(i);
-        decompress_chunk_into(&src[offset..offset + size], unsafe {
-            out.as_mut_ptr().add(i * head.chunk_unpacked_size)
-        }, dst_size)?;
+        decompress_chunk_into(
+            &src[offset..offset + size],
+            unsafe { out.as_mut_ptr().add(i * head.chunk_unpacked_size) },
+            dst_size,
+        )?;
         covered += dst_size;
         offset += size;
     }
@@ -184,7 +180,11 @@ pub fn decompress_bundle_slices(src: &[u8], spans: &[(u32, u32)]) -> Result<Vec<
         for i in run_start..chunk {
             let dst_size = head.chunk_dst_size(i);
             let chunk_src = &src[chunk_offsets[i]..chunk_offsets[i] + head.chunk_sizes[i]];
-            decompress_chunk_into(chunk_src, unsafe { buf.as_mut_ptr().add(written) }, dst_size)?;
+            decompress_chunk_into(
+                chunk_src,
+                unsafe { buf.as_mut_ptr().add(written) },
+                dst_size,
+            )?;
             written += dst_size;
         }
         buf.truncate(run_len);
@@ -202,7 +202,9 @@ pub fn decompress_bundle_slices(src: &[u8], spans: &[(u32, u32)]) -> Result<Vec<
             let (run_start, buf) = runs
                 .iter()
                 .find(|(start, buf)| offset >= *start && offset + size <= start + buf.len())
-                .ok_or_else(|| anyhow!("file span {offset}+{size} missing from decompressed runs"))?;
+                .ok_or_else(|| {
+                    anyhow!("file span {offset}+{size} missing from decompressed runs")
+                })?;
             Ok(buf[offset - run_start..offset - run_start + size].to_vec())
         })
         .collect()
@@ -298,12 +300,12 @@ mod tests {
         let chunk = u32::try_from(BUNDLE_CHUNK_SIZE).unwrap();
         let spans: [(u32, u32); 7] = [
             (0, 10),
-            (chunk + 100, 500),      // inside the second chunk
-            (chunk - 3, 7),          // crosses the first chunk boundary
-            (total - 5, 5),          // tail of the bundle
-            (chunk, chunk),          // exactly chunk-aligned
-            (0, total),              // the whole bundle
-            (1234, 0),               // empty span
+            (chunk + 100, 500), // inside the second chunk
+            (chunk - 3, 7),     // crosses the first chunk boundary
+            (total - 5, 5),     // tail of the bundle
+            (chunk, chunk),     // exactly chunk-aligned
+            (0, total),         // the whole bundle
+            (1234, 0),          // empty span
         ];
         let slices = decompress_bundle_slices(&packed, &spans).unwrap();
         assert_eq!(slices.len(), spans.len());
