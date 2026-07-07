@@ -327,8 +327,9 @@ fn monster_hp_bar(bytes: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Stubs every HLSL function body in the targeted post-processing/lighting
-/// shaders to `return (type)0;` lighting and the post-process chain output nothing, so the world
-/// renders black while the UI — drawn after post-processing — stays intact.
+/// shaders to `return (type)0;`, so lighting and the post-process chain
+/// output nothing and the world renders black, while the UI — drawn after
+/// post-processing — stays intact.
 fn black_screen(bytes: &[u8]) -> Result<Vec<u8>> {
     let text = String::from_utf8_lossy(bytes).into_owned();
     let mut out = String::with_capacity(text.len());

@@ -428,18 +428,21 @@ impl GuiApp {
     /// Cached; rebuilt only when the query, config set, or catalog changes.
     fn refresh_color_filter(&mut self) {
         let catalog_len = self.stat_catalog.as_ref().map_or(0, Vec::len);
-        let key = (
-            self.color_search.clone(),
-            self.color_mods.len(),
-            catalog_len,
-        );
-        if self.color_filter_key.as_ref() != Some(&key) {
+        let fresh = self
+            .color_filter_key
+            .as_ref()
+            .is_some_and(|(query, mods, catalog)| {
+                *query == self.color_search
+                    && *mods == self.color_mods.len()
+                    && *catalog == catalog_len
+            });
+        if !fresh {
             // PoE2-style search (see gui::search): space-separated terms are
             // ANDed regexes matched against the stat id or display text,
             // quotes keep phrases together, `!` excludes — with a literal
             // fallback so loose phrasings like "increase chance to be omen"
             // and pasted stat ids keep working.
-            let query = gui::search::SearchQuery::parse(&key.0);
+            let query = gui::search::SearchQuery::parse(&self.color_search);
             let matches =
                 |stat_id_lower: &str, text_lower: &str| query.matches(stat_id_lower, text_lower);
             let mut rows = Vec::new();
@@ -468,7 +471,11 @@ impl GuiApp {
                 }
             }
             self.color_filter_rows = rows;
-            self.color_filter_key = Some(key);
+            self.color_filter_key = Some((
+                self.color_search.clone(),
+                self.color_mods.len(),
+                catalog_len,
+            ));
         }
     }
 }

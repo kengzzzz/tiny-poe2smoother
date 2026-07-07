@@ -167,6 +167,42 @@ mod tests {
     }
 
     #[test]
+    fn tester_reported_regex_queries_parse_and_match_without_panicking() {
+        let queries = [
+            "\"y: r\"",
+            "\"(rra)\"",
+            "\"(1[0-8]) us\"",
+            "\"^w|ts f|f rare m|rity$|ndo\"",
+        ];
+        let texts = [
+            "waystone drop chance: +{0}%",
+            "{0}% increased rarity of items found in this area",
+            "15 uses remaining",
+            "{0}% more monster life",
+            "",
+        ];
+        for query in queries {
+            let parsed = SearchQuery::parse(query);
+            for text in texts {
+                parsed.matches("map_monsters_damage_+%", text);
+            }
+        }
+        // Spot-check they actually select rows, not just avoid panics.
+        // `(…)` is a regex group (as in game), not literal parentheses.
+        assert!(matches("\"(1[0-8]) us\"", "15 uses remaining"));
+        assert!(!matches("\"(1[0-8]) us\"", "19 uses remaining"));
+        assert!(matches(
+            "\"^w|ts f|f rare m|rity$|ndo\"",
+            "waystone drop chance"
+        ));
+        assert!(matches(
+            "\"^w|ts f|f rare m|rity$|ndo\"",
+            "{0}% increased rarity"
+        ));
+        assert!(matches("\"y: r\"", "rarity: rare"));
+    }
+
+    #[test]
     fn terms_match_either_stat_id_or_display_text() {
         let query = SearchQuery::parse("ritual omen");
         assert!(query.matches(

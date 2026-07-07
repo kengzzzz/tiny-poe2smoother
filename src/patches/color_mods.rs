@@ -262,11 +262,12 @@ fn annotate_variant_line(line: &str, color: [u8; 3]) -> Option<String> {
     let open = line.find('"')?;
     let inner_len = line[open + 1..].find('"')?;
     let inner = &line[open + 1..open + 1 + inner_len];
+    use std::fmt::Write;
     let [r, g, b] = color;
     let mut out = String::with_capacity(line.len() + 24);
     out.push_str(&line[..open]);
     out.push('"');
-    out.push_str(&format!("<rgb({r},{g},{b})>"));
+    let _ = write!(out, "<rgb({r},{g},{b})>");
     out.push_str("{{");
     out.push_str(inner);
     out.push_str("}}");
