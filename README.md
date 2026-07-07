@@ -17,6 +17,12 @@ GUI tool that patches Path of Exile 2 bundle files to disable visual effects for
 - Saved GUI options between launches
 - Backup and restore
 
+## Trust & Privacy
+
+- No telemetry or analytics of any kind.
+- No auto-updater or background network calls — the app only reads and writes local game files.
+- Releases are marked [immutable on GitHub](https://github.com/kengzzzz/tiny-poe2smoother/releases) and built directly from the tagged source by [GitHub Actions](.github/workflows/release.yml), not hand-uploaded.
+
 ## Download
 
 Download the latest Windows executable or Linux archive from the [releases page](https://github.com/kengzzzz/tiny-poe2smoother/releases).
