@@ -498,7 +498,9 @@ fn draw_color_editor(app: &mut GuiApp, ctx: &egui::Context) {
             ui.add_space(8.0);
             ui.add(
                 egui::TextEdit::singleline(&mut app.color_search)
-                    .hint_text("Search stat id or text…")
+                    .hint_text(
+                        "Search stat id or text — regex like in-game search, \"quotes\", !exclude…",
+                    )
                     .desired_width(f32::INFINITY)
                     .margin(egui::Margin::symmetric(10, 8)),
             );

@@ -232,8 +232,7 @@ pub fn all_presets() -> &'static [PresetInfo] {
         },
         PresetInfo {
             name: "black-screen",
-            description:
-                "Black world rendering plus heavy effect removal.",
+            description: "Black world rendering plus heavy effect removal.",
             patches: &[
                 PatchId::BlackScreen,
                 PatchId::Fog,

@@ -429,21 +429,19 @@ impl GuiApp {
     fn refresh_color_filter(&mut self) {
         let catalog_len = self.stat_catalog.as_ref().map_or(0, Vec::len);
         let key = (
-            self.color_search.to_lowercase(),
+            self.color_search.clone(),
             self.color_mods.len(),
             catalog_len,
         );
         if self.color_filter_key.as_ref() != Some(&key) {
-            // Word-based matching: every query word must appear somewhere in
-            // the stat id or display text, in any order. This lets loose
-            // phrasings like "increase chance to be omen" find
-            // "...#% increased chance to be Omens".
-            let tokens: Vec<&str> = key.0.split_whitespace().collect();
-            let matches = |stat_id_lower: &str, text_lower: &str| {
-                tokens
-                    .iter()
-                    .all(|token| stat_id_lower.contains(token) || text_lower.contains(token))
-            };
+            // PoE2-style search (see gui::search): space-separated terms are
+            // ANDed regexes matched against the stat id or display text,
+            // quotes keep phrases together, `!` excludes — with a literal
+            // fallback so loose phrasings like "increase chance to be omen"
+            // and pasted stat ids keep working.
+            let query = gui::search::SearchQuery::parse(&key.0);
+            let matches =
+                |stat_id_lower: &str, text_lower: &str| query.matches(stat_id_lower, text_lower);
             let mut rows = Vec::new();
             for (idx, entry) in self.color_mods.iter().enumerate() {
                 let text_lower = self
@@ -574,6 +572,17 @@ mod tests {
             .iter()
             .any(|row| matches!(row, ColorRowRef::Config(idx)
                 if app.color_mods[*idx].stat_id == "map_monsters_damage_+%")));
+
+        // PoE2-style regex: alternation, quoted phrases, and `!` exclusion.
+        app.color_search = "omen|monster".to_string();
+        app.color_filter_key = None;
+        app.refresh_color_filter();
+        assert!(app.color_filter_rows.len() >= 3);
+        app.color_search = "\"chance to be\" !monster".to_string();
+        app.color_filter_key = None;
+        app.refresh_color_filter();
+        assert_eq!(app.color_filter_rows.len(), 1);
+        assert!(matches!(app.color_filter_rows[0], ColorRowRef::Catalog(_)));
 
         // Empty query shows everything.
         app.color_search.clear();
