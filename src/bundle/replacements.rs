@@ -3,7 +3,7 @@ use super::index::{BundleFile, BundleIndex};
 use super::store::BundleStore;
 use crate::backup::BackupStore;
 use crate::install::InstallLayout;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fs;
@@ -23,7 +23,6 @@ pub fn apply_bundle_replacements(
 ) -> Result<BundleWriteReport> {
     crate::timing!("apply_replacements_total");
     let mut touched = Vec::new();
-    let mut generated_bundle_paths: Vec<PathBuf> = Vec::new();
     let custom_prefix = match store.layout {
         InstallLayout::LooseBundles => "TinyPoe2Smoother/",
         InstallLayout::ContentGgpk => "TinyPoe2Smoother_",
@@ -71,26 +70,19 @@ pub fn apply_bundle_replacements(
     if let Some(parent) = custom_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    if let Err(e) = atomic_write(&custom_path, &out) {
-        // Clean up any previously written generated bundles
-        for p in &generated_bundle_paths {
-            let _ = fs::remove_file(p);
-        }
-        return Err(e.context(format!(
+    atomic_write(&custom_path, &out).with_context(|| {
+        format!(
             "failed to write generated bundle at {}",
             custom_path.display()
-        )));
-    }
-    generated_bundle_paths.push(custom_path.clone());
-    touched.push(custom_path);
+        )
+    })?;
 
     if let Err(e) = atomic_write(&store.index_path, &index_bytes) {
         // Index replacement failed; remove the orphaned generated bundle
-        for p in &generated_bundle_paths {
-            let _ = fs::remove_file(p);
-        }
+        let _ = fs::remove_file(&custom_path);
         return Err(e.context("failed to replace index; generated bundle has been cleaned up"));
     }
+    touched.push(custom_path);
     touched.push(store.index_path.clone());
     Ok(BundleWriteReport {
         touched_paths: touched,
@@ -108,7 +100,11 @@ pub fn slice_file(bundle: &[u8], file: &BundleFile) -> Result<Vec<u8>> {
     let start = file.offset as usize;
     let end = start + file.size as usize;
     if end > bundle.len() {
-        bail!("file slice exceeds bundle length for {}", file.bundle_name);
+        bail!(
+            "file slice exceeds bundle length for bundle index {} (file hash {:#x})",
+            file.bundle_index,
+            file.hash
+        );
     }
     Ok(bundle[start..end].to_vec())
 }
@@ -133,18 +129,9 @@ mod tests {
     #[test]
     fn replacement_edits_sort_by_index_order_map() {
         let mut edits = vec![
-            (
-                BundleFile::for_test_with_hash(30, "a", 1),
-                b"third".to_vec(),
-            ),
-            (
-                BundleFile::for_test_with_hash(10, "a", 1),
-                b"first".to_vec(),
-            ),
-            (
-                BundleFile::for_test_with_hash(20, "a", 1),
-                b"second".to_vec(),
-            ),
+            (BundleFile::for_test_with_hash(30, 1), b"third".to_vec()),
+            (BundleFile::for_test_with_hash(10, 1), b"first".to_vec()),
+            (BundleFile::for_test_with_hash(20, 1), b"second".to_vec()),
         ];
         let order = HashMap::from([(10, 0), (20, 1), (30, 2)]);
 

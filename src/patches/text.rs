@@ -54,13 +54,13 @@ pub(super) fn replace_array_property(mut data: String, property: &str) -> String
         return data;
     };
     let bracket_start = index + bracket_start_rel;
+    let bytes = data.as_bytes();
     let mut depth = 1;
     let mut end = bracket_start + 1;
-    let chars: Vec<char> = data.chars().collect();
-    while end < chars.len() && depth > 0 {
-        match chars[end] {
-            '[' => depth += 1,
-            ']' => depth -= 1,
+    while end < bytes.len() && depth > 0 {
+        match bytes[end] {
+            b'[' => depth += 1,
+            b']' => depth -= 1,
             _ => {}
         }
         end += 1;
@@ -299,6 +299,15 @@ pub(super) fn empty_named_blocks(data: &str, names: &HashSet<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replace_array_property_survives_non_ascii_prefix() {
+        // Non-ASCII before the property must not skew the bracket scan
+        // (byte vs char indices) or panic on a non-boundary slice.
+        let input = "// gráph…\n{\"values\": [[1, 2], [3]],\"other\": 1}".to_string();
+        let out = replace_array_property(input, "values");
+        assert_eq!(out, "// gráph…\n{\"values\": [],\"other\": 1}");
+    }
 
     #[test]
     fn effects_keeps_selected_client_blocks() {

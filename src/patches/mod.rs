@@ -6,6 +6,7 @@ mod text;
 mod transform;
 
 pub use apply::compute_patch_set;
+pub(crate) use apply::unique_patches;
 pub use catalog::{
     all_patches, all_presets, parse_patch, parse_preset, patch_info, PatchChange, PatchId,
     PatchInfo, PatchParams, PatchSet, PresetInfo,

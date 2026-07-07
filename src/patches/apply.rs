@@ -25,8 +25,8 @@ pub fn compute_patch_set(
     let candidates = dedup_candidates(candidates);
 
     crate::timing!("bundle_batch_read");
-    let files: Vec<BundleFile> = candidates.iter().map(|(_, file)| file.clone()).collect();
-    let mut by_hash = store.read_files_batch(&files)?;
+    let files: Vec<BundleFile> = candidates.iter().map(|(_, file)| *file).collect();
+    let mut by_hash = store.read_files_batch(index, &files)?;
     let file_data: Vec<Vec<u8>> = candidates
         .iter()
         .map(|(path, file)| {
@@ -59,7 +59,7 @@ pub fn compute_patch_set(
         .into_iter()
         .collect::<Result<Vec<_>>>()?;
 
-    build_patch_set_from_transformed(&candidates, transformed)
+    build_patch_set_from_transformed(index, &candidates, transformed)
 }
 
 fn collect_patch_targets(
@@ -81,7 +81,7 @@ fn collect_patch_targets(
             continue;
         }
         for path in exact_targets {
-            if let Some(file) = index.file_by_path(path).cloned() {
+            if let Some(file) = index.file_by_path(path).copied() {
                 targets
                     .entry(patch)
                     .or_default()
@@ -101,7 +101,7 @@ fn collect_patch_targets(
                     targets
                         .entry(*patch)
                         .or_default()
-                        .push((entry.path.clone(), entry.file.clone()));
+                        .push((entry.path.clone(), entry.file));
                 }
             }
         }
@@ -122,7 +122,7 @@ fn collect_patch_targets(
     Ok(candidates)
 }
 
-fn unique_patches(patches: &[PatchId]) -> Vec<PatchId> {
+pub(crate) fn unique_patches(patches: &[PatchId]) -> Vec<PatchId> {
     let mut selected = HashSet::new();
     let mut ordered_unique = Vec::new();
     for patch in patches {
@@ -134,6 +134,7 @@ fn unique_patches(patches: &[PatchId]) -> Vec<PatchId> {
 }
 
 fn build_patch_set_from_transformed(
+    index: &BundleIndex,
     candidates: &[(String, BundleFile)],
     transformed: Vec<(String, Vec<u8>, bool)>,
 ) -> Result<PatchSet> {
@@ -144,16 +145,17 @@ fn build_patch_set_from_transformed(
             bail!("transformed patch target order mismatch: {candidate_path} != {path}");
         }
         if changed {
+            let bundle_name = index.bundle_name(file.bundle_index)?;
             changes.push(PatchChange {
                 path,
-                bundle_name: file.bundle_name.clone(),
+                bundle_name: bundle_name.to_string(),
                 old_size: file.size as usize,
                 new_size: bytes.len(),
             });
             replacements
-                .entry(file.bundle_name.clone())
+                .entry(bundle_name.to_string())
                 .or_default()
-                .push((file.clone(), bytes));
+                .push((*file, bytes));
         }
     }
 
@@ -165,6 +167,7 @@ fn build_patch_set_from_transformed(
 
 #[cfg(test)]
 fn build_patch_set_from_changed(
+    index: &BundleIndex,
     candidates: &[(String, BundleFile)],
     file_data: &mut BTreeMap<String, Vec<u8>>,
     changed: &BTreeMap<String, bool>,
@@ -176,16 +179,17 @@ fn build_patch_set_from_changed(
             let bytes = file_data
                 .remove(path)
                 .ok_or_else(|| anyhow!("changed patch target bytes missing: {path}"))?;
+            let bundle_name = index.bundle_name(file.bundle_index)?;
             changes.push(PatchChange {
                 path: path.clone(),
-                bundle_name: file.bundle_name.clone(),
+                bundle_name: bundle_name.to_string(),
                 old_size: file.size as usize,
                 new_size: bytes.len(),
             });
             replacements
-                .entry(file.bundle_name.clone())
+                .entry(bundle_name.to_string())
                 .or_default()
-                .push((file.clone(), bytes));
+                .push((*file, bytes));
         }
     }
 
@@ -209,11 +213,15 @@ mod tests {
 
     #[test]
     fn changed_replacements_are_built_once_per_target_path() {
-        let file = BundleFile::for_test("env.bundle.bin", 6);
-        let candidates = vec![(
-            "metadata/environmentsettings/test.env".to_string(),
-            file.clone(),
-        )];
+        let index = BundleIndex::for_test_paths(&[(
+            "metadata/environmentsettings/test.env",
+            "env.bundle.bin",
+            6,
+        )]);
+        let file = *index
+            .file_by_path("metadata/environmentsettings/test.env")
+            .unwrap();
+        let candidates = vec![("metadata/environmentsettings/test.env".to_string(), file)];
         let mut file_data = BTreeMap::from([(
             "metadata/environmentsettings/test.env".to_string(),
             b"changed".to_vec(),
@@ -221,7 +229,7 @@ mod tests {
         let changed = BTreeMap::from([("metadata/environmentsettings/test.env".to_string(), true)]);
 
         let patch_set =
-            build_patch_set_from_changed(&candidates, &mut file_data, &changed).unwrap();
+            build_patch_set_from_changed(&index, &candidates, &mut file_data, &changed).unwrap();
 
         assert_eq!(patch_set.changes.len(), 1);
         assert_eq!(
@@ -235,16 +243,10 @@ mod tests {
 
     #[test]
     fn duplicate_patch_candidates_collapse_to_one_target() {
-        let file = BundleFile::for_test("env.bundle.bin", 6);
+        let file = BundleFile::for_test(6);
         let candidates = dedup_candidates(vec![
-            (
-                "metadata/environmentsettings/test.env".to_string(),
-                file.clone(),
-            ),
-            (
-                "metadata/environmentsettings/test.env".to_string(),
-                file.clone(),
-            ),
+            ("metadata/environmentsettings/test.env".to_string(), file),
+            ("metadata/environmentsettings/test.env".to_string(), file),
         ]);
 
         assert_eq!(candidates.len(), 1);

@@ -1,7 +1,7 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use sysinfo::System;
+use sysinfo::{ProcessRefreshKind, RefreshKind, System, UpdateKind};
 
 const POE2_APP_ID: &str = "2694490";
 const STANDALONE_DIRS: &[&str] = &["Path of Exile 2", "Path of Exile 2 - poe2_production"];
@@ -34,8 +34,12 @@ pub fn resolve_game_dir(explicit: Option<PathBuf>) -> Result<PathBuf> {
         if !manifest.exists() {
             continue;
         }
-        let text = std::fs::read_to_string(&manifest)
-            .with_context(|| format!("failed to read {}", manifest.display()))?;
+        // An unreadable manifest (permissions, broken library) should not stop
+        // the scan; keep trying the other Steam libraries and standalone paths.
+        let Ok(text) = std::fs::read_to_string(&manifest) else {
+            tracing::warn!("skipping unreadable {}", manifest.display());
+            continue;
+        };
         let install_dir = parse_install_dir(&text).unwrap_or_else(|| "Path of Exile 2".to_string());
         let game_dir = candidate.join("steamapps").join("common").join(install_dir);
         if game_dir.exists() {
@@ -91,8 +95,13 @@ pub fn ensure_game_not_running() -> Result<()> {
 }
 
 pub fn is_game_running() -> bool {
-    let mut system = System::new_all();
-    system.refresh_all();
+    // Runs synchronously on the UI thread when Apply/Restore is clicked; only
+    // process names and command lines are needed, so skip the full system
+    // refresh (CPU, memory, disks, ...) that `System::new_all` would do twice.
+    let system = System::new_with_specifics(
+        RefreshKind::nothing()
+            .with_processes(ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always)),
+    );
     system.processes().values().any(|process| {
         let name = process.name().to_string_lossy().to_ascii_lowercase();
         if name.contains("pathofexile") || name.contains("path of exile") {

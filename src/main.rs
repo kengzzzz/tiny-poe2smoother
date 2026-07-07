@@ -21,6 +21,7 @@ use tiny_poe2smoother::patches::{
 const PREFS_KEY: &str = "tiny-poe2smoother.gui.v1";
 
 fn main() -> eframe::Result {
+    tiny_poe2smoother::init_tracing();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([980.0, 720.0])
@@ -298,9 +299,18 @@ impl GuiApp {
         let Some(rx) = &self.task else {
             return;
         };
-        let Ok(result) = rx.try_recv() else {
-            ctx.request_repaint_after(std::time::Duration::from_millis(33));
-            return;
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(33));
+                return;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.task = None;
+                self.busy_label = None;
+                self.set_message("Background task failed unexpectedly.", MessageKind::Error);
+                return;
+            }
         };
 
         self.task = None;

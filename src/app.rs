@@ -1,11 +1,11 @@
-use crate::backup::{BackupEntry, BackupStore};
+use crate::backup::{ggpk_backup_meta, BackupEntry, BackupStore};
 use crate::bundle::{apply_bundle_replacements, BundleIndex, BundleStore};
 use crate::install::{
     detect_install_layout, ensure_game_not_running, resolve_game_dir, InstallLayout,
 };
 use crate::patches::{
     all_patches, all_presets, compute_patch_set, parse_patch, parse_preset, parse_stat_catalog,
-    PatchChange, PatchId, PatchParams, StatCatalogEntry,
+    unique_patches, PatchChange, PatchId, PatchParams, StatCatalogEntry,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use rayon::prelude::*;
@@ -154,7 +154,7 @@ pub fn resolve_patch_selection(selection: PatchSelection) -> Result<Vec<PatchId>
         bail!("select at least one --patch/--preset or use --all");
     }
 
-    Ok(unique_patch_ids(out))
+    Ok(unique_patches(&out))
 }
 
 pub fn patch_names(ids: &[PatchId]) -> Vec<&'static str> {
@@ -166,17 +166,6 @@ pub fn patch_names(ids: &[PatchId]) -> Vec<&'static str> {
 
 pub fn preset_names() -> Vec<&'static str> {
     all_presets().iter().map(|preset| preset.name).collect()
-}
-
-fn unique_patch_ids(ids: Vec<PatchId>) -> Vec<PatchId> {
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    for id in ids {
-        if seen.insert(id) {
-            out.push(id);
-        }
-    }
-    out
 }
 
 pub fn preview_patches(request: PatchRequest) -> Result<PatchPreview> {
@@ -297,7 +286,10 @@ pub fn restore_backup(game_dir: Option<PathBuf>) -> Result<RestoreReport> {
 
 fn restore_backup_with_store(game_dir: PathBuf, backup: BackupStore) -> Result<RestoreReport> {
     let restored_files = if backup.has_backup() {
-        if backup.count()? == 0 {
+        // Parse the backup once; the emptiness check, GGPK metadata lookup,
+        // and restore below all work off the same entries.
+        let entries = backup.entries()?;
+        if entries.is_empty() {
             bail!(
                 "backup exists but is empty at {};\n  check file integrity",
                 backup.path().display()
@@ -329,7 +321,7 @@ fn restore_backup_with_store(game_dir: PathBuf, backup: BackupStore) -> Result<R
             InstallLayout::ContentGgpk
         );
         if overlay_restore {
-            if let Some(meta) = backup.ggpk_backup_meta()? {
+            if let Some(meta) = ggpk_backup_meta(&entries)? {
                 store.restore_ggpk_backup(meta).with_context(|| {
                     format!(
                         "failed to restore {};\n  backup may be corrupt",
@@ -340,7 +332,7 @@ fn restore_backup_with_store(game_dir: PathBuf, backup: BackupStore) -> Result<R
             }
         }
         backup
-            .restore(&game_dir, overlay_restore)
+            .restore(&entries, &game_dir, overlay_restore)
             .with_context(|| {
                 format!(
                     "restore from {} failed;\n  backup may be corrupt",
@@ -405,9 +397,10 @@ pub fn find_paths(
     let store = BundleStore::new(&game_dir);
     let mut index = store.open_index()?;
     let query = query.to_ascii_lowercase();
-    let paths = index.ensure_paths_built()?.to_vec();
+    index.ensure_paths_built()?;
 
-    Ok(paths
+    Ok(index
+        .paths()
         .iter()
         .filter(|path| path.to_ascii_lowercase().contains(&query))
         .take(limit)
@@ -435,8 +428,8 @@ pub fn load_stat_catalog(game_dir: Option<PathBuf>) -> Result<Vec<StatCatalogEnt
             .strip_prefix(PREFIX)
             .is_some_and(|rest| rest.ends_with(".csd") && !rest.contains('/'))
     })?;
-    let files: Vec<_> = entries.iter().map(|entry| entry.file.clone()).collect();
-    let by_hash = store.read_files_batch(&files)?;
+    let files: Vec<_> = entries.iter().map(|entry| entry.file).collect();
+    let by_hash = store.read_files_batch(&index, &files)?;
 
     let parsed: Vec<Vec<StatCatalogEntry>> = files
         .par_iter()
@@ -648,6 +641,9 @@ mod tests {
         raw.extend_from_slice(&0u32.to_le_bytes());
         raw.extend_from_slice(&0u32.to_le_bytes());
         raw.extend_from_slice(&0u32.to_le_bytes());
+        // Trailing compressed directory data; open_index builds paths from it
+        // (and caches them) even when the directory record is empty.
+        raw.extend_from_slice(&pack_uncompressed_bundle(&[]).unwrap());
         pack_uncompressed_bundle(&raw).unwrap()
     }
 }
