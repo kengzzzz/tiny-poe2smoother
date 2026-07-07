@@ -33,6 +33,7 @@ const GROUPS: &[(&str, &[PatchId])] = &[
             PatchId::Particles,
             PatchId::Effects,
             PatchId::MtxSoft,
+            PatchId::BlackScreen,
         ],
     ),
     (
@@ -46,7 +47,7 @@ const GROUPS: &[(&str, &[PatchId])] = &[
     ("Interface", &[PatchId::ColorMods, PatchId::MonsterHpBar]),
 ];
 
-// Column packing chosen to roughly balance row counts (3+4+2 vs 6+3).
+// Column packing chosen to roughly balance row counts (3+5+2 vs 6+3).
 const COLUMNS: [&[usize]; 2] = [&[0, 2, 4], &[1, 3]];
 
 pub fn draw(app: &mut GuiApp, ui: &mut egui::Ui) {

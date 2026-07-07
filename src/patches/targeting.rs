@@ -62,6 +62,21 @@ pub(super) fn exact_patch_targets(patch: PatchId) -> &'static [&'static str] {
         ],
         PatchId::AtlasFog => &["metadata/materials/environment/worldmap/worldmap_fogofwar.fxgraph"],
         PatchId::MonsterHpBar => &["metadata/monsters/monster.ot"],
+        // stubs out; killing lighting + the post chain renders the world black
+        // while the UI (drawn after post-processing) stays visible.
+        PatchId::BlackScreen => &[
+            "shaders/postprocessuber.hlsl",
+            "shaders/bloomcutoff.hlsl",
+            "shaders/bloomgather.hlsl",
+            "shaders/blur.hlsl",
+            "shaders/copytexture.hlsl",
+            "shaders/depthawareblur.hlsl",
+            "shaders/gaussianblur.hlsl",
+            "shaders/postprocessoutput.hlsl",
+            "shaders/screenspaceshadows.hlsl",
+            "shaders/include/lighting.hlsl",
+            "shaders/include/projection.hlsl",
+        ],
         _ => &[],
     }
 }
@@ -72,9 +87,11 @@ pub(super) fn patch_targets_path(patch: PatchId, path: &str) -> bool {
             starts_with_path_ci(path, "metadata/")
                 && (ends_with_path_ci(path, ".ot") || ends_with_path_ci(path, ".otc"))
         }
-        PatchId::Minimap | PatchId::AtlasFog | PatchId::MonsterHpBar => exact_patch_targets(patch)
-            .iter()
-            .any(|target| eq_path_ci(path, target)),
+        PatchId::Minimap | PatchId::AtlasFog | PatchId::MonsterHpBar | PatchId::BlackScreen => {
+            exact_patch_targets(patch)
+                .iter()
+                .any(|target| eq_path_ci(path, target))
+        }
         PatchId::ColorMods => is_stat_description_target(path),
         PatchId::Fog
         | PatchId::Rain
@@ -164,6 +181,9 @@ pub(super) fn patch_applies_path(patch: PatchId, path: &str) -> bool {
                 && is_metadata_effect_ext(path)
         }
         PatchId::MonsterHpBar => eq_path_ci(path, "metadata/monsters/monster.ot"),
+        PatchId::BlackScreen => exact_patch_targets(PatchId::BlackScreen)
+            .iter()
+            .any(|target| eq_path_ci(path, target)),
     }
 }
 
@@ -284,6 +304,29 @@ mod tests {
         assert!(!is_startup_scene_protected(
             "metadata/effects/spells/fireball/fireball.ao"
         ));
+    }
+
+    #[test]
+    fn black_screen_targets_only_the_post_processing_shaders() {
+        for path in [
+            "shaders/postprocessuber.hlsl",
+            "Shaders/PostProcessOutput.hlsl",
+            "shaders\\include\\lighting.hlsl",
+            "shaders/include/projection.hlsl",
+        ] {
+            assert!(patch_targets_path(PatchId::BlackScreen, path));
+            assert!(patch_applies_path(PatchId::BlackScreen, path));
+        }
+        for path in [
+            // No overlap with the minimap patch's shaders.
+            "shaders/minimap_visibility_pixel.hlsl",
+            "shaders/minimap_blending_pixel.hlsl",
+            "shaders/lighting.hlsl",
+            "shaders/include/lighting.hlsl.bak",
+        ] {
+            assert!(!patch_targets_path(PatchId::BlackScreen, path));
+            assert!(!patch_applies_path(PatchId::BlackScreen, path));
+        }
     }
 
     #[test]

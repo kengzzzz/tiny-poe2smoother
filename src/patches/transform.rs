@@ -5,8 +5,8 @@ use super::targeting::{
     patch_targets_path, EFFECT_PROTECTED_PREFIXES, PARTICLE_PROTECTED_PREFIXES,
 };
 use super::text::{
-    decode_utf16, decode_utf16_lossless, empty_named_blocks, encode_utf16_bom, regex_utf16,
-    remove_function_calls, replace_array_property, replace_utf16, strip_client_blocks,
+    decode_utf16, decode_utf16_lossless, empty_named_blocks, encode_utf16_bom, find_matching_brace,
+    regex_utf16, remove_function_calls, replace_array_property, replace_utf16, strip_client_blocks,
 };
 use anyhow::Result;
 use regex::Regex;
@@ -17,6 +17,15 @@ static RAIN_INTENSITY_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"("rain_intensity":\s*)([^,\r\n}]+)(,?)"#).unwrap());
 static CLOUDS_INTENSITY_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"("clouds_intensity":\s*)([^,\r\n}]+)(,?)"#).unwrap());
+// HLSL function signature: return type, name, parameter list. Longest-first
+// alternation so `float4x4` never half-matches as `float`; the parameter list
+// allows one level of nested parens for macro params like `TEXTURE2D_DECL(tex)`.
+static HLSL_FUNCTION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\b(float4x4|float3x3|float2x2|float4|float3|float2|float|void|OutPixel)\s+\w+\s*\((?:[^()]|\([^()]*\))*\)",
+    )
+    .unwrap()
+});
 static EFFECT_KEEP_BLOCKS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     [
         "ClientAnimationController",
@@ -104,6 +113,7 @@ pub(super) fn transform(
         PatchId::MonsterSounds => strip_sounds(path, bytes),
         PatchId::MtxSoft => mtx_soft(path, bytes),
         PatchId::MonsterHpBar => monster_hp_bar(bytes),
+        PatchId::BlackScreen => black_screen(bytes),
     }
 }
 
@@ -314,6 +324,75 @@ fn monster_hp_bar(bytes: &[u8]) -> Result<Vec<u8>> {
     lines.insert(index, "\tbase_maximum_life = 1".to_string());
     lines.insert(index, "\tbase_maximum_energy_shield = 1".to_string());
     Ok(encode_utf16_bom(&lines.join("\r\n")))
+}
+
+/// Stubs every HLSL function body in the targeted post-processing/lighting
+/// shaders to `return (type)0;` lighting and the post-process chain output nothing, so the world
+/// renders black while the UI — drawn after post-processing — stays intact.
+fn black_screen(bytes: &[u8]) -> Result<Vec<u8>> {
+    let text = String::from_utf8_lossy(bytes).into_owned();
+    let mut out = String::with_capacity(text.len());
+    let mut pos = 0;
+    while let Some(found) = HLSL_FUNCTION_RE.captures(&text[pos..]) {
+        let signature_end = pos + found.get(0).expect("group 0 always exists").end();
+        // Only accept a body directly following the signature (allowing a
+        // `: SEMANTIC` return annotation); anything else — e.g. a forward
+        // declaration ending in `;` — is copied through untouched rather than
+        // grabbing the next `{` anywhere.
+        let body = function_body_open(&text, signature_end)
+            .and_then(|open| find_matching_brace(&text, open).map(|close| (open, close)));
+        let Some((open, close)) = body else {
+            out.push_str(&text[pos..signature_end]);
+            pos = signature_end;
+            continue;
+        };
+        out.push_str(&text[pos..open]);
+        out.push_str(hlsl_stub(&found[1]));
+        pos = close + 1;
+    }
+    out.push_str(&text[pos..]);
+    Ok(out.into_bytes())
+}
+
+/// Index of the `{` opening a function body that directly follows a signature
+/// ending at `from`, allowing only whitespace, `//` line comments, and one
+/// `: SEMANTIC` return annotation in between.
+fn function_body_open(text: &str, from: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut semantic_seen = false;
+    let mut i = from;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => return Some(i),
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                i += text[i..].find('\n')?;
+            }
+            b if b.is_ascii_whitespace() => {}
+            b':' if !semantic_seen => semantic_seen = true,
+            b if semantic_seen && (b.is_ascii_alphanumeric() || b == b'_') => {}
+            _ => return None,
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Replacement bodies byte-for-byte.
+fn hlsl_stub(return_type: &str) -> &'static str {
+    match return_type {
+        "float" => "{\n\treturn (float)0;\n}",
+        "float2" => "{\n\treturn (float2)0;\n}",
+        "float3" => "{\n\treturn (float3)0;\n}",
+        "float4" => "{\n\treturn (float4)0;\n}",
+        "float2x2" => "{\n\treturn (float2x2)0;\n}",
+        "float3x3" => "{\n\treturn (float3x3)0;\n}",
+        "float4x4" => "{\n\treturn (float4x4)0;\n}",
+        // screenspaceshadows.hlsl: report "fully lit" instead of computing.
+        "OutPixel" => {
+            "{\tOutPixel res;\r\n\tres.shadowmap_data = float4(1.0f, 1.0f, 1.0f, 1.0f);\r\n\treturn res;\n}"
+        }
+        _ => "{ }",
+    }
 }
 
 /// Index of the first line inside the `Stats { ... }` block body, if present.
@@ -527,6 +606,55 @@ SoundEvents {}\r\n}";
         )
         .unwrap();
         assert_eq!(untouched, bare);
+    }
+
+    #[test]
+    fn black_screen_stubs_function_bodies_by_return_type() {
+        // Shapes taken from the real PoE2 shader files: nested braces in a
+        // body, macro parens in a parameter list, and a trailing line comment
+        // between the signature and the body.
+        let input = b"#include \"include/common.hlsl\"\n\nfloat3 ComputeLight(float3 normal, float3 dir)\n{\n\tif (dot(normal, dir) > 0.0f)\n\t{\n\t\treturn normal * dir;\n\t}\n\treturn (float3)0.5f;\n}\n\nfloat4 SampleEnv(uniform TEXTURECUBE_DECL(spec_tex), float3 dir)\n{\n\treturn SAMPLE_TEXCUBELOD(spec_tex, Sampler, float4(dir, 0.0f));\n}\n\nfloat SmithTerm(float alpha, float VdotN) // * VdotN * LdotN\n{\n\treturn alpha * VdotN;\n}\n\nvoid Accumulate(inout float4 total)\n{\n\ttotal += 1.0f;\n}\n";
+        let out = transform(
+            PatchId::BlackScreen,
+            "shaders/include/lighting.hlsl",
+            input,
+            TransformCtx::default(),
+        )
+        .unwrap();
+
+        let expected = "#include \"include/common.hlsl\"\n\nfloat3 ComputeLight(float3 normal, float3 dir)\n{\n\treturn (float3)0;\n}\n\nfloat4 SampleEnv(uniform TEXTURECUBE_DECL(spec_tex), float3 dir)\n{\n\treturn (float4)0;\n}\n\nfloat SmithTerm(float alpha, float VdotN) // * VdotN * LdotN\n{\n\treturn (float)0;\n}\n\nvoid Accumulate(inout float4 total)\n{ }\n";
+        assert_eq!(String::from_utf8(out.clone()).unwrap(), expected);
+
+        // Re-applying to already-stubbed bytes changes nothing.
+        let again = transform(
+            PatchId::BlackScreen,
+            "shaders/include/lighting.hlsl",
+            &out,
+            TransformCtx::default(),
+        )
+        .unwrap();
+        assert_eq!(again, out);
+    }
+
+    #[test]
+    fn black_screen_stubs_outpixel_shader_and_skips_forward_declarations() {
+        let input = b"float ShadowTerm(float3 pos);\n\nOutPixel main(InPixel input) : SV_Target\n{\n\tOutPixel res;\n\tres.shadowmap_data = ComputeShadows(input);\n\treturn res;\n}\n";
+        let out = transform(
+            PatchId::BlackScreen,
+            "shaders/screenspaceshadows.hlsl",
+            input,
+            TransformCtx::default(),
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+
+        // The forward declaration is untouched; its `;` must not make the
+        // stubber swallow the next function's body.
+        assert!(text.starts_with("float ShadowTerm(float3 pos);\n"));
+        assert!(text.contains(
+            "{\tOutPixel res;\r\n\tres.shadowmap_data = float4(1.0f, 1.0f, 1.0f, 1.0f);\r\n\treturn res;\n}"
+        ));
+        assert!(!text.contains("ComputeShadows"));
     }
 
     #[test]

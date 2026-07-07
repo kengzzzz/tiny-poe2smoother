@@ -169,7 +169,7 @@ fn skip_syntax(text: &str, i: usize) -> usize {
     }
 }
 
-fn find_matching_brace(text: &str, open: usize) -> Option<usize> {
+pub(super) fn find_matching_brace(text: &str, open: usize) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut depth = 1;
     let mut i = open + 1;

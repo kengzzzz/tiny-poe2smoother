@@ -22,6 +22,7 @@ pub enum PatchId {
     MonsterSounds,
     MtxSoft,
     MonsterHpBar,
+    BlackScreen,
 }
 
 #[derive(Debug, Clone)]
@@ -161,6 +162,11 @@ pub fn all_patches() -> &'static [PatchInfo] {
             name: "monster-hp-bar",
             description: "Always show monster HP bars.",
         },
+        PatchInfo {
+            id: PatchId::BlackScreen,
+            name: "black-screen",
+            description: "Black out world rendering.",
+        },
     ]
 }
 
@@ -225,8 +231,25 @@ pub fn all_presets() -> &'static [PresetInfo] {
             ],
         },
         PresetInfo {
+            name: "black-screen",
+            description:
+                "Black world rendering plus heavy effect removal.",
+            patches: &[
+                PatchId::BlackScreen,
+                PatchId::Fog,
+                PatchId::Rain,
+                PatchId::Clouds,
+                PatchId::EnvParticles,
+                PatchId::Shadow,
+                PatchId::Light,
+                PatchId::Delirium,
+                PatchId::Particles,
+                PatchId::Effects,
+            ],
+        },
+        PresetInfo {
             name: "check-all",
-            description: "Select every ported patch.",
+            description: "Select every ported patch except black-screen.",
             patches: &[
                 PatchId::Camera,
                 PatchId::Minimap,

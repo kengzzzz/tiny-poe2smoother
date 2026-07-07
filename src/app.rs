@@ -598,9 +598,11 @@ mod tests {
 
     #[test]
     fn removed_destructive_patches_are_unknown() {
+        // "black-screen" used to be on this list, but was reintroduced as a
+        // safe shader-stub patch (see `PatchId::BlackScreen`) rather than the
+        // original tool's destructive game-wide file blanking.
         for name in [
             "zero-effects",
-            "black-screen",
             "remove-players",
             "remove-monsters",
             "clean-terrain",
