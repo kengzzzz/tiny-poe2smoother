@@ -1,12 +1,15 @@
-use crate::backup::{BackupEntry, BackupStore};
+use crate::backup::{ggpk_backup_meta, BackupEntry, BackupStore};
 use crate::bundle::{apply_bundle_replacements, BundleIndex, BundleStore};
 use crate::install::{
     detect_install_layout, ensure_game_not_running, resolve_game_dir, InstallLayout,
 };
 use crate::patches::{
-    all_patches, all_presets, compute_patch_set, parse_patch, parse_preset, PatchChange, PatchId,
+    all_patches, all_presets, compute_patch_set, parse_patch, parse_preset, parse_stat_catalog,
+    unique_patches, PatchChange, PatchId, PatchParams, StatCatalogEntry,
 };
 use anyhow::{anyhow, bail, Context, Result};
+use rayon::prelude::*;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,7 +50,7 @@ pub struct AppStatus {
 pub struct PatchRequest {
     pub game_dir: Option<PathBuf>,
     pub patches: Vec<PatchId>,
-    pub zoom: f64,
+    pub params: PatchParams,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -99,7 +102,7 @@ pub fn load_status(game_dir: Option<PathBuf>) -> Result<AppStatus> {
     let store = BundleStore::new(&game_dir);
     let mut index = store.open_index()?;
     let indexed_paths = index.ensure_paths_built()?.len();
-    let backup = BackupStore::default()?;
+    let backup = BackupStore::from_default_location()?;
     let has_backup = backup.has_backup();
     let patch_state = classify_patch_state(has_backup, index_is_patched(&index));
     let index_display_path = store.index_display_path();
@@ -151,7 +154,7 @@ pub fn resolve_patch_selection(selection: PatchSelection) -> Result<Vec<PatchId>
         bail!("select at least one --patch/--preset or use --all");
     }
 
-    Ok(unique_patch_ids(out))
+    Ok(unique_patches(&out))
 }
 
 pub fn patch_names(ids: &[PatchId]) -> Vec<&'static str> {
@@ -165,23 +168,12 @@ pub fn preset_names() -> Vec<&'static str> {
     all_presets().iter().map(|preset| preset.name).collect()
 }
 
-fn unique_patch_ids(ids: Vec<PatchId>) -> Vec<PatchId> {
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    for id in ids {
-        if seen.insert(id) {
-            out.push(id);
-        }
-    }
-    out
-}
-
 pub fn preview_patches(request: PatchRequest) -> Result<PatchPreview> {
     crate::timing!("preview_patches_total");
     let game_dir = resolve_game_dir(request.game_dir)?;
     let store = BundleStore::new(&game_dir);
     let mut index = store.open_index()?;
-    let patch_set = compute_patch_set(&store, &mut index, &request.patches, request.zoom)?;
+    let patch_set = compute_patch_set(&store, &mut index, &request.patches, &request.params)?;
 
     Ok(PatchPreview {
         game_dir,
@@ -196,7 +188,7 @@ pub fn apply_patches(request: PatchRequest) -> Result<ApplyReport> {
 
     let game_dir = resolve_game_dir(request.game_dir)?;
     let store = BundleStore::new(&game_dir);
-    let backup = BackupStore::default()?;
+    let backup = BackupStore::from_default_location()?;
 
     if !store.index_exists()? {
         bail!(
@@ -216,7 +208,7 @@ pub fn apply_patches(request: PatchRequest) -> Result<ApplyReport> {
     let patch_state = classify_patch_state(backup.has_backup(), index_is_patched(&index));
     ensure_can_apply(patch_state, backup.path())?;
 
-    let patch_set = compute_patch_set(&store, &mut index, &request.patches, request.zoom)?;
+    let patch_set = compute_patch_set(&store, &mut index, &request.patches, &request.params)?;
 
     if patch_set.changes.is_empty() {
         bail!(
@@ -288,13 +280,16 @@ pub fn apply_patches(request: PatchRequest) -> Result<ApplyReport> {
 pub fn restore_backup(game_dir: Option<PathBuf>) -> Result<RestoreReport> {
     ensure_game_not_running()?;
     let game_dir = resolve_game_dir(game_dir)?;
-    let backup = BackupStore::default()?;
+    let backup = BackupStore::from_default_location()?;
     restore_backup_with_store(game_dir, backup)
 }
 
 fn restore_backup_with_store(game_dir: PathBuf, backup: BackupStore) -> Result<RestoreReport> {
     let restored_files = if backup.has_backup() {
-        if backup.count()? == 0 {
+        // Parse the backup once; the emptiness check, GGPK metadata lookup,
+        // and restore below all work off the same entries.
+        let entries = backup.entries()?;
+        if entries.is_empty() {
             bail!(
                 "backup exists but is empty at {};\n  check file integrity",
                 backup.path().display()
@@ -326,7 +321,7 @@ fn restore_backup_with_store(game_dir: PathBuf, backup: BackupStore) -> Result<R
             InstallLayout::ContentGgpk
         );
         if overlay_restore {
-            if let Some(meta) = backup.ggpk_backup_meta()? {
+            if let Some(meta) = ggpk_backup_meta(&entries)? {
                 store.restore_ggpk_backup(meta).with_context(|| {
                     format!(
                         "failed to restore {};\n  backup may be corrupt",
@@ -337,7 +332,7 @@ fn restore_backup_with_store(game_dir: PathBuf, backup: BackupStore) -> Result<R
             }
         }
         backup
-            .restore(&game_dir, overlay_restore)
+            .restore(&entries, &game_dir, overlay_restore)
             .with_context(|| {
                 format!(
                     "restore from {} failed;\n  backup may be corrupt",
@@ -389,7 +384,7 @@ fn ensure_can_apply(patch_state: PatchState, backup_path: &Path) -> Result<()> {
 }
 
 pub fn backup_entries() -> Result<(PathBuf, Vec<BackupEntry>)> {
-    let backup = BackupStore::default()?;
+    let backup = BackupStore::from_default_location()?;
     Ok((backup.path().to_path_buf(), backup.entries()?))
 }
 
@@ -402,9 +397,10 @@ pub fn find_paths(
     let store = BundleStore::new(&game_dir);
     let mut index = store.open_index()?;
     let query = query.to_ascii_lowercase();
-    let paths = index.ensure_paths_built()?.to_vec();
+    index.ensure_paths_built()?;
 
-    Ok(paths
+    Ok(index
+        .paths()
         .iter()
         .filter(|path| path.to_ascii_lowercase().contains(&query))
         .take(limit)
@@ -413,6 +409,49 @@ pub fn find_paths(
             has_record: index.file_by_path(path).is_some(),
         })
         .collect())
+}
+
+/// Build the searchable stat catalog for the color-mods editor from the
+/// top-level `data/statdescriptions/*.csd` files of the user's install. The
+/// 560 `specific_skill_stat_descriptions/` files only re-describe ids already
+/// present in `stat_descriptions.csd`, so they are skipped. Runs off the UI
+/// thread (called from a background task in the GUI); never part of apply.
+pub fn load_stat_catalog(game_dir: Option<PathBuf>) -> Result<Vec<StatCatalogEntry>> {
+    crate::timing!("load_stat_catalog_total");
+    const PREFIX: &str = "data/statdescriptions/";
+    let game_dir = resolve_game_dir(game_dir)?;
+    let store = BundleStore::new(&game_dir);
+    let mut index = store.open_index()?;
+    let entries = index.matching_paths_by(|path| {
+        let normalized = path.replace('\\', "/").to_ascii_lowercase();
+        normalized
+            .strip_prefix(PREFIX)
+            .is_some_and(|rest| rest.ends_with(".csd") && !rest.contains('/'))
+    })?;
+    let files: Vec<_> = entries.iter().map(|entry| entry.file).collect();
+    let by_hash = store.read_files_batch(&index, &files)?;
+
+    let parsed: Vec<Vec<StatCatalogEntry>> = files
+        .par_iter()
+        .map(|file| {
+            let Some(bytes) = by_hash.get(&file.hash) else {
+                return Vec::new();
+            };
+            let Ok(text) = crate::patches::decode_utf16(bytes) else {
+                return Vec::new();
+            };
+            parse_stat_catalog(&text)
+        })
+        .collect();
+
+    let mut seen = HashSet::new();
+    let mut catalog: Vec<StatCatalogEntry> = parsed
+        .into_iter()
+        .flatten()
+        .filter(|entry| seen.insert(entry.stat_id.clone()))
+        .collect();
+    catalog.sort_by(|a, b| a.stat_id.cmp(&b.stat_id));
+    Ok(catalog)
 }
 
 pub fn inspect_path(
@@ -552,9 +591,11 @@ mod tests {
 
     #[test]
     fn removed_destructive_patches_are_unknown() {
+        // "black-screen" used to be on this list, but was reintroduced as a
+        // safe shader-stub patch (see `PatchId::BlackScreen`) rather than the
+        // original tool's destructive game-wide file blanking.
         for name in [
             "zero-effects",
-            "black-screen",
             "remove-players",
             "remove-monsters",
             "clean-terrain",
@@ -600,6 +641,9 @@ mod tests {
         raw.extend_from_slice(&0u32.to_le_bytes());
         raw.extend_from_slice(&0u32.to_le_bytes());
         raw.extend_from_slice(&0u32.to_le_bytes());
+        // Trailing compressed directory data; open_index builds paths from it
+        // (and caches them) even when the directory record is empty.
+        raw.extend_from_slice(&pack_uncompressed_bundle(&[]).unwrap());
         pack_uncompressed_bundle(&raw).unwrap()
     }
 }

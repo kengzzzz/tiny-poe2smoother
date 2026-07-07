@@ -18,6 +18,7 @@ fn main() {
 
 fn build_ooz() {
     println!("cargo:rerun-if-changed=vendor/ooz");
+    println!("cargo:rerun-if-env-changed=OOZ_LTO");
     let mut build = cc::Build::new();
     build
         .cpp(true)
@@ -34,6 +35,32 @@ fn build_ooz() {
         .opt_level(2)
         .debug(true)
         .include("vendor/ooz");
+    // Opt-in LTO for the vendored codec. Requires a clang-family compiler
+    // (CXX=clang++) plus an LTO-capable final link (clang + lld via RUSTFLAGS)
+    // and AR=llvm-ar so the archive index covers bitcode members. Unset means
+    // no change, so the Windows/mingw Docker cross-build is unaffected.
+    //
+    // WARNING: clang/LLVM 22.1.6 miscompiles Leviathan_ProcessLz in kraken.cpp
+    // at -O2: the SLP vectorizer fuses the two COPY_64s of the matchlen==9
+    // match copy into one 16-byte load/store without an overlap guard, so LZ
+    // matches at distance 8..15 copy stale bytes and real PoE2 bundles decode
+    // corrupted (Mermaid roundtrip tests still pass; only real Leviathan
+    // streams hit it). -fno-slp-vectorize fixes plain -O2 builds, but under
+    // (Thin)LTO the linker's backend reruns SLP, so that flag alone is NOT
+    // sufficient for OOZ_LTO builds. Verify any clang-built binary against a
+    // g++ baseline (`ooz-bench digest`) before trusting it.
+    match std::env::var("OOZ_LTO").as_deref() {
+        Ok("thin") => {
+            assert_clang_for_lto(&build);
+            build.flag("-flto=thin");
+        }
+        Ok("full") => {
+            assert_clang_for_lto(&build);
+            build.flag("-flto");
+        }
+        Ok("none") | Ok("") | Err(_) => {}
+        Ok(other) => panic!("OOZ_LTO must be none|thin|full, got {other:?}"),
+    }
     for file in [
         "bitknit.cpp",
         "compr_entropy.cpp",
@@ -51,6 +78,16 @@ fn build_ooz() {
         build.file(format!("vendor/ooz/{file}"));
     }
     build.compile("ooz");
+}
+
+fn assert_clang_for_lto(build: &cc::Build) {
+    let tool = build.get_compiler();
+    assert!(
+        tool.is_like_clang(),
+        "OOZ_LTO requires a clang-family compiler (set CXX=clang++); got {:?}. \
+         GCC -flto emits GIMPLE bitcode that lld cannot consume.",
+        tool.path()
+    );
 }
 
 fn static_libstdcpp_dir() -> Option<std::path::PathBuf> {

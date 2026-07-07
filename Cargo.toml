@@ -1,10 +1,11 @@
 [package]
 name = "tiny-poe2smoother"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 default-run = "tiny-poe2smoother"
 
 [dependencies]
+aho-corasick = "1.1"
 anyhow = "1.0"
 byteorder = "1.5"
 dirs = "6.0"
@@ -12,11 +13,11 @@ memmap2 = "0.9"
 regex = "1.11"
 rayon = "1.10"
 serde = { version = "1.0", features = ["derive"] }
-sysinfo = "0.37"
+sysinfo = { version = "0.37", default-features = false, features = ["system"] }
 tempfile = "3.23"
 thiserror = "2.0"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 
 [target.'cfg(windows)'.dependencies]
 eframe = { version = "0.35", default-features = false, features = [
@@ -39,9 +40,6 @@ rfd = "0.17"
 
 [build-dependencies]
 cc = { version = "1", features = ["parallel"] }
-
-[dev-dependencies]
-assert_cmd = "2.0"
 
 [profile.release]
 opt-level = 3

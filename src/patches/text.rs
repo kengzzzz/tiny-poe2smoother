@@ -15,8 +15,8 @@ pub(super) fn regex_utf16(bytes: &[u8], regex: &Regex, replacement: &str) -> Res
     Ok(encode_utf16_bom(&regex.replace_all(&text, replacement)))
 }
 
-pub(super) fn decode_utf16(bytes: &[u8]) -> Result<String> {
-    if bytes.len() % 2 != 0 {
+pub(crate) fn decode_utf16(bytes: &[u8]) -> Result<String> {
+    if !bytes.len().is_multiple_of(2) {
         bail!("UTF-16 file has odd byte length");
     }
     let units: Vec<u16> = bytes
@@ -28,7 +28,7 @@ pub(super) fn decode_utf16(bytes: &[u8]) -> Result<String> {
 }
 
 pub(super) fn decode_utf16_lossless(bytes: &[u8]) -> Result<Option<String>> {
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Ok(None);
     }
     match decode_utf16(bytes) {
@@ -54,13 +54,13 @@ pub(super) fn replace_array_property(mut data: String, property: &str) -> String
         return data;
     };
     let bracket_start = index + bracket_start_rel;
+    let bytes = data.as_bytes();
     let mut depth = 1;
     let mut end = bracket_start + 1;
-    let chars: Vec<char> = data.chars().collect();
-    while end < chars.len() && depth > 0 {
-        match chars[end] {
-            '[' => depth += 1,
-            ']' => depth -= 1,
+    while end < bytes.len() && depth > 0 {
+        match bytes[end] {
+            b'[' => depth += 1,
+            b']' => depth -= 1,
             _ => {}
         }
         end += 1;
@@ -169,7 +169,7 @@ fn skip_syntax(text: &str, i: usize) -> usize {
     }
 }
 
-fn find_matching_brace(text: &str, open: usize) -> Option<usize> {
+pub(super) fn find_matching_brace(text: &str, open: usize) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut depth = 1;
     let mut i = open + 1;
@@ -299,6 +299,15 @@ pub(super) fn empty_named_blocks(data: &str, names: &HashSet<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replace_array_property_survives_non_ascii_prefix() {
+        // Non-ASCII before the property must not skew the bracket scan
+        // (byte vs char indices) or panic on a non-boundary slice.
+        let input = "// gráph…\n{\"values\": [[1, 2], [3]],\"other\": 1}".to_string();
+        let out = replace_array_property(input, "values");
+        assert_eq!(out, "// gráph…\n{\"values\": [],\"other\": 1}");
+    }
 
     #[test]
     fn effects_keeps_selected_client_blocks() {

@@ -13,8 +13,8 @@ pub struct GgpkArchive {
 
 impl GgpkArchive {
     pub fn from_file(path: &Path) -> Result<Self> {
-        let file = fs::File::open(path)
-            .with_context(|| format!("failed to open {}", path.display()))?;
+        let file =
+            fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
         let mmap = unsafe { memmap2::Mmap::map(&file) }
             .with_context(|| format!("failed to map {}", path.display()))?;
         if mmap.len() < 12 {

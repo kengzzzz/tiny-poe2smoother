@@ -21,7 +21,7 @@ use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use tiny_poe2smoother::bundle::{slice_file, BundleFile, BundleStore};
+use tiny_poe2smoother::bundle::{slice_file, BundleFile, BundleIndex, BundleStore};
 use tiny_poe2smoother::patches::{audit_transform, PatchId};
 
 fn content_hash(bytes: &[u8]) -> u64 {
@@ -42,8 +42,17 @@ fn ext_of(path: &str) -> &str {
 
 struct Capture {
     store: BundleStore,
+    index: BundleIndex,
     files: HashMap<String, BundleFile>,
     present: HashSet<String>, // bundle names physically on disk
+}
+
+impl Capture {
+    /// Bundle name of a file record, resolved through this capture's own
+    /// index (bundle indices are not comparable across captures).
+    fn bundle_name(&self, file: &BundleFile) -> &str {
+        self.index.bundle_name(file.bundle_index).unwrap_or("")
+    }
 }
 
 fn load(game_dir: &Path) -> Result<Capture> {
@@ -71,6 +80,7 @@ fn load(game_dir: &Path) -> Result<Capture> {
     );
     Ok(Capture {
         store,
+        index,
         files,
         present,
     })
@@ -113,6 +123,7 @@ struct Change {
 }
 
 fn main() -> Result<()> {
+    tiny_poe2smoother::init_tracing();
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 4 {
         eprintln!(
@@ -165,7 +176,7 @@ fn main() -> Result<()> {
                         .get(*p)
                         .map(|bf| {
                             let af = &after.files[*p];
-                            bf.bundle_name != af.bundle_name || bf.size != af.size
+                            before.bundle_name(bf) != after.bundle_name(af) || bf.size != af.size
                         })
                         .unwrap_or(false)
             })
@@ -174,8 +185,8 @@ fn main() -> Result<()> {
         hits.truncate(n);
         let mut bundles_needed: HashSet<String> = HashSet::new();
         for p in &hits {
-            bundles_needed.insert(after.files[*p].bundle_name.clone());
-            bundles_needed.insert(before.files[*p].bundle_name.clone());
+            bundles_needed.insert(after.bundle_name(&after.files[*p]).to_string());
+            bundles_needed.insert(before.bundle_name(&before.files[*p]).to_string());
         }
         let ab = decompress_present(&after, &bundles_needed);
         let bb = decompress_present(&before, &bundles_needed);
@@ -184,7 +195,10 @@ fn main() -> Result<()> {
         for (i, p) in hits.iter().enumerate() {
             let af = &after.files[*p];
             let bf = &before.files[*p];
-            if let (Some(abd), Some(bbd)) = (ab.get(&af.bundle_name), bb.get(&bf.bundle_name)) {
+            if let (Some(abd), Some(bbd)) = (
+                ab.get(after.bundle_name(af)),
+                bb.get(before.bundle_name(bf)),
+            ) {
                 if let (Ok(a), Ok(b)) = (slice_file(abd, af), slice_file(bbd, bf)) {
                     fs::write(dump_dir.join(format!("{i:02}.path")), p.as_str())?;
                     fs::write(dump_dir.join(format!("{i:02}.before")), &b)?;
@@ -207,7 +221,7 @@ fn main() -> Result<()> {
         match before.files.get(path) {
             None => definite.push((path.clone(), "added")),
             Some(bf) => {
-                if bf.bundle_name != af.bundle_name || bf.size != af.size {
+                if before.bundle_name(bf) != after.bundle_name(af) || bf.size != af.size {
                     definite.push((path.clone(), "changed"));
                 } else {
                     maybe.push(path.clone());
@@ -224,14 +238,14 @@ fn main() -> Result<()> {
     // Bundles we must decompress.
     let mut after_needed: HashSet<String> = HashSet::new();
     for (p, _) in &definite {
-        after_needed.insert(after.files[p].bundle_name.clone());
+        after_needed.insert(after.bundle_name(&after.files[p]).to_string());
     }
     for p in &maybe {
-        after_needed.insert(after.files[p].bundle_name.clone());
+        after_needed.insert(after.bundle_name(&after.files[p]).to_string());
     }
     let mut before_needed: HashSet<String> = HashSet::new();
     for p in &maybe {
-        before_needed.insert(before.files[p].bundle_name.clone());
+        before_needed.insert(before.bundle_name(&before.files[p]).to_string());
     }
     eprintln!(
         "decompressing {} after bundles + {} before bundles (present-only)…",
@@ -249,7 +263,7 @@ fn main() -> Result<()> {
 
     let read = |cap: &Capture, bundles: &HashMap<String, Vec<u8>>, path: &str| -> Option<Vec<u8>> {
         let f = cap.files.get(path)?;
-        let b = bundles.get(&f.bundle_name)?;
+        let b = bundles.get(cap.bundle_name(f))?;
         slice_file(b, f).ok()
     };
 
@@ -342,14 +356,14 @@ fn main() -> Result<()> {
             let bytes = read(&after, &after_bundles, path)?;
             let af = &after.files[path];
             let (before_bundle, before_size) = match before.files.get(path) {
-                Some(bf) => (bf.bundle_name.clone(), bf.size as i64),
+                Some(bf) => (before.bundle_name(bf).to_string(), bf.size as i64),
                 None => (String::new(), -1),
             };
             Some(Change {
                 path: path.clone(),
                 status,
                 before_bundle,
-                after_bundle: af.bundle_name.clone(),
+                after_bundle: after.bundle_name(af).to_string(),
                 before_size,
                 after_size: bytes.len() as i64,
                 content_hash: content_hash(&bytes),
@@ -441,7 +455,7 @@ fn main() -> Result<()> {
         println!("  {e:12}  {ch:6} / {ad}");
     }
     let mut top: Vec<(u64, usize)> = blob_refs.iter().map(|(h, n)| (*h, *n)).collect();
-    top.sort_by(|a, b| b.1.cmp(&a.1));
+    top.sort_by_key(|item| std::cmp::Reverse(item.1));
     println!("\ntop 20 most-referenced blobs (hash  refs  size):");
     for (h, n) in top.iter().take(20) {
         println!("  {h:016x}  {n:6}  {} bytes", blob_size[h]);

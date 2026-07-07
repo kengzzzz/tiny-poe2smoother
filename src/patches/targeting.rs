@@ -61,6 +61,22 @@ pub(super) fn exact_patch_targets(patch: PatchId) -> &'static [&'static str] {
             "shaders/minimap_blending_pixel.hlsl",
         ],
         PatchId::AtlasFog => &["metadata/materials/environment/worldmap/worldmap_fogofwar.fxgraph"],
+        PatchId::MonsterHpBar => &["metadata/monsters/monster.ot"],
+        // stubs out; killing lighting + the post chain renders the world black
+        // while the UI (drawn after post-processing) stays visible.
+        PatchId::BlackScreen => &[
+            "shaders/postprocessuber.hlsl",
+            "shaders/bloomcutoff.hlsl",
+            "shaders/bloomgather.hlsl",
+            "shaders/blur.hlsl",
+            "shaders/copytexture.hlsl",
+            "shaders/depthawareblur.hlsl",
+            "shaders/gaussianblur.hlsl",
+            "shaders/postprocessoutput.hlsl",
+            "shaders/screenspaceshadows.hlsl",
+            "shaders/include/lighting.hlsl",
+            "shaders/include/projection.hlsl",
+        ],
         _ => &[],
     }
 }
@@ -71,9 +87,12 @@ pub(super) fn patch_targets_path(patch: PatchId, path: &str) -> bool {
             starts_with_path_ci(path, "metadata/")
                 && (ends_with_path_ci(path, ".ot") || ends_with_path_ci(path, ".otc"))
         }
-        PatchId::Minimap | PatchId::AtlasFog => exact_patch_targets(patch)
-            .iter()
-            .any(|target| eq_path_ci(path, target)),
+        PatchId::Minimap | PatchId::AtlasFog | PatchId::MonsterHpBar | PatchId::BlackScreen => {
+            exact_patch_targets(patch)
+                .iter()
+                .any(|target| eq_path_ci(path, target))
+        }
+        PatchId::ColorMods => is_stat_description_target(path),
         PatchId::Fog
         | PatchId::Rain
         | PatchId::Clouds
@@ -124,6 +143,7 @@ pub(super) fn patch_applies_path(patch: PatchId, path: &str) -> bool {
             path,
             "metadata/materials/environment/worldmap/worldmap_fogofwar.fxgraph",
         ),
+        PatchId::ColorMods => is_stat_description_target(path),
         PatchId::Fog
         | PatchId::Rain
         | PatchId::Clouds
@@ -160,7 +180,15 @@ pub(super) fn patch_applies_path(patch: PatchId, path: &str) -> bool {
             starts_with_path_ci(path, "metadata/effects/microtransactions")
                 && is_metadata_effect_ext(path)
         }
+        PatchId::MonsterHpBar => eq_path_ci(path, "metadata/monsters/monster.ot"),
+        PatchId::BlackScreen => exact_patch_targets(PatchId::BlackScreen)
+            .iter()
+            .any(|target| eq_path_ci(path, target)),
     }
+}
+
+fn is_stat_description_target(path: &str) -> bool {
+    starts_with_path_ci(path, "data/statdescriptions") && ends_with_path_ci(path, ".csd")
 }
 
 pub(super) fn is_metadata_effect_ext(path: &str) -> bool {
@@ -276,5 +304,48 @@ mod tests {
         assert!(!is_startup_scene_protected(
             "metadata/effects/spells/fireball/fireball.ao"
         ));
+    }
+
+    #[test]
+    fn black_screen_targets_only_the_post_processing_shaders() {
+        for path in [
+            "shaders/postprocessuber.hlsl",
+            "Shaders/PostProcessOutput.hlsl",
+            "shaders\\include\\lighting.hlsl",
+            "shaders/include/projection.hlsl",
+        ] {
+            assert!(patch_targets_path(PatchId::BlackScreen, path));
+            assert!(patch_applies_path(PatchId::BlackScreen, path));
+        }
+        for path in [
+            // No overlap with the minimap patch's shaders.
+            "shaders/minimap_visibility_pixel.hlsl",
+            "shaders/minimap_blending_pixel.hlsl",
+            "shaders/lighting.hlsl",
+            "shaders/include/lighting.hlsl.bak",
+        ] {
+            assert!(!patch_targets_path(PatchId::BlackScreen, path));
+            assert!(!patch_applies_path(PatchId::BlackScreen, path));
+        }
+    }
+
+    #[test]
+    fn monster_hp_bar_targets_only_the_monster_template() {
+        for path in [
+            "metadata/monsters/monster.ot",
+            "Metadata/Monsters/Monster.ot",
+            "metadata\\monsters\\monster.ot",
+        ] {
+            assert!(patch_targets_path(PatchId::MonsterHpBar, path));
+            assert!(patch_applies_path(PatchId::MonsterHpBar, path));
+        }
+        for path in [
+            "metadata/monsters/monster.otc",
+            "metadata/monsters/bosses/monster.ot",
+            "metadata/characters/character.ot",
+        ] {
+            assert!(!patch_targets_path(PatchId::MonsterHpBar, path));
+            assert!(!patch_applies_path(PatchId::MonsterHpBar, path));
+        }
     }
 }

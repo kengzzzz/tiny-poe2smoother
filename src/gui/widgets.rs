@@ -131,6 +131,30 @@ pub fn patch_row(
     response
 }
 
+/// Small clickable color square for the color-mods editor; the currently
+/// assigned color gets a bright outline.
+pub fn color_swatch(ui: &mut egui::Ui, color: egui::Color32, selected: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
+    let painter = ui.painter();
+    painter.rect_filled(rect.shrink(1.0), 4.0, color);
+    if selected {
+        painter.rect_stroke(
+            rect,
+            4.0,
+            egui::Stroke::new(1.5, palette::TEXT),
+            egui::StrokeKind::Outside,
+        );
+    } else if response.hovered() {
+        painter.rect_stroke(
+            rect,
+            4.0,
+            egui::Stroke::new(1.0, palette::TEXT_FAINT),
+            egui::StrokeKind::Outside,
+        );
+    }
+    response
+}
+
 pub fn tinted(color: egui::Color32, alpha: u8) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
 }

@@ -1,3 +1,4 @@
+use super::color_mods::{default_color_mods, ColorModEntry};
 use crate::bundle::BundleFile;
 use std::collections::HashMap;
 
@@ -6,6 +7,7 @@ pub enum PatchId {
     Camera,
     Minimap,
     AtlasFog,
+    ColorMods,
     Fog,
     Rain,
     Clouds,
@@ -19,6 +21,8 @@ pub enum PatchId {
     SkillSounds,
     MonsterSounds,
     MtxSoft,
+    MonsterHpBar,
+    BlackScreen,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +53,23 @@ pub struct PatchSet {
     pub replacements: HashMap<String, Vec<(BundleFile, Vec<u8>)>>,
 }
 
+/// Per-request knobs for parameterized patches (camera zoom level, color-mod
+/// assignments). Everything else is fully determined by the patch id.
+#[derive(Debug, Clone)]
+pub struct PatchParams {
+    pub zoom: f64,
+    pub color_mods: Vec<ColorModEntry>,
+}
+
+impl Default for PatchParams {
+    fn default() -> Self {
+        Self {
+            zoom: 2.4,
+            color_mods: default_color_mods(),
+        }
+    }
+}
+
 pub fn all_patches() -> &'static [PatchInfo] {
     &[
         PatchInfo {
@@ -65,6 +86,11 @@ pub fn all_patches() -> &'static [PatchInfo] {
             id: PatchId::AtlasFog,
             name: "atlas-fog",
             description: "Remove Atlas fog of war graph nodes.",
+        },
+        PatchInfo {
+            id: PatchId::ColorMods,
+            name: "color-mods",
+            description: "Colorize modifier text on items.",
         },
         PatchInfo {
             id: PatchId::Fog,
@@ -131,6 +157,16 @@ pub fn all_patches() -> &'static [PatchInfo] {
             name: "mtx-soft",
             description: "Blank microtransaction effect/particle files.",
         },
+        PatchInfo {
+            id: PatchId::MonsterHpBar,
+            name: "monster-hp-bar",
+            description: "Always show monster HP bars.",
+        },
+        PatchInfo {
+            id: PatchId::BlackScreen,
+            name: "black-screen",
+            description: "Black out world rendering.",
+        },
     ]
 }
 
@@ -195,12 +231,29 @@ pub fn all_presets() -> &'static [PresetInfo] {
             ],
         },
         PresetInfo {
+            name: "black-screen",
+            description: "Black world rendering plus heavy effect removal.",
+            patches: &[
+                PatchId::BlackScreen,
+                PatchId::Fog,
+                PatchId::Rain,
+                PatchId::Clouds,
+                PatchId::EnvParticles,
+                PatchId::Shadow,
+                PatchId::Light,
+                PatchId::Delirium,
+                PatchId::Particles,
+                PatchId::Effects,
+            ],
+        },
+        PresetInfo {
             name: "check-all",
-            description: "Select every ported patch.",
+            description: "Select every ported patch except black-screen.",
             patches: &[
                 PatchId::Camera,
                 PatchId::Minimap,
                 PatchId::AtlasFog,
+                PatchId::ColorMods,
                 PatchId::Fog,
                 PatchId::Rain,
                 PatchId::Clouds,
@@ -214,6 +267,7 @@ pub fn all_presets() -> &'static [PresetInfo] {
                 PatchId::SkillSounds,
                 PatchId::MonsterSounds,
                 PatchId::MtxSoft,
+                PatchId::MonsterHpBar,
             ],
         },
     ]

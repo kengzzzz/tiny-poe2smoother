@@ -1,11 +1,12 @@
 use super::catalog::PatchId;
+use super::color_mods::ColorMatcher;
 use super::targeting::{
     ends_with_path_ci, is_startup_scene_protected, normalize_path, patch_applies_path,
     patch_targets_path, EFFECT_PROTECTED_PREFIXES, PARTICLE_PROTECTED_PREFIXES,
 };
 use super::text::{
-    decode_utf16, decode_utf16_lossless, empty_named_blocks, encode_utf16_bom, regex_utf16,
-    remove_function_calls, replace_array_property, replace_utf16, strip_client_blocks,
+    decode_utf16, decode_utf16_lossless, empty_named_blocks, encode_utf16_bom, find_matching_brace,
+    regex_utf16, remove_function_calls, replace_array_property, replace_utf16, strip_client_blocks,
 };
 use anyhow::Result;
 use regex::Regex;
@@ -16,6 +17,15 @@ static RAIN_INTENSITY_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"("rain_intensity":\s*)([^,\r\n}]+)(,?)"#).unwrap());
 static CLOUDS_INTENSITY_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"("clouds_intensity":\s*)([^,\r\n}]+)(,?)"#).unwrap());
+// HLSL function signature: return type, name, parameter list. Longest-first
+// alternation so `float4x4` never half-matches as `float`; the parameter list
+// allows one level of nested parens for macro params like `TEXTURE2D_DECL(tex)`.
+static HLSL_FUNCTION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\b(float4x4|float3x3|float2x2|float4|float3|float2|float|void|OutPixel)\s+\w+\s*\((?:[^()]|\([^()]*\))*\)",
+    )
+    .unwrap()
+});
 static EFFECT_KEEP_BLOCKS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     [
         "ClientAnimationController",
@@ -35,6 +45,23 @@ static EFFECT_KEEP_BLOCKS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
 static SOUND_EMPTY_BLOCKS: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| ["SoundEvents", "SoundParams"].into_iter().collect());
 
+/// Shared, per-request inputs for parameterized transforms. Built once in
+/// `compute_patch_set` and borrowed by every rayon transform task.
+#[derive(Clone, Copy)]
+pub(super) struct TransformCtx<'a> {
+    pub zoom: f64,
+    pub color: Option<&'a ColorMatcher>,
+}
+
+impl Default for TransformCtx<'_> {
+    fn default() -> Self {
+        Self {
+            zoom: 2.4,
+            color: None,
+        }
+    }
+}
+
 /// Whether `patch` would select `path` as a target, and (if so) the bytes it
 /// would write for it. Exposed for the `capture-diff` dev tool to verify the
 /// capture-driven transforms against reference output. Returns `None`
@@ -44,14 +71,23 @@ pub fn audit_transform(patch: PatchId, path: &str, bytes: &[u8]) -> Option<Resul
     if !patch_targets_path(patch, path) || !patch_applies_path(patch, path) {
         return None;
     }
-    Some(transform(patch, path, bytes, 2.4))
+    Some(transform(patch, path, bytes, TransformCtx::default()))
 }
 
-pub(super) fn transform(patch: PatchId, path: &str, bytes: &[u8], zoom: f64) -> Result<Vec<u8>> {
+pub(super) fn transform(
+    patch: PatchId,
+    path: &str,
+    bytes: &[u8],
+    ctx: TransformCtx<'_>,
+) -> Result<Vec<u8>> {
     match patch {
-        PatchId::Camera => camera(path, bytes, zoom),
+        PatchId::Camera => camera(path, bytes, ctx.zoom),
         PatchId::Minimap => minimap(path, bytes),
         PatchId::AtlasFog => atlas_fog(bytes),
+        PatchId::ColorMods => match ctx.color {
+            Some(matcher) => matcher.colorize(bytes),
+            None => Ok(bytes.to_vec()),
+        },
         PatchId::Fog => replace_utf16(bytes, &[("\"fog\"", "\"xog\"")]),
         PatchId::Rain => regex_utf16(bytes, &RAIN_INTENSITY_RE, "${1}0.0${3}"),
         PatchId::Clouds => regex_utf16(bytes, &CLOUDS_INTENSITY_RE, "${1}0.0${3}"),
@@ -76,6 +112,8 @@ pub(super) fn transform(patch: PatchId, path: &str, bytes: &[u8], zoom: f64) -> 
         PatchId::SkillSounds => strip_sounds(path, bytes),
         PatchId::MonsterSounds => strip_sounds(path, bytes),
         PatchId::MtxSoft => mtx_soft(path, bytes),
+        PatchId::MonsterHpBar => monster_hp_bar(bytes),
+        PatchId::BlackScreen => black_screen(bytes),
     }
 }
 
@@ -266,6 +304,107 @@ fn mtx_soft(path: &str, bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(bytes.to_vec())
 }
 
+/// Gives every monster 1 base energy shield/life via the shared
+/// `metadata/monsters/monster.ot` template, which makes the engine render HP
+/// bars permanently instead of only after the monster takes damage
+fn monster_hp_bar(bytes: &[u8]) -> Result<Vec<u8>> {
+    let text = decode_utf16(bytes)?;
+    if text.contains("base_maximum_energy_shield = 1") || text.contains("base_maximum_life = 1") {
+        return Ok(bytes.to_vec());
+    }
+    let mut lines: Vec<String> = text.split("\r\n").map(str::to_string).collect();
+    let insert_at = lines
+        .iter()
+        .position(|line| line.contains("item_drop_slots = 1"))
+        .map(|index| index + 1)
+        .or_else(|| stats_block_body_start(&lines));
+    let Some(index) = insert_at else {
+        return Ok(bytes.to_vec());
+    };
+    lines.insert(index, "\tbase_maximum_life = 1".to_string());
+    lines.insert(index, "\tbase_maximum_energy_shield = 1".to_string());
+    Ok(encode_utf16_bom(&lines.join("\r\n")))
+}
+
+/// Stubs every HLSL function body in the targeted post-processing/lighting
+/// shaders to `return (type)0;`, so lighting and the post-process chain
+/// output nothing and the world renders black, while the UI — drawn after
+/// post-processing — stays intact.
+fn black_screen(bytes: &[u8]) -> Result<Vec<u8>> {
+    let text = String::from_utf8_lossy(bytes).into_owned();
+    let mut out = String::with_capacity(text.len());
+    let mut pos = 0;
+    while let Some(found) = HLSL_FUNCTION_RE.captures(&text[pos..]) {
+        let signature_end = pos + found.get(0).expect("group 0 always exists").end();
+        // Only accept a body directly following the signature (allowing a
+        // `: SEMANTIC` return annotation); anything else — e.g. a forward
+        // declaration ending in `;` — is copied through untouched rather than
+        // grabbing the next `{` anywhere.
+        let body = function_body_open(&text, signature_end)
+            .and_then(|open| find_matching_brace(&text, open).map(|close| (open, close)));
+        let Some((open, close)) = body else {
+            out.push_str(&text[pos..signature_end]);
+            pos = signature_end;
+            continue;
+        };
+        out.push_str(&text[pos..open]);
+        out.push_str(hlsl_stub(&found[1]));
+        pos = close + 1;
+    }
+    out.push_str(&text[pos..]);
+    Ok(out.into_bytes())
+}
+
+/// Index of the `{` opening a function body that directly follows a signature
+/// ending at `from`, allowing only whitespace, `//` line comments, and one
+/// `: SEMANTIC` return annotation in between.
+fn function_body_open(text: &str, from: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut semantic_seen = false;
+    let mut i = from;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => return Some(i),
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                i += text[i..].find('\n')?;
+            }
+            b if b.is_ascii_whitespace() => {}
+            b':' if !semantic_seen => semantic_seen = true,
+            b if semantic_seen && (b.is_ascii_alphanumeric() || b == b'_') => {}
+            _ => return None,
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Replacement bodies byte-for-byte.
+fn hlsl_stub(return_type: &str) -> &'static str {
+    match return_type {
+        "float" => "{\n\treturn (float)0;\n}",
+        "float2" => "{\n\treturn (float2)0;\n}",
+        "float3" => "{\n\treturn (float3)0;\n}",
+        "float4" => "{\n\treturn (float4)0;\n}",
+        "float2x2" => "{\n\treturn (float2x2)0;\n}",
+        "float3x3" => "{\n\treturn (float3x3)0;\n}",
+        "float4x4" => "{\n\treturn (float4x4)0;\n}",
+        // screenspaceshadows.hlsl: report "fully lit" instead of computing.
+        "OutPixel" => {
+            "{\tOutPixel res;\r\n\tres.shadowmap_data = float4(1.0f, 1.0f, 1.0f, 1.0f);\r\n\treturn res;\n}"
+        }
+        _ => "{ }",
+    }
+}
+
+/// Index of the first line inside the `Stats { ... }` block body, if present.
+fn stats_block_body_start(lines: &[String]) -> Option<usize> {
+    let stats = lines.iter().position(|line| line.trim() == "Stats")?;
+    let brace = lines[stats + 1..]
+        .iter()
+        .position(|line| line.trim() == "{")?;
+    Some(stats + 1 + brace + 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,7 +434,13 @@ mod tests {
         );
         let mut bytes = input;
         for patch in [PatchId::Fog, PatchId::Rain, PatchId::Clouds] {
-            bytes = transform(patch, "metadata/environmentsettings/test.env", &bytes, 2.4).unwrap();
+            bytes = transform(
+                patch,
+                "metadata/environmentsettings/test.env",
+                &bytes,
+                TransformCtx::default(),
+            )
+            .unwrap();
         }
         let text = decode_utf16(&bytes).unwrap();
 
@@ -339,7 +484,7 @@ SoundEvents {}\r\n}";
             PatchId::SkillSounds,
             "metadata/effects/spells/absolution_blast/aoe_explosion_01.ao",
             &encode_utf16_bom(before),
-            2.4,
+            TransformCtx::default(),
         )
         .unwrap();
 
@@ -357,7 +502,7 @@ SoundEvents {}\r\n}";
             PatchId::DisableSounds,
             "metadata/effects/spells/fireball/fireball.ao",
             &input,
-            2.4,
+            TransformCtx::default(),
         )
         .unwrap();
         let text = decode_utf16(&out).unwrap();
@@ -380,7 +525,7 @@ SoundEvents {}\r\n}";
             PatchId::MtxSoft,
             "metadata/effects/microtransactions/portal/portal.epk",
             &stuff,
-            2.4,
+            TransformCtx::default(),
         )
         .unwrap();
         assert_eq!(epk, vec![0xff, 0xfe]);
@@ -390,7 +535,7 @@ SoundEvents {}\r\n}";
                 PatchId::MtxSoft,
                 &format!("metadata/effects/microtransactions/portal/portal.{ext}"),
                 &stuff,
-                2.4,
+                TransformCtx::default(),
             )
             .unwrap();
             assert_eq!(out, encode_utf16_bom("0"));
@@ -401,10 +546,116 @@ SoundEvents {}\r\n}";
             PatchId::MtxSoft,
             "metadata/effects/microtransactions/portal/portal.ao",
             &ao_in,
-            2.4,
+            TransformCtx::default(),
         )
         .unwrap();
         assert_eq!(ao, ao_in);
+    }
+
+    #[test]
+    fn monster_hp_bar_inserts_stats_after_drop_slots_anchor() {
+        let input = encode_utf16_bom(
+            "version 2\r\nextends \"Metadata/Base\"\r\n\r\nStats\r\n{\r\n\titem_drop_slots = 1\r\n\tset_monster_scale = 100\r\n}",
+        );
+        let out = transform(
+            PatchId::MonsterHpBar,
+            "metadata/monsters/monster.ot",
+            &input,
+            TransformCtx::default(),
+        )
+        .unwrap();
+
+        let expected = encode_utf16_bom(
+            "version 2\r\nextends \"Metadata/Base\"\r\n\r\nStats\r\n{\r\n\titem_drop_slots = 1\r\n\tbase_maximum_energy_shield = 1\r\n\tbase_maximum_life = 1\r\n\tset_monster_scale = 100\r\n}",
+        );
+        assert_eq!(out, expected);
+
+        // Re-applying to already-patched bytes changes nothing.
+        let again = transform(
+            PatchId::MonsterHpBar,
+            "metadata/monsters/monster.ot",
+            &out,
+            TransformCtx::default(),
+        )
+        .unwrap();
+        assert_eq!(again, out);
+    }
+
+    #[test]
+    fn monster_hp_bar_falls_back_to_stats_block_when_anchor_is_missing() {
+        let input =
+            encode_utf16_bom("version 2\r\n\r\nStats\r\n{\r\n\tset_monster_scale = 100\r\n}");
+        let out = transform(
+            PatchId::MonsterHpBar,
+            "metadata/monsters/monster.ot",
+            &input,
+            TransformCtx::default(),
+        )
+        .unwrap();
+        let text = decode_utf16(&out).unwrap();
+        assert!(text.contains(
+            "Stats\r\n{\r\n\tbase_maximum_energy_shield = 1\r\n\tbase_maximum_life = 1\r\n\tset_monster_scale = 100"
+        ));
+
+        // No anchor and no Stats block: leave the file untouched.
+        let bare = encode_utf16_bom("version 2\r\nextends \"Metadata/Base\"");
+        let untouched = transform(
+            PatchId::MonsterHpBar,
+            "metadata/monsters/monster.ot",
+            &bare,
+            TransformCtx::default(),
+        )
+        .unwrap();
+        assert_eq!(untouched, bare);
+    }
+
+    #[test]
+    fn black_screen_stubs_function_bodies_by_return_type() {
+        // Shapes taken from the real PoE2 shader files: nested braces in a
+        // body, macro parens in a parameter list, and a trailing line comment
+        // between the signature and the body.
+        let input = b"#include \"include/common.hlsl\"\n\nfloat3 ComputeLight(float3 normal, float3 dir)\n{\n\tif (dot(normal, dir) > 0.0f)\n\t{\n\t\treturn normal * dir;\n\t}\n\treturn (float3)0.5f;\n}\n\nfloat4 SampleEnv(uniform TEXTURECUBE_DECL(spec_tex), float3 dir)\n{\n\treturn SAMPLE_TEXCUBELOD(spec_tex, Sampler, float4(dir, 0.0f));\n}\n\nfloat SmithTerm(float alpha, float VdotN) // * VdotN * LdotN\n{\n\treturn alpha * VdotN;\n}\n\nvoid Accumulate(inout float4 total)\n{\n\ttotal += 1.0f;\n}\n";
+        let out = transform(
+            PatchId::BlackScreen,
+            "shaders/include/lighting.hlsl",
+            input,
+            TransformCtx::default(),
+        )
+        .unwrap();
+
+        let expected = "#include \"include/common.hlsl\"\n\nfloat3 ComputeLight(float3 normal, float3 dir)\n{\n\treturn (float3)0;\n}\n\nfloat4 SampleEnv(uniform TEXTURECUBE_DECL(spec_tex), float3 dir)\n{\n\treturn (float4)0;\n}\n\nfloat SmithTerm(float alpha, float VdotN) // * VdotN * LdotN\n{\n\treturn (float)0;\n}\n\nvoid Accumulate(inout float4 total)\n{ }\n";
+        assert_eq!(String::from_utf8(out.clone()).unwrap(), expected);
+
+        // Re-applying to already-stubbed bytes changes nothing.
+        let again = transform(
+            PatchId::BlackScreen,
+            "shaders/include/lighting.hlsl",
+            &out,
+            TransformCtx::default(),
+        )
+        .unwrap();
+        assert_eq!(again, out);
+    }
+
+    #[test]
+    fn black_screen_stubs_outpixel_shader_and_skips_forward_declarations() {
+        let input = b"float ShadowTerm(float3 pos);\n\nOutPixel main(InPixel input) : SV_Target\n{\n\tOutPixel res;\n\tres.shadowmap_data = ComputeShadows(input);\n\treturn res;\n}\n";
+        let out = transform(
+            PatchId::BlackScreen,
+            "shaders/screenspaceshadows.hlsl",
+            input,
+            TransformCtx::default(),
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+
+        // The forward declaration is untouched; its `;` must not make the
+        // stubber swallow the next function's body.
+        assert!(text.starts_with("float ShadowTerm(float3 pos);\n"));
+        assert!(text.contains(
+            "{\tOutPixel res;\r\n\tres.shadowmap_data = float4(1.0f, 1.0f, 1.0f, 1.0f);\r\n\treturn res;\n}"
+        ));
+        assert!(!text.contains("ComputeShadows"));
     }
 
     #[test]
@@ -414,7 +665,7 @@ SoundEvents {}\r\n}";
             PatchId::DisableSounds,
             "metadata/effects/misc/CharacterSelection/gallows.ao",
             &input,
-            2.4,
+            TransformCtx::default(),
         )
         .unwrap();
 

@@ -6,9 +6,12 @@ GUI tool that patches Path of Exile 2 bundle files to disable visual effects for
 
 ## Features
 
-- 16 optional patches: camera zoom, fog, rain, clouds, shadows, lighting, delirium effects, particles, minimap reveal, atlas fog, environment particles, client effect blocks, plus sound silencing (disable sounds, skill sounds, monster sounds) and microtransaction effect removal (mtx-soft)
+- 19 optional patches: camera zoom, fog, rain, clouds, shadows, lighting, delirium effects, particles, minimap reveal, atlas fog, color mods, monster HP bars, black screen, environment particles, client effect blocks, plus sound silencing (disable sounds, skill sounds, monster sounds) and microtransaction effect removal (mtx-soft)
 - Sound and MTX patches write ground-truth-derived, structurally valid bytes, so they never corrupt files or crash the game
 - Camera zoom adjustment (1.2x -- 2.4x)
+- Color mods: colorize modifier text wherever it appears in game — waystones, items, tablets — with a searchable editor over every stat in your own game files; search supports in-game-style regex (`|`, `"quoted phrases"`, `!exclude`); per-mod color overrides and custom colors supported
+- Monster HP bars: always show monster health bars instead of only after they take damage
+- Black screen: render the world black; UI, item labels, HP bars, and minimap stay visible
 - Safe modification via Oodle-compressed bundle patching with atomic writes
 - Automatic Steam and standalone install detection, including secondary Steam library drives
 - Saved GUI options between launches

@@ -35,7 +35,132 @@ struct CacheKey {
     mtime: u128,
 }
 
-const CACHE_MAGIC: &[u8; 4] = b"2SI2";
+const CACHE_MAGIC: &[u8; 4] = b"2SI3";
+
+/// Validate a length/count read from the cache against the bytes actually
+/// remaining, so a truncated or corrupt file is rejected instead of aborting
+/// on a huge allocation. `unit` is the minimum encoded size of one element.
+fn checked_count(c: &Cursor<&[u8]>, count: u64, unit: u64) -> Option<usize> {
+    let remaining = (c.get_ref().len() as u64).saturating_sub(c.position());
+    (count.checked_mul(unit)? <= remaining).then_some(count as usize)
+}
+
+fn parse_index_cache(data: &[u8], key: &CacheKey) -> Option<BundleIndex> {
+    let mut c = Cursor::new(data);
+    let mut magic = [0u8; 4];
+    c.read_exact(&mut magic).ok()?;
+    if &magic != CACHE_MAGIC {
+        return None;
+    }
+    let source_len = c.read_u64::<LittleEndian>().ok()?;
+    let source_len = checked_count(&c, source_len, 1)?;
+    let mut source_bytes = vec![0u8; source_len];
+    c.read_exact(&mut source_bytes).ok()?;
+    let cached_source = String::from_utf8(source_bytes).ok()?;
+    let cached_size: u64 = c.read_u64::<LittleEndian>().ok()?;
+    let cached_mtime: u128 = c.read_u128::<LittleEndian>().ok()?;
+    if cached_source != key.source || cached_size != key.size || cached_mtime != key.mtime {
+        return None;
+    }
+    let rd_len = c.read_u64::<LittleEndian>().ok()?;
+    let rd_len = checked_count(&c, rd_len, 1)?;
+    let mut raw_decompressed = vec![0u8; rd_len];
+    c.read_exact(&mut raw_decompressed).ok()?;
+    let bcount = c.read_u64::<LittleEndian>().ok()?;
+    // name length (u32) + uncompressed_size (u32)
+    let bcount = checked_count(&c, bcount, 8)?;
+    let mut bundles = Vec::with_capacity(bcount);
+    for _ in 0..bcount {
+        let nlen = c.read_u32::<LittleEndian>().ok()?;
+        let nlen = checked_count(&c, u64::from(nlen), 1)?;
+        let mut nb = vec![0u8; nlen];
+        c.read_exact(&mut nb).ok()?;
+        let size_pos = c.position() as usize;
+        let uncompressed_size = c.read_u32::<LittleEndian>().ok()?;
+        bundles.push(BundleInfo {
+            name: String::from_utf8(nb).ok()?,
+            uncompressed_size,
+            size_pos,
+        });
+    }
+    let fcount = c.read_u64::<LittleEndian>().ok()?;
+    // hash + record_pos (u64 each) + bundle_index + offset + size (u32 each)
+    let fcount = checked_count(&c, fcount, 28)?;
+    let mut files = HashMap::with_capacity(fcount);
+    let mut file_order = Vec::with_capacity(fcount);
+    for _ in 0..fcount {
+        let hash = c.read_u64::<LittleEndian>().ok()?;
+        let record_pos = c.read_u64::<LittleEndian>().ok()? as usize;
+        let bundle_index = c.read_u32::<LittleEndian>().ok()?;
+        let offset = c.read_u32::<LittleEndian>().ok()?;
+        let size = c.read_u32::<LittleEndian>().ok()?;
+        if bundle_index as usize >= bundles.len() {
+            return None;
+        }
+        file_order.push(hash);
+        files.insert(
+            hash,
+            BundleFile {
+                hash,
+                bundle_index,
+                offset,
+                size,
+                record_pos,
+            },
+        );
+    }
+    let hm_byte = c.read_u8().ok()?;
+    let hash_mode = match hm_byte {
+        0 => HashMode::Murmur64A,
+        1 => HashMode::Fnv1A,
+        _ => return None,
+    };
+    let file_count_pos = c.read_u64::<LittleEndian>().ok()? as usize;
+    let dirlen = c.read_u64::<LittleEndian>().ok()?;
+    let dirlen = checked_count(&c, dirlen, 1)?;
+    let mut directory_bytes_compressed = vec![0u8; dirlen];
+    c.read_exact(&mut directory_bytes_compressed).ok()?;
+    let dcount = c.read_u64::<LittleEndian>().ok()?;
+    // path_hash (u64) + offset + size + recursive_size (u32 each)
+    let dcount = checked_count(&c, dcount, 20)?;
+    let mut directories = Vec::with_capacity(dcount);
+    for _ in 0..dcount {
+        directories.push(DirectoryRecord {
+            path_hash: c.read_u64::<LittleEndian>().ok()?,
+            offset: c.read_u32::<LittleEndian>().ok()?,
+            size: c.read_u32::<LittleEndian>().ok()?,
+            _recursive_size: c.read_u32::<LittleEndian>().ok()?,
+        });
+    }
+    let has_paths = c.read_u8().ok()? != 0;
+    let paths = if has_paths {
+        let pcount = c.read_u64::<LittleEndian>().ok()?;
+        // length prefix (u64) per path
+        let pcount = checked_count(&c, pcount, 8)?;
+        let mut p = Vec::with_capacity(pcount);
+        for _ in 0..pcount {
+            let plen = c.read_u64::<LittleEndian>().ok()?;
+            let plen = checked_count(&c, plen, 1)?;
+            let mut pb = vec![0u8; plen];
+            c.read_exact(&mut pb).ok()?;
+            p.push(String::from_utf8(pb).ok()?);
+        }
+        Some(p)
+    } else {
+        None
+    };
+    Some(BundleIndex {
+        raw_decompressed,
+        bundles,
+        hash_mode,
+        files,
+        file_order,
+        file_count_pos,
+        directory_bytes_compressed,
+        directories,
+        paths,
+    })
+}
 
 impl BundleStore {
     pub fn new(game_dir: impl Into<PathBuf>) -> Self {
@@ -97,106 +222,7 @@ impl BundleStore {
         crate::timing!("cache_read");
         let key = self.cache_key().ok()??;
         let data = fs::read(self.cache_path()).ok()?;
-        let mut c = Cursor::new(&data);
-        let mut magic = [0u8; 4];
-        c.read_exact(&mut magic).ok()?;
-        if &magic != CACHE_MAGIC {
-            return None;
-        }
-        let source_len = c.read_u64::<LittleEndian>().ok()? as usize;
-        let mut source_bytes = vec![0u8; source_len];
-        c.read_exact(&mut source_bytes).ok()?;
-        let cached_source = String::from_utf8(source_bytes).ok()?;
-        let cached_size: u64 = c.read_u64::<LittleEndian>().ok()?;
-        let cached_mtime: u128 = c.read_u128::<LittleEndian>().ok()?;
-        if cached_source != key.source || cached_size != key.size || cached_mtime != key.mtime {
-            return None;
-        }
-        let rd_len = c.read_u64::<LittleEndian>().ok()? as usize;
-        let mut raw_decompressed = vec![0u8; rd_len];
-        c.read_exact(&mut raw_decompressed).ok()?;
-        let bcount = c.read_u64::<LittleEndian>().ok()? as usize;
-        let mut bundles = Vec::with_capacity(bcount);
-        for _ in 0..bcount {
-            let nlen = c.read_u32::<LittleEndian>().ok()? as usize;
-            let mut nb = vec![0u8; nlen];
-            c.read_exact(&mut nb).ok()?;
-            let size_pos = c.position() as usize;
-            let uncompressed_size = c.read_u32::<LittleEndian>().ok()?;
-            bundles.push(BundleInfo {
-                name: String::from_utf8(nb).ok()?,
-                uncompressed_size,
-                size_pos,
-            });
-        }
-        let fcount = c.read_u64::<LittleEndian>().ok()? as usize;
-        let mut files = HashMap::with_capacity(fcount);
-        let mut file_order = Vec::with_capacity(fcount);
-        for _ in 0..fcount {
-            let hash = c.read_u64::<LittleEndian>().ok()?;
-            let record_pos = c.read_u64::<LittleEndian>().ok()? as usize;
-            let bundle_index = c.read_u32::<LittleEndian>().ok()?;
-            let offset = c.read_u32::<LittleEndian>().ok()?;
-            let size = c.read_u32::<LittleEndian>().ok()?;
-            let bname = bundles.get(bundle_index as usize)?.name.clone();
-            file_order.push(hash);
-            files.insert(
-                hash,
-                BundleFile {
-                    hash,
-                    bundle_index,
-                    bundle_name: bname,
-                    offset,
-                    size,
-                    record_pos,
-                },
-            );
-        }
-        let hm_byte = c.read_u8().ok()?;
-        let hash_mode = match hm_byte {
-            0 => HashMode::Murmur64A,
-            1 => HashMode::Fnv1A,
-            _ => return None,
-        };
-        let file_count_pos = c.read_u64::<LittleEndian>().ok()? as usize;
-        let dirlen = c.read_u64::<LittleEndian>().ok()? as usize;
-        let mut directory_bytes_compressed = vec![0u8; dirlen];
-        c.read_exact(&mut directory_bytes_compressed).ok()?;
-        let dcount = c.read_u64::<LittleEndian>().ok()? as usize;
-        let mut directories = Vec::with_capacity(dcount);
-        for _ in 0..dcount {
-            directories.push(DirectoryRecord {
-                path_hash: c.read_u64::<LittleEndian>().ok()?,
-                offset: c.read_u32::<LittleEndian>().ok()?,
-                size: c.read_u32::<LittleEndian>().ok()?,
-                _recursive_size: c.read_u32::<LittleEndian>().ok()?,
-            });
-        }
-        let has_paths = c.read_u8().ok()? != 0;
-        let paths = if has_paths {
-            let pcount = c.read_u64::<LittleEndian>().ok()? as usize;
-            let mut p = Vec::with_capacity(pcount);
-            for _ in 0..pcount {
-                let plen = c.read_u64::<LittleEndian>().ok()? as usize;
-                let mut pb = vec![0u8; plen];
-                c.read_exact(&mut pb).ok()?;
-                p.push(String::from_utf8(pb).ok()?);
-            }
-            Some(p)
-        } else {
-            None
-        };
-        Some(BundleIndex {
-            raw_decompressed,
-            bundles,
-            hash_mode,
-            files,
-            file_order,
-            file_count_pos,
-            directory_bytes_compressed,
-            directories,
-            paths,
-        })
+        parse_index_cache(&data, &key)
     }
 
     fn write_cache(&self, index: &BundleIndex) {
@@ -282,7 +308,10 @@ impl BundleStore {
         let decompressed =
             decompress_bundle(&bytes).context("failed to decompress bundle index")?;
         crate::timing!("index_parse");
-        let index = BundleIndex::parse(decompressed)?;
+        let mut index = BundleIndex::parse(decompressed)?;
+        // Build paths before caching so cache hits skip dir_decompress +
+        // build_paths, the dominant cost of a warm launch.
+        index.ensure_paths_built()?;
         self.write_cache(&index);
         Ok(index)
     }
@@ -299,8 +328,6 @@ impl BundleStore {
     pub fn index_display_path(&self) -> String {
         if matches!(self.layout, InstallLayout::ContentGgpk) {
             format!("{}::Bundles2/_.index.bin", self.content_path.display())
-        } else if self.index_path.exists() {
-            self.index_path.display().to_string()
         } else {
             self.index_path.display().to_string()
         }
@@ -310,19 +337,15 @@ impl BundleStore {
         let file = index
             .file_by_path(path)
             .ok_or_else(|| anyhow!("path not found in bundle index: {path}"))?;
+        let bundle_name = index.bundle_name(file.bundle_index)?;
         let compressed = self
-            .read_storage_file_cow(&storage_bundle_path(&file.bundle_name))
-            .with_context(|| {
-                format!(
-                    "failed to read {}",
-                    self.bundle_display_path(&file.bundle_name)
-                )
-            })?;
+            .read_storage_file_cow(&storage_bundle_path(bundle_name))
+            .with_context(|| format!("failed to read {}", self.bundle_display_path(bundle_name)))?;
         let mut slices = decompress_bundle_slices(&compressed, &[(file.offset, file.size)])
             .with_context(|| {
                 format!(
                     "failed to decompress {}",
-                    self.bundle_display_path(&file.bundle_name)
+                    self.bundle_display_path(bundle_name)
                 )
             })?;
         Ok(slices.pop().expect("one span requested"))
@@ -357,8 +380,6 @@ impl BundleStore {
                 self.content_path.display(),
                 storage_bundle_path(bundle_name)
             )
-        } else if loose.exists() {
-            loose.display().to_string()
         } else {
             loose.display().to_string()
         }
@@ -366,18 +387,20 @@ impl BundleStore {
 
     /// Read the bytes of each target file, decompressing only the bundle
     /// chunks that cover them. Results are keyed by the file's index hash.
-    pub fn read_files_batch(&self, files: &[BundleFile]) -> Result<HashMap<u64, Vec<u8>>> {
-        let mut by_bundle: HashMap<&str, Vec<&BundleFile>> = HashMap::new();
+    pub fn read_files_batch(
+        &self,
+        index: &BundleIndex,
+        files: &[BundleFile],
+    ) -> Result<HashMap<u64, Vec<u8>>> {
+        let mut by_bundle: HashMap<u32, Vec<&BundleFile>> = HashMap::new();
         for file in files {
-            by_bundle
-                .entry(file.bundle_name.as_str())
-                .or_default()
-                .push(file);
+            by_bundle.entry(file.bundle_index).or_default().push(file);
         }
         let groups: Vec<_> = by_bundle.into_iter().collect();
         let per_bundle: Vec<Vec<(u64, Vec<u8>)>> = groups
             .par_iter()
-            .map(|(name, files)| {
+            .map(|(bundle_index, files)| {
+                let name = index.bundle_name(*bundle_index)?;
                 let compressed = self
                     .read_storage_file_cow(&storage_bundle_path(name))
                     .with_context(|| {
@@ -410,9 +433,10 @@ impl BundleStore {
             let span = self.ggpk_file_span(rel_path)?.ok_or_else(|| {
                 anyhow!("{} not found in {}", rel_path, self.content_path.display())
             })?;
-            let ggpk = self.ggpk.as_ref().ok_or_else(|| {
-                anyhow!("failed to open {}", self.content_path.display())
-            })?;
+            let ggpk = self
+                .ggpk
+                .as_ref()
+                .ok_or_else(|| anyhow!("failed to open {}", self.content_path.display()))?;
             let end = span.begin + span.len;
             return ggpk
                 .mmap
@@ -437,10 +461,7 @@ impl BundleStore {
             return self.ggpk_file_span(rel_path).map(|span| span.is_some());
         }
         let loose = self.game_dir.join(rel_path);
-        if loose.exists() {
-            return Ok(true);
-        }
-        Ok(false)
+        Ok(loose.exists())
     }
 
     fn ggpk_file_span(&self, rel_path: &str) -> Result<Option<GgpkFileSpan>> {
@@ -479,11 +500,8 @@ impl BundleStore {
         let appended_start = fs::metadata(&self.content_path)?.len();
         let index_record = ggpk_file_record("_.index.bin", index_bytes, ggpk.use_utf32())?;
         let custom_file_name = format!("{custom_bundle_name}.bundle.bin");
-        let custom_record = ggpk_file_record(
-            &custom_file_name,
-            custom_bundle_bytes,
-            ggpk.use_utf32(),
-        )?;
+        let custom_record =
+            ggpk_file_record(&custom_file_name, custom_bundle_bytes, ggpk.use_utf32())?;
         let index_offset = appended_start;
         let custom_offset = index_offset + u64::try_from(index_record.len())?;
         let new_bundles2_offset = custom_offset + u64::try_from(custom_record.len())?;
@@ -509,12 +527,8 @@ impl BundleStore {
         });
         entries.sort_by_key(|entry| entry.name_hash);
 
-        let new_bundles2 = ggpk_pdir_record(
-            &bundles2.name,
-            &bundles2.digest,
-            &entries,
-            ggpk.use_utf32(),
-        )?;
+        let new_bundles2 =
+            ggpk_pdir_record(&bundles2.name, &bundles2.digest, &entries, ggpk.use_utf32())?;
 
         let mut append_bytes = Vec::new();
         append_bytes.extend_from_slice(&index_record);
@@ -615,6 +629,42 @@ mod tests {
     use super::*;
 
     use std::path::Path;
+
+    #[test]
+    fn corrupt_index_cache_is_rejected_without_huge_allocations() {
+        let key = CacheKey {
+            source: "src".to_string(),
+            size: 1,
+            mtime: 2,
+        };
+        // Truncated header and wrong magic.
+        assert!(parse_index_cache(b"2SI2", &key).is_none());
+        assert!(parse_index_cache(b"XXXXXXXXXXXXXXXX", &key).is_none());
+
+        // Valid magic + matching key, then corrupt lengths.
+        let mut header = Vec::new();
+        header.extend_from_slice(CACHE_MAGIC);
+        header
+            .write_u64::<LittleEndian>(key.source.len() as u64)
+            .unwrap();
+        header.extend_from_slice(key.source.as_bytes());
+        header.write_u64::<LittleEndian>(key.size).unwrap();
+        header.write_u128::<LittleEndian>(key.mtime).unwrap();
+
+        // Absurd raw_decompressed length: must be rejected, not allocated.
+        let mut absurd_len = header.clone();
+        absurd_len.write_u64::<LittleEndian>(u64::MAX).unwrap();
+        assert!(parse_index_cache(&absurd_len, &key).is_none());
+
+        // Absurd file count after empty sections.
+        let mut absurd_count = header;
+        absurd_count.write_u64::<LittleEndian>(0).unwrap(); // raw_decompressed len
+        absurd_count.write_u64::<LittleEndian>(0).unwrap(); // bundle count
+        absurd_count
+            .write_u64::<LittleEndian>(u64::MAX / 4)
+            .unwrap(); // file count
+        assert!(parse_index_cache(&absurd_count, &key).is_none());
+    }
 
     #[test]
     fn content_ggpk_reader_ignores_loose_overlay_index() {

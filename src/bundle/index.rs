@@ -6,11 +6,13 @@ use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::io::{Cursor, Read};
 
-#[derive(Debug, Clone)]
+/// One file record from the bundle index. The owning bundle's name is not
+/// stored per record (that would clone ~1M strings on parse); resolve it via
+/// [`BundleIndex::bundle_name`] from `bundle_index`.
+#[derive(Debug, Clone, Copy)]
 pub struct BundleFile {
     pub hash: u64,
     pub bundle_index: u32,
-    pub bundle_name: String,
     pub offset: u32,
     pub size: u32,
     pub(super) record_pos: usize,
@@ -18,22 +20,20 @@ pub struct BundleFile {
 
 #[cfg(test)]
 impl BundleFile {
-    pub(crate) fn for_test(bundle_name: &str, size: u32) -> Self {
+    pub(crate) fn for_test(size: u32) -> Self {
         Self {
             hash: 0,
             bundle_index: 0,
-            bundle_name: bundle_name.to_string(),
             offset: 0,
             size,
             record_pos: 0,
         }
     }
 
-    pub(crate) fn for_test_with_hash(hash: u64, bundle_name: &str, size: u32) -> Self {
+    pub(crate) fn for_test_with_hash(hash: u64, size: u32) -> Self {
         Self {
             hash,
             bundle_index: 0,
-            bundle_name: bundle_name.to_string(),
             offset: 0,
             size,
             record_pos: 0,
@@ -102,7 +102,6 @@ impl BundleIndex {
                 BundleFile {
                     hash,
                     bundle_index: bundle_index as u32,
-                    bundle_name: (*bundle_name).to_string(),
                     offset: 0,
                     size: *size,
                     record_pos: 0,
@@ -156,18 +155,15 @@ impl BundleIndex {
             let bundle_index = cursor.read_u32::<LittleEndian>()?;
             let offset = cursor.read_u32::<LittleEndian>()?;
             let size = cursor.read_u32::<LittleEndian>()?;
-            let bundle_name = bundles
-                .get(bundle_index as usize)
-                .ok_or_else(|| anyhow!("file references invalid bundle index {bundle_index}"))?
-                .name
-                .clone();
+            if bundle_index as usize >= bundles.len() {
+                bail!("file references invalid bundle index {bundle_index}");
+            }
             file_order.push(hash);
             files.insert(
                 hash,
                 BundleFile {
                     hash,
                     bundle_index,
-                    bundle_name,
                     offset,
                     size,
                     record_pos,
@@ -210,17 +206,26 @@ impl BundleIndex {
         self.files.get(&self.name_hash(path))
     }
 
+    /// Resolve a file record's owning bundle name from its `bundle_index`.
+    pub fn bundle_name(&self, bundle_index: u32) -> Result<&str> {
+        self.bundles
+            .get(bundle_index as usize)
+            .map(|bundle| bundle.name.as_str())
+            .ok_or_else(|| anyhow!("invalid bundle index {bundle_index}"))
+    }
+
     pub fn ensure_paths_built(&mut self) -> Result<&[String]> {
-        if self.paths.is_some() {
-            return Ok(self.paths.as_ref().unwrap());
+        if self.paths.is_none() {
+            crate::timing!("dir_decompress");
+            let directory_bytes = decompress_bundle(&self.directory_bytes_compressed)
+                .context("failed to decompress index directory data")?;
+            crate::timing!("dir_build_paths");
+            self.paths = Some(build_paths_from_directories(
+                &directory_bytes,
+                &self.directories,
+            )?);
         }
-        crate::timing!("dir_decompress");
-        let directory_bytes = decompress_bundle(&self.directory_bytes_compressed)
-            .context("failed to decompress index directory data")?;
-        crate::timing!("dir_build_paths");
-        let paths = build_paths_from_directories(&directory_bytes, &self.directories)?;
-        self.paths = Some(paths);
-        Ok(self.paths.as_ref().unwrap())
+        Ok(self.paths.as_deref().expect("paths initialized"))
     }
 
     pub fn paths(&self) -> &[String] {
@@ -254,7 +259,7 @@ impl BundleIndex {
             if !predicate(path) {
                 continue;
             }
-            if let Some(file) = files.get(&hash_path(hash_mode, path)).cloned() {
+            if let Some(file) = files.get(&hash_path(hash_mode, path)).copied() {
                 result.push(IndexedPath {
                     path: path.clone(),
                     file,
@@ -271,6 +276,9 @@ impl BundleIndex {
         offset: u32,
         size: u32,
     ) -> Result<()> {
+        if bundle_index as usize >= self.bundles.len() {
+            bail!("invalid bundle index {bundle_index}");
+        }
         let file = self
             .files
             .get_mut(&hash)
@@ -278,12 +286,6 @@ impl BundleIndex {
         file.bundle_index = bundle_index;
         file.offset = offset;
         file.size = size;
-        file.bundle_name = self
-            .bundles
-            .get(bundle_index as usize)
-            .ok_or_else(|| anyhow!("invalid bundle index {bundle_index}"))?
-            .name
-            .clone();
 
         let pos = file.record_pos + 8;
         let mut writer = Cursor::new(&mut self.raw_decompressed[pos..pos + 12]);
@@ -316,7 +318,7 @@ impl BundleIndex {
         let hash_mode = self.hash_mode;
         let mut result = Vec::with_capacity(paths.len());
         for path in paths {
-            if let Some(file) = files.get(&hash_path(hash_mode, path)).cloned() {
+            if let Some(file) = files.get(&hash_path(hash_mode, path)).copied() {
                 result.push(IndexedPath {
                     path: path.clone(),
                     file,
