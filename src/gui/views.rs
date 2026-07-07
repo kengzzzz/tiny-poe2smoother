@@ -47,8 +47,8 @@ const GROUPS: &[(&str, &[PatchId])] = &[
     ("Interface", &[PatchId::ColorMods, PatchId::MonsterHpBar]),
 ];
 
-// Column packing chosen to roughly balance row counts (3+5+2 vs 6+3).
-const COLUMNS: [&[usize]; 2] = [&[0, 2, 4], &[1, 3]];
+// Column packing chosen to roughly balance column heights (3+3+2 vs 6+5).
+const COLUMNS: [&[usize]; 2] = [&[0, 3, 4], &[1, 2]];
 
 pub fn draw(app: &mut GuiApp, ui: &mut egui::Ui) {
     draw_header(app, ui);
