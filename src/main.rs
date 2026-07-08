@@ -57,6 +57,7 @@ struct GuiApp {
     stat_catalog: Option<Vec<CatalogRow>>,
     catalog_task: Option<Receiver<Result<Vec<CatalogRow>, String>>>,
     catalog_error: Option<String>,
+    stat_catalog_dir: Option<PathBuf>,
     color_filter_key: Option<ColorFilterKey>,
     color_filter_rows: Vec<ColorRowRef>,
     effect_overrides: HashMap<String, EffectLevel>,
@@ -65,6 +66,7 @@ struct GuiApp {
     effect_catalog: Option<Vec<EffectFolderRow>>,
     effect_catalog_task: Option<Receiver<Result<Vec<EffectFolderRow>, String>>>,
     effect_catalog_error: Option<String>,
+    effect_catalog_dir: Option<PathBuf>,
     effects_filter_key: Option<(String, usize)>,
     effects_filter_rows: Vec<usize>,
     status: Option<AppStatus>,
@@ -149,6 +151,7 @@ impl Default for GuiApp {
             stat_catalog: None,
             catalog_task: None,
             catalog_error: None,
+            stat_catalog_dir: None,
             color_filter_key: None,
             color_filter_rows: Vec::new(),
             effect_overrides: HashMap::new(),
@@ -157,6 +160,7 @@ impl Default for GuiApp {
             effect_catalog: None,
             effect_catalog_task: None,
             effect_catalog_error: None,
+            effect_catalog_dir: None,
             effects_filter_key: None,
             effects_filter_rows: Vec::new(),
             status: None,
@@ -423,17 +427,32 @@ impl GuiApp {
         self.status = Some(status);
     }
 
+    /// Discard a stale stat catalog (and its in-flight load / filter cache)
+    /// when the target game dir no longer matches the one it was loaded for.
+    /// Overrides/config are left alone — only the display/derived layer resets.
+    fn invalidate_stat_catalog_if_stale(&mut self, game_dir: &Option<PathBuf>) {
+        if self.stat_catalog_dir.as_deref() != game_dir.as_deref() {
+            self.stat_catalog = None;
+            self.catalog_task = None;
+            self.catalog_error = None;
+            self.color_filter_key = None;
+            self.color_filter_rows.clear();
+        }
+    }
+
     /// Kick off the background stat-catalog load for the color editor if it
     /// hasn't run yet. Deliberately NOT `spawn`: that would set `is_busy()`
     /// and lock the whole UI while the editor should stay usable.
     fn ensure_catalog_loading(&mut self) {
+        let game_dir = self.game_dir();
+        self.invalidate_stat_catalog_if_stale(&game_dir);
         if self.stat_catalog.is_some() || self.catalog_task.is_some() {
             return;
         }
         self.catalog_error = None;
-        let game_dir = self.game_dir();
         let (tx, rx) = mpsc::channel();
         self.catalog_task = Some(rx);
+        self.stat_catalog_dir = game_dir.clone();
         thread::spawn(move || {
             let result = load_stat_catalog(game_dir)
                 .map(|entries| {
@@ -546,17 +565,33 @@ impl GuiApp {
         }
     }
 
+    /// Discard a stale effect catalog (and its in-flight load / filter cache)
+    /// when the target game dir no longer matches the one it was loaded for.
+    /// `effect_overrides` intentionally survive — they're folder-keyed and stale
+    /// folders simply match no path (see `from_prefs`).
+    fn invalidate_effect_catalog_if_stale(&mut self, game_dir: &Option<PathBuf>) {
+        if self.effect_catalog_dir.as_deref() != game_dir.as_deref() {
+            self.effect_catalog = None;
+            self.effect_catalog_task = None;
+            self.effect_catalog_error = None;
+            self.effects_filter_key = None;
+            self.effects_filter_rows.clear();
+        }
+    }
+
     /// Kick off the background skill-folder load for the effects editor if it
     /// hasn't run yet. Like `ensure_catalog_loading`, deliberately NOT
     /// `spawn`: the editor should stay usable while it loads.
     fn ensure_effect_catalog_loading(&mut self) {
+        let game_dir = self.game_dir();
+        self.invalidate_effect_catalog_if_stale(&game_dir);
         if self.effect_catalog.is_some() || self.effect_catalog_task.is_some() {
             return;
         }
         self.effect_catalog_error = None;
-        let game_dir = self.game_dir();
         let (tx, rx) = mpsc::channel();
         self.effect_catalog_task = Some(rx);
+        self.effect_catalog_dir = game_dir.clone();
         thread::spawn(move || {
             let result = load_effect_skill_catalog(game_dir)
                 .map(effect_skill_catalog_rows)
@@ -825,6 +860,44 @@ mod tests {
         app.effects_search.clear();
         app.refresh_effects_filter();
         assert_eq!(app.effects_filter_rows, vec![0, 1]);
+    }
+
+    #[test]
+    fn effect_catalog_invalidates_only_when_game_dir_changes() {
+        let mut app = GuiApp {
+            effect_catalog: Some(vec![EffectFolderRow {
+                folders: vec!["fireball".to_string()],
+                active_skill_id: "fireball".to_string(),
+                action_type: "GreaterFireball".to_string(),
+                display: "Fireball".to_string(),
+                display_lower: "fireball".to_string(),
+                search_lower: "fireball greaterfireball".to_string(),
+            }]),
+            effect_catalog_dir: Some(PathBuf::from("/install/A")),
+            effects_filter_key: Some(("q".to_string(), 1)),
+            effects_filter_rows: vec![0],
+            ..GuiApp::default()
+        };
+        app.effect_overrides
+            .insert("fireball".to_string(), EffectLevel::Hidden);
+
+        // Same dir: nothing is discarded.
+        app.invalidate_effect_catalog_if_stale(&Some(PathBuf::from("/install/A")));
+        assert!(app.effect_catalog.is_some());
+        assert!(app.effects_filter_key.is_some());
+        assert_eq!(app.effects_filter_rows, vec![0]);
+
+        // Different dir: catalog + filter cache reset, overrides untouched.
+        app.invalidate_effect_catalog_if_stale(&Some(PathBuf::from("/install/B")));
+        assert!(app.effect_catalog.is_none());
+        assert!(app.effect_catalog_task.is_none());
+        assert!(app.effect_catalog_error.is_none());
+        assert!(app.effects_filter_key.is_none());
+        assert!(app.effects_filter_rows.is_empty());
+        assert_eq!(
+            app.effect_overrides.get("fireball"),
+            Some(&EffectLevel::Hidden)
+        );
     }
 
     #[test]
