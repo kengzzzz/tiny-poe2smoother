@@ -1,4 +1,5 @@
 use super::catalog::PatchId;
+use super::effect_skills::{EffectLevel, EffectsFilter};
 
 pub(super) static PARTICLE_PROTECTED_PREFIXES: &[&str] = &[
     "metadata/particles/monster_effects/league_legion/rewardsystem",
@@ -110,10 +111,7 @@ pub(super) fn patch_targets_path(patch: PatchId, path: &str) -> bool {
             starts_with_path_ci(path, "metadata/particles")
                 && (ends_with_path_ci(path, ".pet") || ends_with_path_ci(path, ".trl"))
         }
-        PatchId::Effects => {
-            starts_with_path_ci(path, "metadata/effects/spells")
-                && (ends_with_path_ci(path, ".aoc") || ends_with_path_ci(path, ".ao"))
-        }
+        PatchId::Effects => effects_targets_path(path, None),
         PatchId::DisableSounds => is_sound_target(path),
         PatchId::SkillSounds => {
             starts_with_path_ci(path, "metadata/effects/spells")
@@ -129,6 +127,25 @@ pub(super) fn patch_targets_path(patch: PatchId, path: &str) -> bool {
             starts_with_path_ci(path, "metadata/effects/microtransactions")
                 && is_metadata_effect_ext(path)
         }
+    }
+}
+
+/// Filter-aware target predicate for `Effects`. Without a filter this is the
+/// long-standing rule (`.ao`/`.aoc` under spells). With one, `Full` folders
+/// drop out entirely and `Hidden` folders additionally pull in their
+/// `.epk`/`.pet`/`.trl` effect data for blanking.
+pub(super) fn effects_targets_path(path: &str, filter: Option<&EffectsFilter>) -> bool {
+    if !starts_with_path_ci(path, "metadata/effects/spells") {
+        return false;
+    }
+    let is_anim = ends_with_path_ci(path, ".aoc") || ends_with_path_ci(path, ".ao");
+    let Some(filter) = filter else {
+        return is_anim;
+    };
+    match filter.level_for(path) {
+        EffectLevel::Full => false,
+        EffectLevel::Reduced => is_anim,
+        EffectLevel::Hidden => is_metadata_effect_ext(path),
     }
 }
 
@@ -161,9 +178,10 @@ pub(super) fn patch_applies_path(patch: PatchId, path: &str) -> bool {
             starts_with_path_ci(path, "metadata/particles")
                 && (ends_with_path_ci(path, ".pet") || ends_with_path_ci(path, ".trl"))
         }
+        // Broader than the target rule so Hidden folders' `.epk`/`.pet`/`.trl`
+        // candidates pass this gate; the transform itself decides per level.
         PatchId::Effects => {
-            starts_with_path_ci(path, "metadata/effects/spells")
-                && (ends_with_path_ci(path, ".aoc") || ends_with_path_ci(path, ".ao"))
+            starts_with_path_ci(path, "metadata/effects/spells") && is_metadata_effect_ext(path)
         }
         PatchId::DisableSounds => is_sound_target(path),
         PatchId::SkillSounds => {
@@ -248,7 +266,7 @@ fn eq_path_ci(path: &str, pattern: &str) -> bool {
             .all(|(a, b)| path_byte_eq(a, b))
 }
 
-fn starts_with_path_ci(path: &str, prefix: &str) -> bool {
+pub(super) fn starts_with_path_ci(path: &str, prefix: &str) -> bool {
     path.len() >= prefix.len()
         && path
             .bytes()
@@ -267,7 +285,7 @@ pub(super) fn ends_with_path_ci(path: &str, suffix: &str) -> bool {
         .all(|(a, b)| path_byte_eq(a, b))
 }
 
-fn path_byte_eq(a: u8, b: u8) -> bool {
+pub(super) fn path_byte_eq(a: u8, b: u8) -> bool {
     let a = if a == b'\\' {
         b'/'
     } else {
@@ -327,6 +345,78 @@ mod tests {
             assert!(!patch_targets_path(PatchId::BlackScreen, path));
             assert!(!patch_applies_path(PatchId::BlackScreen, path));
         }
+    }
+
+    #[test]
+    fn effects_targeting_without_filter_matches_the_long_standing_rule() {
+        for path in [
+            "metadata/effects/spells/fireball/fireball.ao",
+            "Metadata\\Effects\\Spells\\Arc_02\\beam.aoc",
+        ] {
+            assert!(effects_targets_path(path, None), "path: {path}");
+            assert!(patch_targets_path(PatchId::Effects, path));
+        }
+        for path in [
+            "metadata/effects/spells/fireball/fx/impact.pet",
+            "metadata/effects/spells/cold_herald_of_ice/epk/unarmed_buff.epk",
+            "metadata/effects/spells/fireball/trail.trl",
+            "metadata/particles/enviro/foo.ao",
+        ] {
+            assert!(!effects_targets_path(path, None), "path: {path}");
+            assert!(!patch_targets_path(PatchId::Effects, path));
+        }
+        // The applies gate is broader (Hidden folders' data files must pass
+        // it), but still never matches outside spells.
+        assert!(patch_applies_path(
+            PatchId::Effects,
+            "metadata/effects/spells/fireball/fx/impact.pet"
+        ));
+        assert!(!patch_applies_path(
+            PatchId::Effects,
+            "metadata/particles/enviro/foo.pet"
+        ));
+    }
+
+    #[test]
+    fn effects_targeting_with_filter_honors_per_skill_levels() {
+        use super::super::effect_skills::EffectSkillOverride;
+
+        let filter = EffectsFilter::new(&[
+            EffectSkillOverride {
+                folder: "cold_herald_of_ice".to_string(),
+                level: EffectLevel::Full,
+            },
+            EffectSkillOverride {
+                folder: "arc_02".to_string(),
+                level: EffectLevel::Hidden,
+            },
+        ])
+        .unwrap();
+        let filter = Some(&filter);
+
+        // Full folders drop out entirely.
+        assert!(!effects_targets_path(
+            "metadata/effects/spells/cold_herald_of_ice/ao/ice_explosion.ao",
+            filter
+        ));
+        // Hidden folders also pull in their effect data files.
+        for path in [
+            "metadata/effects/spells/arc_02/arc.aoc",
+            "metadata/effects/spells/arc_02/epk/buff.epk",
+            "metadata/effects/spells/arc_02/fx/beam.pet",
+            "metadata/effects/spells/arc_02/fx/beam.trl",
+        ] {
+            assert!(effects_targets_path(path, filter), "path: {path}");
+        }
+        // Unlisted folders keep the .ao/.aoc-only rule.
+        assert!(effects_targets_path(
+            "metadata/effects/spells/fireball/fireball.ao",
+            filter
+        ));
+        assert!(!effects_targets_path(
+            "metadata/effects/spells/fireball/fx/impact.pet",
+            filter
+        ));
     }
 
     #[test]

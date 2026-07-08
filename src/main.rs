@@ -4,18 +4,18 @@ mod gui;
 
 use eframe::egui;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use tiny_poe2smoother::app::{
-    apply_patches, load_stat_catalog, load_status, restore_backup, AppStatus, ApplyReport,
-    PatchRequest, RestoreReport,
+    apply_patches, load_effect_skill_catalog, load_stat_catalog, load_status, restore_backup,
+    AppStatus, ApplyReport, PatchRequest, RestoreReport,
 };
 use tiny_poe2smoother::install::display_path;
 use tiny_poe2smoother::patches::{
     all_patches, default_color_mods, display_stat_text, merge_with_defaults, parse_patch,
-    ColorModEntry, PatchId, PatchParams,
+    ColorModEntry, EffectLevel, EffectSkillCatalogEntry, EffectSkillOverride, PatchId, PatchParams,
 };
 
 const PREFS_KEY: &str = "tiny-poe2smoother.gui.v1";
@@ -59,6 +59,14 @@ struct GuiApp {
     catalog_error: Option<String>,
     color_filter_key: Option<ColorFilterKey>,
     color_filter_rows: Vec<ColorRowRef>,
+    effect_overrides: HashMap<String, EffectLevel>,
+    show_effects_editor: bool,
+    effects_search: String,
+    effect_catalog: Option<Vec<EffectFolderRow>>,
+    effect_catalog_task: Option<Receiver<Result<Vec<EffectFolderRow>, String>>>,
+    effect_catalog_error: Option<String>,
+    effects_filter_key: Option<(String, usize)>,
+    effects_filter_rows: Vec<usize>,
     status: Option<AppStatus>,
     message: String,
     message_kind: MessageKind,
@@ -94,6 +102,18 @@ enum ColorRowRef {
 /// invalidates the cached row list; color/enabled edits don't.
 type ColorFilterKey = (String, usize, usize);
 
+/// One visible skill row in the per-skill effects editor. A row may own
+/// several underlying effect folders when the game splits one skill's visuals
+/// across buff/explosion/etc. folders.
+struct EffectFolderRow {
+    folders: Vec<String>,
+    active_skill_id: String,
+    action_type: String,
+    display: String,
+    display_lower: String,
+    search_lower: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GuiPrefs {
     game_dir_input: String,
@@ -101,6 +121,8 @@ struct GuiPrefs {
     zoom: f64,
     #[serde(default)]
     color_mods: Vec<ColorModEntry>,
+    #[serde(default)]
+    effect_skills: Vec<EffectSkillOverride>,
 }
 
 enum TaskResult {
@@ -129,6 +151,14 @@ impl Default for GuiApp {
             catalog_error: None,
             color_filter_key: None,
             color_filter_rows: Vec::new(),
+            effect_overrides: HashMap::new(),
+            show_effects_editor: false,
+            effects_search: String::new(),
+            effect_catalog: None,
+            effect_catalog_task: None,
+            effect_catalog_error: None,
+            effects_filter_key: None,
+            effects_filter_rows: Vec::new(),
             status: None,
             message: "Ready.".to_string(),
             message_kind: MessageKind::Info,
@@ -155,6 +185,7 @@ impl eframe::App for GuiApp {
 
         self.poll_task(ctx);
         self.poll_catalog(ctx);
+        self.poll_effect_catalog(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -192,11 +223,20 @@ impl GuiApp {
         } else {
             merge_with_defaults(prefs.color_mods)
         };
+        // Only non-default levels are ever saved; stale folders from older
+        // game versions are kept silently (they simply match no path).
+        let effect_overrides = prefs
+            .effect_skills
+            .into_iter()
+            .filter(|entry| entry.level != EffectLevel::Reduced)
+            .map(|entry| (entry.folder.to_ascii_lowercase(), entry.level))
+            .collect();
         Self {
             game_dir_input: prefs.game_dir_input,
             selected_patches,
             zoom: prefs.zoom.clamp(1.2, 2.4),
             color_mods,
+            effect_overrides,
             ..Self::default()
         }
     }
@@ -212,7 +252,23 @@ impl GuiApp {
             selected_patches,
             zoom: self.zoom,
             color_mods: self.color_mods.clone(),
+            effect_skills: self.effect_skill_overrides(),
         }
+    }
+
+    /// The non-default per-skill levels as a folder-sorted list (stable
+    /// serialization order for prefs and `PatchParams`).
+    fn effect_skill_overrides(&self) -> Vec<EffectSkillOverride> {
+        let mut overrides: Vec<EffectSkillOverride> = self
+            .effect_overrides
+            .iter()
+            .map(|(folder, level)| EffectSkillOverride {
+                folder: folder.clone(),
+                level: *level,
+            })
+            .collect();
+        overrides.sort_by(|a, b| a.folder.cmp(&b.folder));
+        overrides
     }
 
     fn is_busy(&self) -> bool {
@@ -244,12 +300,27 @@ impl GuiApp {
                 "Color mods is selected but no mods are enabled — use Edit colors…".to_string(),
             );
         }
+        if patches.contains(&PatchId::Effects) {
+            if let Some(catalog) = &self.effect_catalog {
+                let all_full = catalog.iter().any(|row| !row.folders.is_empty())
+                    && catalog.iter().flat_map(|row| &row.folders).all(|folder| {
+                        self.effect_overrides.get(folder) == Some(&EffectLevel::Full)
+                    });
+                if all_full {
+                    return Err(
+                        "Effects is selected but every skill is set to Full — use Edit skills…"
+                            .to_string(),
+                    );
+                }
+            }
+        }
         Ok(PatchRequest {
             game_dir: self.game_dir(),
             patches,
             params: PatchParams {
                 zoom: self.zoom,
                 color_mods: self.color_mods.clone(),
+                effect_skills: self.effect_skill_overrides(),
             },
         })
     }
@@ -488,6 +559,119 @@ impl GuiApp {
             ));
         }
     }
+
+    /// Kick off the background skill-folder load for the effects editor if it
+    /// hasn't run yet. Like `ensure_catalog_loading`, deliberately NOT
+    /// `spawn`: the editor should stay usable while it loads.
+    fn ensure_effect_catalog_loading(&mut self) {
+        if self.effect_catalog.is_some() || self.effect_catalog_task.is_some() {
+            return;
+        }
+        self.effect_catalog_error = None;
+        let game_dir = self.game_dir();
+        let (tx, rx) = mpsc::channel();
+        self.effect_catalog_task = Some(rx);
+        thread::spawn(move || {
+            let result = load_effect_skill_catalog(game_dir)
+                .map(effect_skill_catalog_rows)
+                .map_err(|err| err.to_string());
+            let _ = tx.send(result);
+        });
+    }
+
+    fn poll_effect_catalog(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.effect_catalog_task else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(rows)) => {
+                self.effect_catalog_task = None;
+                self.effect_catalog = Some(rows);
+            }
+            Ok(Err(err)) => {
+                self.effect_catalog_task = None;
+                self.effect_catalog_error = Some(err);
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                if self.show_effects_editor {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(33));
+                }
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.effect_catalog_task = None;
+                self.effect_catalog_error = Some("skill catalog task failed".to_string());
+            }
+        }
+    }
+
+    /// Rebuild `effects_filter_rows` (indices into `effect_catalog` matching
+    /// the query) if stale. Level edits never invalidate the cache — the
+    /// visible set only depends on the query and the catalog.
+    fn refresh_effects_filter(&mut self) {
+        let catalog_len = self.effect_catalog.as_ref().map_or(0, Vec::len);
+        let fresh = self
+            .effects_filter_key
+            .as_ref()
+            .is_some_and(|(query, catalog)| {
+                *query == self.effects_search && *catalog == catalog_len
+            });
+        if !fresh {
+            let query = gui::search::SearchQuery::parse(&self.effects_search);
+            self.effects_filter_rows = self
+                .effect_catalog
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| query.matches(&row.search_lower, &row.display_lower))
+                .map(|(idx, _)| idx)
+                .collect();
+            self.effects_filter_key = Some((self.effects_search.clone(), catalog_len));
+        }
+    }
+
+    fn apply_effect_level_to_filtered_rows(&mut self, level: EffectLevel) {
+        self.refresh_effects_filter();
+        let folders: Vec<String> = self
+            .effect_catalog
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| self.effects_filter_rows.contains(idx))
+            .flat_map(|(_, row)| row.folders.iter().cloned())
+            .collect();
+        for folder in folders {
+            if level == EffectLevel::Reduced {
+                self.effect_overrides.remove(&folder);
+            } else {
+                self.effect_overrides.insert(folder, level);
+            }
+        }
+    }
+}
+
+fn effect_skill_catalog_rows(entries: Vec<EffectSkillCatalogEntry>) -> Vec<EffectFolderRow> {
+    entries
+        .into_iter()
+        .map(|entry| {
+            let search_lower = format!(
+                "{} {} {} {}",
+                entry.display.to_lowercase(),
+                entry.active_skill_id,
+                entry.action_type.to_lowercase(),
+                entry.folders.join(" ")
+            );
+            EffectFolderRow {
+                folders: entry.folders,
+                active_skill_id: entry.active_skill_id,
+                action_type: entry.action_type,
+                display_lower: entry.display.to_lowercase(),
+                display: entry.display,
+                search_lower,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -501,6 +685,7 @@ mod tests {
             selected_patches: vec!["fog".to_string(), "unknown".to_string()],
             zoom: 9.0,
             color_mods: Vec::new(),
+            effect_skills: Vec::new(),
         });
 
         assert_eq!(
@@ -526,6 +711,7 @@ mod tests {
             selected_patches: vec!["fog".to_string()],
             zoom: 2.4,
             color_mods: saved,
+            effect_skills: Vec::new(),
         });
 
         let edited = app
@@ -537,6 +723,198 @@ mod tests {
         assert!(!edited.enabled);
         // Defaults the user never saw are appended.
         assert_eq!(app.color_mods.len(), default_color_mods().len());
+    }
+
+    #[test]
+    fn prefs_round_trip_effect_skill_overrides_and_drop_reduced_entries() {
+        let app = GuiApp::from_prefs(GuiPrefs {
+            game_dir_input: String::new(),
+            selected_patches: vec!["fog".to_string()],
+            zoom: 2.4,
+            color_mods: Vec::new(),
+            effect_skills: vec![
+                EffectSkillOverride {
+                    folder: "Cold_Herald_Of_Ice".to_string(),
+                    level: EffectLevel::Hidden,
+                },
+                EffectSkillOverride {
+                    folder: "arc_02".to_string(),
+                    level: EffectLevel::Reduced,
+                },
+                EffectSkillOverride {
+                    folder: "fireball".to_string(),
+                    level: EffectLevel::Full,
+                },
+            ],
+        });
+
+        assert_eq!(
+            app.effect_overrides.get("cold_herald_of_ice"),
+            Some(&EffectLevel::Hidden)
+        );
+        assert_eq!(
+            app.effect_overrides.get("fireball"),
+            Some(&EffectLevel::Full)
+        );
+        // Explicit Reduced entries are meaningless and dropped on load.
+        assert!(!app.effect_overrides.contains_key("arc_02"));
+
+        // Saved back folder-sorted, non-default only.
+        assert_eq!(
+            app.prefs().effect_skills,
+            vec![
+                EffectSkillOverride {
+                    folder: "cold_herald_of_ice".to_string(),
+                    level: EffectLevel::Hidden,
+                },
+                EffectSkillOverride {
+                    folder: "fireball".to_string(),
+                    level: EffectLevel::Full,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn patch_request_embeds_overrides_and_rejects_all_full_effects() {
+        let mut app = GuiApp {
+            selected_patches: [PatchId::Effects].into_iter().collect(),
+            ..GuiApp::default()
+        };
+        app.effect_overrides
+            .insert("fireball".to_string(), EffectLevel::Full);
+        app.effect_catalog = Some(vec![EffectFolderRow {
+            folders: vec!["fireball".to_string()],
+            active_skill_id: "fireball".to_string(),
+            action_type: "Fireball".to_string(),
+            display: "Fireball".to_string(),
+            display_lower: "fireball".to_string(),
+            search_lower: "fireball fireball".to_string(),
+        }]);
+
+        let err = app.patch_request().unwrap_err();
+        assert!(err.contains("every skill is set to Full"));
+
+        app.effect_overrides
+            .insert("fireball".to_string(), EffectLevel::Hidden);
+        let request = app.patch_request().unwrap();
+        assert_eq!(
+            request.params.effect_skills,
+            vec![EffectSkillOverride {
+                folder: "fireball".to_string(),
+                level: EffectLevel::Hidden,
+            }]
+        );
+    }
+
+    #[test]
+    fn effects_filter_matches_folder_and_display_text() {
+        let mut app = GuiApp {
+            effect_catalog: Some(
+                [
+                    ("cold_herald_of_ice", "Herald of Ice"),
+                    ("fireball", "Fireball"),
+                ]
+                .into_iter()
+                .map(|(folder, display)| {
+                    let display = display.to_string();
+                    EffectFolderRow {
+                        folders: vec![folder.to_string()],
+                        active_skill_id: display.to_lowercase().replace(' ', "_"),
+                        action_type: display.replace(' ', ""),
+                        display_lower: display.to_lowercase(),
+                        display,
+                        search_lower: folder.to_string(),
+                    }
+                })
+                .collect(),
+            ),
+            ..GuiApp::default()
+        };
+
+        app.effects_search = "herald ice".to_string();
+        app.refresh_effects_filter();
+        assert_eq!(app.effects_filter_rows, vec![0]);
+
+        app.effects_search.clear();
+        app.refresh_effects_filter();
+        assert_eq!(app.effects_filter_rows, vec![0, 1]);
+    }
+
+    #[test]
+    fn effect_bulk_level_applies_to_filtered_rows_only() {
+        let mut app = GuiApp {
+            effect_catalog: Some(vec![
+                EffectFolderRow {
+                    folders: vec!["fire_heraldofash".to_string(), "herald_of_fire".to_string()],
+                    active_skill_id: "herald_of_ash".to_string(),
+                    action_type: "HeraldOfAsh".to_string(),
+                    display: "Herald of Ash".to_string(),
+                    display_lower: "herald of ash".to_string(),
+                    search_lower:
+                        "herald of ash herald_of_ash heraldofash fire_heraldofash herald_of_fire"
+                            .to_string(),
+                },
+                EffectFolderRow {
+                    folders: vec!["fireball".to_string()],
+                    active_skill_id: "fireball".to_string(),
+                    action_type: "GreaterFireball".to_string(),
+                    display: "Fireball".to_string(),
+                    display_lower: "fireball".to_string(),
+                    search_lower: "fireball greaterfireball".to_string(),
+                },
+            ]),
+            ..GuiApp::default()
+        };
+
+        app.effects_search = "herald".to_string();
+        app.apply_effect_level_to_filtered_rows(EffectLevel::Hidden);
+        assert_eq!(
+            app.effect_overrides.get("fire_heraldofash"),
+            Some(&EffectLevel::Hidden)
+        );
+        assert_eq!(
+            app.effect_overrides.get("herald_of_fire"),
+            Some(&EffectLevel::Hidden)
+        );
+        assert!(!app.effect_overrides.contains_key("fireball"));
+
+        app.apply_effect_level_to_filtered_rows(EffectLevel::Reduced);
+        assert!(app.effect_overrides.is_empty());
+    }
+
+    #[test]
+    fn effect_catalog_rows_keep_skill_first_grouping() {
+        let rows = effect_skill_catalog_rows(vec![
+            EffectSkillCatalogEntry {
+                active_skill_id: "herald_of_ash".to_string(),
+                display: "Herald of Ash".to_string(),
+                action_type: "HeraldOfAsh".to_string(),
+                folders: vec!["fire_heraldofash".to_string(), "herald_of_fire".to_string()],
+            },
+            EffectSkillCatalogEntry {
+                active_skill_id: "fireball".to_string(),
+                display: "Fireball".to_string(),
+                action_type: "GreaterFireball".to_string(),
+                folders: vec!["fireball".to_string()],
+            },
+        ]);
+
+        assert_eq!(rows.len(), 2);
+        let herald = rows
+            .iter()
+            .find(|row| row.display == "Herald of Ash")
+            .unwrap();
+        assert_eq!(
+            herald.folders,
+            vec!["fire_heraldofash".to_string(), "herald_of_fire".to_string()]
+        );
+        assert_eq!(herald.active_skill_id, "herald_of_ash");
+        assert_eq!(herald.action_type, "HeraldOfAsh");
+        assert!(herald.search_lower.contains("herald_of_ash"));
+        assert!(herald.search_lower.contains("heraldofash"));
+        assert!(herald.search_lower.contains("fire_heraldofash"));
+        assert!(herald.search_lower.contains("herald_of_fire"));
     }
 
     fn catalog_row(stat_id: &str, text: &str) -> CatalogRow {
@@ -556,6 +934,7 @@ mod tests {
             selected_patches: Vec::new(),
             zoom: 2.4,
             color_mods: Vec::new(),
+            effect_skills: Vec::new(),
         });
         app.stat_catalog = Some(vec![
             catalog_row(

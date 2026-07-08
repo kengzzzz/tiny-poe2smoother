@@ -2,7 +2,8 @@ use eframe::egui;
 use tiny_poe2smoother::app::PatchState;
 use tiny_poe2smoother::install::{display_path, is_game_running};
 use tiny_poe2smoother::patches::{
-    all_patches, all_presets, default_color_mods, ColorModEntry, PatchId, PatchInfo, PRESET_COLORS,
+    all_patches, all_presets, default_color_mods, ColorModEntry, EffectLevel, PatchId, PatchInfo,
+    PRESET_COLORS,
 };
 
 use super::icon;
@@ -272,6 +273,9 @@ fn draw_patch_group(app: &mut GuiApp, ui: &mut egui::Ui, title: &str, patch_ids:
             if patch_id == PatchId::ColorMods {
                 draw_color_mods_row(app, ui);
             }
+            if patch_id == PatchId::Effects {
+                draw_effect_skills_row(app, ui);
+            }
         }
     });
 }
@@ -288,6 +292,35 @@ fn draw_color_mods_row(app: &mut GuiApp, ui: &mut egui::Ui) {
         }
         let enabled = app.color_mods.iter().filter(|entry| entry.enabled).count();
         ui.label(theme::caption_text(&format!("{enabled} mod(s) enabled")));
+    });
+}
+
+fn draw_effect_skills_row(app: &mut GuiApp, ui: &mut egui::Ui) {
+    if !app.selected_patches.contains(&PatchId::Effects) {
+        return;
+    }
+    ui.horizontal(|ui| {
+        ui.add_space(26.0);
+        if small_action(ui, "Edit skills…") {
+            app.show_effects_editor = true;
+            app.ensure_effect_catalog_loading();
+        }
+        let hidden = app
+            .effect_overrides
+            .values()
+            .filter(|level| **level == EffectLevel::Hidden)
+            .count();
+        let full = app
+            .effect_overrides
+            .values()
+            .filter(|level| **level == EffectLevel::Full)
+            .count();
+        let caption = if hidden == 0 && full == 0 {
+            "all skills reduced".to_string()
+        } else {
+            format!("{hidden} hidden · {full} kept")
+        };
+        ui.label(theme::caption_text(&caption));
     });
 }
 
@@ -446,6 +479,10 @@ fn draw_modals(app: &mut GuiApp, ctx: &egui::Context) {
 
     if app.show_color_editor {
         draw_color_editor(app, ctx);
+    }
+
+    if app.show_effects_editor {
+        draw_effects_editor(app, ctx);
     }
 
     if app.show_game_running_dialog {
@@ -632,6 +669,166 @@ fn color_row_ui(ui: &mut egui::Ui, entry: &mut ColorModEntry, text: Option<&str>
         },
     );
     changed
+}
+
+/// The per-skill effects editor: search box over the skill folders found in
+/// the game files, one row per skill with a Full/Reduced/Hidden level
+/// selector. Same layout as the color-mods editor.
+fn draw_effects_editor(app: &mut GuiApp, ctx: &egui::Context) {
+    let modal = egui::Modal::new(egui::Id::new("effect_skills_editor"))
+        .frame(widgets::card().inner_margin(20))
+        .backdrop_color(egui::Color32::from_black_alpha(140))
+        .show(ctx, |ui| {
+            ui.set_width(640.0);
+            ui.label(theme::heading_text("Skill effects"));
+            ui.add_space(2.0);
+            ui.label(theme::caption_text(
+                "Full keeps a skill's original visuals · Reduced strips heavy client effects \
+                 (default) · Hidden also blanks its particle/effect data.",
+            ));
+            ui.add_space(8.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut app.effects_search)
+                    .hint_text("Search skills — regex like in-game search, \"quotes\", !exclude…")
+                    .desired_width(f32::INFINITY)
+                    .margin(egui::Margin::symmetric(10, 8)),
+            );
+            ui.add_space(6.0);
+            if app.effect_catalog_task.is_some() {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().color(palette::ACCENT));
+                    ui.label(theme::caption_text("Loading skill list from game files…"));
+                });
+                ui.add_space(4.0);
+            } else if let Some(error) = app.effect_catalog_error.clone() {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("Skill list unavailable: {error}"))
+                            .size(11.5)
+                            .color(palette::WARNING),
+                    );
+                    if small_action(ui, "Retry") {
+                        app.effect_catalog_error = None;
+                        app.ensure_effect_catalog_loading();
+                    }
+                });
+                ui.add_space(4.0);
+            }
+
+            app.refresh_effects_filter();
+            let row_count = app.effects_filter_rows.len();
+            ui.horizontal(|ui| {
+                ui.label(theme::caption_text(&format!("{row_count} shown")));
+                ui.add_enabled_ui(row_count > 0, |ui| {
+                    if small_action(ui, "Full") {
+                        app.apply_effect_level_to_filtered_rows(EffectLevel::Full);
+                    }
+                    if small_action(ui, "Reduced") {
+                        app.apply_effect_level_to_filtered_rows(EffectLevel::Reduced);
+                    }
+                    if small_action(ui, "Hidden") {
+                        app.apply_effect_level_to_filtered_rows(EffectLevel::Hidden);
+                    }
+                });
+            });
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical()
+                .max_height(380.0)
+                .auto_shrink([false, true])
+                .show_rows(ui, COLOR_ROW_HEIGHT, row_count, |ui, range| {
+                    for i in range {
+                        let idx = app.effects_filter_rows[i];
+                        draw_effect_skill_row(app, ui, idx);
+                    }
+                });
+
+            ui.add_space(10.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add(widgets::primary_button("Close")).clicked() {
+                    app.show_effects_editor = false;
+                }
+                if ui
+                    .add(widgets::secondary_button("Reset to defaults"))
+                    .clicked()
+                {
+                    app.effect_overrides.clear();
+                }
+            });
+        })
+        .should_close();
+    if modal {
+        app.show_effects_editor = false;
+    }
+}
+
+/// One skill row: Full/Reduced/Hidden selector plus the skill name. A row can
+/// control multiple effect folders for skills whose visuals are split across
+/// buff/explosion/etc. folders. Selecting Reduced removes all overrides.
+fn draw_effect_skill_row(app: &mut GuiApp, ui: &mut egui::Ui, idx: usize) {
+    let Some(catalog) = &app.effect_catalog else {
+        return;
+    };
+    let row = &catalog[idx];
+    let folders = row.folders.clone();
+    let display = row.display.clone();
+    let level = grouped_effect_level(app, &folders);
+    let mut new_level = level;
+    let hover = format!(
+        "{}\n{}\n{}",
+        row.active_skill_id,
+        row.action_type,
+        folders.join("\n")
+    );
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), COLOR_ROW_HEIGHT),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            for (label, value) in [
+                ("Full", EffectLevel::Full),
+                ("Reduced", EffectLevel::Reduced),
+                ("Hidden", EffectLevel::Hidden),
+            ] {
+                if ui.selectable_label(level == Some(value), label).clicked() {
+                    new_level = Some(value);
+                }
+            }
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(egui::RichText::new(&display).size(11.5).color(
+                    if level == Some(EffectLevel::Reduced) {
+                        palette::TEXT_MUTED
+                    } else {
+                        palette::TEXT
+                    },
+                ))
+                .truncate(),
+            )
+            .on_hover_text(hover);
+        },
+    );
+    if new_level != level {
+        if let Some(new_level) = new_level {
+            for folder in folders {
+                if new_level == EffectLevel::Reduced {
+                    app.effect_overrides.remove(&folder);
+                } else {
+                    app.effect_overrides.insert(folder, new_level);
+                }
+            }
+        }
+    }
+}
+
+fn grouped_effect_level(app: &GuiApp, folders: &[String]) -> Option<EffectLevel> {
+    let mut levels = folders.iter().map(|folder| {
+        app.effect_overrides
+            .get(folder)
+            .copied()
+            .unwrap_or_default()
+    });
+    let first = levels.next()?;
+    levels.all(|level| level == first).then_some(first)
 }
 
 /// Shows a modal with shared styling; returns true when it should close

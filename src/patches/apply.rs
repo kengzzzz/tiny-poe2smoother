@@ -1,6 +1,9 @@
 use super::catalog::{patch_label, PatchChange, PatchId, PatchParams, PatchSet};
 use super::color_mods::ColorMatcher;
-use super::targeting::{exact_patch_targets, patch_applies_path, patch_targets_path};
+use super::effect_skills::EffectsFilter;
+use super::targeting::{
+    effects_targets_path, exact_patch_targets, patch_applies_path, patch_targets_path,
+};
 use super::transform::{transform, TransformCtx};
 use crate::bundle::{BundleFile, BundleIndex, BundleStore};
 use anyhow::{anyhow, bail, Result};
@@ -17,11 +20,13 @@ pub fn compute_patch_set(
 
     let patches = unique_patches(patches);
     let color_matcher = ColorMatcher::new(&params.color_mods);
+    let effects_filter = EffectsFilter::new(&params.effect_skills);
     let ctx = TransformCtx {
         zoom: params.zoom,
         color: color_matcher.as_ref(),
+        effects: effects_filter.as_ref(),
     };
-    let candidates = collect_patch_targets(index, &patches)?;
+    let candidates = collect_patch_targets(index, &patches, effects_filter.as_ref())?;
     let candidates = dedup_candidates(candidates);
 
     crate::timing!("bundle_batch_read");
@@ -65,8 +70,15 @@ pub fn compute_patch_set(
 fn collect_patch_targets(
     index: &mut BundleIndex,
     patches: &[PatchId],
+    effects: Option<&EffectsFilter>,
 ) -> Result<Vec<(String, BundleFile)>> {
     let patches = unique_patches(patches);
+    // Effects is the one filter-aware patch: Full folders are never read,
+    // Hidden folders also pull in their `.epk`/`.pet`/`.trl` files.
+    let targets_path = |patch: PatchId, path: &str| match patch {
+        PatchId::Effects => effects_targets_path(path, effects),
+        _ => patch_targets_path(patch, path),
+    };
     let mut targets: HashMap<PatchId, Vec<(String, BundleFile)>> = patches
         .iter()
         .copied()
@@ -92,12 +104,10 @@ fn collect_patch_targets(
 
     if !broad_patches.is_empty() {
         for entry in index.matching_paths_by(|path| {
-            broad_patches
-                .iter()
-                .any(|patch| patch_targets_path(*patch, path))
+            broad_patches.iter().any(|patch| targets_path(*patch, path))
         })? {
             for patch in &broad_patches {
-                if patch_targets_path(*patch, &entry.path) {
+                if targets_path(*patch, &entry.path) {
                     targets
                         .entry(*patch)
                         .or_default()
@@ -111,6 +121,12 @@ fn collect_patch_targets(
     for &patch in &patches {
         let patch_targets = targets.remove(&patch).unwrap_or_default();
         if patch_targets.is_empty() {
+            if patch == PatchId::Effects && effects.is_some() {
+                bail!(
+                    "patch 'effects' matches no files: every skill effect is set to Full (keep);\n\
+                     change some skill levels in Edit skills… or deselect effects"
+                );
+            }
             bail!(
                 "patch '{}' has no matching files in this game version;\n\
                  verify game files or wait for a tiny-poe2smoother update",
@@ -258,7 +274,8 @@ mod tests {
         let mut index =
             BundleIndex::for_test_paths(&[("metadata/environmentsettings/test.env", "env", 12)]);
 
-        let candidates = collect_patch_targets(&mut index, &[PatchId::Fog, PatchId::Fog]).unwrap();
+        let candidates =
+            collect_patch_targets(&mut index, &[PatchId::Fog, PatchId::Fog], None).unwrap();
         let candidates = dedup_candidates(candidates);
 
         assert_eq!(candidates.len(), 1);
@@ -282,6 +299,7 @@ mod tests {
                 PatchId::Shadow,
                 PatchId::Light,
             ],
+            None,
         )
         .unwrap();
         let candidates = dedup_candidates(candidates);
@@ -303,7 +321,8 @@ mod tests {
         ]);
 
         let candidates =
-            collect_patch_targets(&mut index, &[PatchId::Minimap, PatchId::AtlasFog]).unwrap();
+            collect_patch_targets(&mut index, &[PatchId::Minimap, PatchId::AtlasFog], None)
+                .unwrap();
         let paths = candidates
             .into_iter()
             .map(|(path, _)| path)
@@ -323,7 +342,7 @@ mod tests {
         let mut index =
             BundleIndex::for_test_paths(&[("metadata/environmentsettings/test.env", "env", 12)]);
 
-        let err = collect_patch_targets(&mut index, &[PatchId::Minimap]).unwrap_err();
+        let err = collect_patch_targets(&mut index, &[PatchId::Minimap], None).unwrap_err();
 
         assert!(err
             .to_string()
@@ -364,6 +383,7 @@ mod tests {
                 PatchId::MonsterSounds,
                 PatchId::MtxSoft,
             ],
+            None,
         )
         .unwrap();
         let paths = dedup_candidates(candidates)
@@ -383,6 +403,125 @@ mod tests {
     }
 
     #[test]
+    fn per_skill_levels_filter_effect_target_collection() {
+        use super::super::effect_skills::{EffectLevel, EffectSkillOverride};
+
+        let mut index = BundleIndex::for_test_paths(&[
+            (
+                "metadata/effects/spells/cold_herald_of_ice/ao/ice_explosion.ao",
+                "effects",
+                12,
+            ),
+            (
+                "metadata/effects/spells/cold_herald_of_ice/epk/buff.epk",
+                "effects",
+                12,
+            ),
+            (
+                "metadata/effects/spells/cold_herald_of_ice/fx/burst.pet",
+                "effects",
+                12,
+            ),
+            (
+                "metadata/effects/spells/fireball/fireball.ao",
+                "effects",
+                12,
+            ),
+            ("metadata/effects/spells/arc_02/arc.aoc", "effects", 12),
+            ("metadata/effects/spells/arc_02/beam.trl", "effects", 12),
+        ]);
+        let filter = EffectsFilter::new(&[
+            EffectSkillOverride {
+                folder: "cold_herald_of_ice".to_string(),
+                level: EffectLevel::Hidden,
+            },
+            EffectSkillOverride {
+                folder: "fireball".to_string(),
+                level: EffectLevel::Full,
+            },
+        ])
+        .unwrap();
+
+        let candidates =
+            collect_patch_targets(&mut index, &[PatchId::Effects], Some(&filter)).unwrap();
+        let paths = dedup_candidates(candidates)
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect::<Vec<_>>();
+
+        // Hidden folders pull in their effect data files too.
+        for path in [
+            "metadata/effects/spells/cold_herald_of_ice/ao/ice_explosion.ao",
+            "metadata/effects/spells/cold_herald_of_ice/epk/buff.epk",
+            "metadata/effects/spells/cold_herald_of_ice/fx/burst.pet",
+            "metadata/effects/spells/arc_02/arc.aoc",
+        ] {
+            assert!(paths.contains(&path.to_string()), "missing: {path}");
+        }
+        // Full folders are never even read; unlisted folders keep the
+        // .ao/.aoc-only rule.
+        assert!(!paths.contains(&"metadata/effects/spells/fireball/fireball.ao".to_string()));
+        assert!(!paths.contains(&"metadata/effects/spells/arc_02/beam.trl".to_string()));
+    }
+
+    #[test]
+    fn full_skill_folders_still_flow_to_other_selected_patches() {
+        use super::super::effect_skills::{EffectLevel, EffectSkillOverride};
+
+        let mut index = BundleIndex::for_test_paths(&[
+            (
+                "metadata/effects/spells/fireball/fireball.ao",
+                "effects",
+                12,
+            ),
+            ("metadata/effects/spells/arc_02/arc.ao", "effects", 12),
+        ]);
+        let filter = EffectsFilter::new(&[EffectSkillOverride {
+            folder: "fireball".to_string(),
+            level: EffectLevel::Full,
+        }])
+        .unwrap();
+
+        let candidates = collect_patch_targets(
+            &mut index,
+            &[PatchId::Effects, PatchId::SkillSounds],
+            Some(&filter),
+        )
+        .unwrap();
+        let paths = dedup_candidates(candidates)
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect::<Vec<_>>();
+
+        // The Full folder's .ao is still collected via SkillSounds; the
+        // Effects transform itself passes it through unchanged (covered in
+        // transform.rs).
+        assert!(paths.contains(&"metadata/effects/spells/fireball/fireball.ao".to_string()));
+        assert!(paths.contains(&"metadata/effects/spells/arc_02/arc.ao".to_string()));
+    }
+
+    #[test]
+    fn all_full_effect_selection_reports_a_tailored_error() {
+        use super::super::effect_skills::{EffectLevel, EffectSkillOverride};
+
+        let mut index = BundleIndex::for_test_paths(&[(
+            "metadata/effects/spells/fireball/fireball.ao",
+            "effects",
+            12,
+        )]);
+        let filter = EffectsFilter::new(&[EffectSkillOverride {
+            folder: "fireball".to_string(),
+            level: EffectLevel::Full,
+        }])
+        .unwrap();
+
+        let err =
+            collect_patch_targets(&mut index, &[PatchId::Effects], Some(&filter)).unwrap_err();
+
+        assert!(err.to_string().contains("set to Full"));
+    }
+
+    #[test]
     fn sound_patch_skips_character_selection_assets() {
         let startup_scene =
             "Metadata/Terrain/CharacterSelection/CharacterSelectionGallows/Gallows_MainBuilding_fx.ao";
@@ -391,7 +530,8 @@ mod tests {
             ("metadata/terrain/trees/tree.ao", "terrain", 12),
         ]);
 
-        let candidates = collect_patch_targets(&mut index, &[PatchId::DisableSounds]).unwrap();
+        let candidates =
+            collect_patch_targets(&mut index, &[PatchId::DisableSounds], None).unwrap();
         let paths = dedup_candidates(candidates)
             .into_iter()
             .map(|(path, _)| path)
