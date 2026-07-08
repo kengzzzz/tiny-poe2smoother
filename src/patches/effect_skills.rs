@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 const SPELLS_PREFIX: &str = "metadata/effects/spells/";
+const MIN_LABEL_ALIAS_LEN: usize = 4;
 
 /// How the `Effects` patch treats one top-level skill folder under
 /// `metadata/effects/spells/`.
@@ -134,22 +135,13 @@ pub fn build_effect_skill_catalog(
     if let Some(bytes) = miscanimated_bytes {
         collect_miscanimated_catalog_candidates(bytes, &skills, &valid_folders, &mut candidates);
     }
+    collect_folder_name_catalog_candidates(&skills, &valid_folders, &mut candidates);
 
     let mut by_skill: BTreeMap<String, EffectSkillCatalogEntry> = BTreeMap::new();
     for (folder, skill_candidates) in candidates {
-        let best = skill_candidates
-            .values()
-            .map(|candidate| candidate.confidence)
-            .max()?;
-        let mut best_candidates = skill_candidates
-            .values()
-            .filter(|candidate| candidate.confidence == best);
-        let Some(candidate) = best_candidates.next() else {
+        let Some(candidate) = select_folder_candidate(&folder, &skill_candidates) else {
             continue;
         };
-        if best_candidates.next().is_some() {
-            continue;
-        }
 
         let row = by_skill
             .entry(candidate.active_skill_id.clone())
@@ -186,10 +178,49 @@ struct ActiveSkillEffectRow {
     action_key: String,
 }
 
+impl ActiveSkillEffectRow {
+    fn label_aliases(&self) -> Vec<(String, AliasRank)> {
+        let mut aliases = Vec::new();
+        push_unique_alias(&mut aliases, self.action_key.clone(), AliasRank::Action);
+        push_min_len_alias(
+            &mut aliases,
+            normalize_label_key(&self.display),
+            AliasRank::Display,
+        );
+        push_min_len_alias(
+            &mut aliases,
+            normalize_label_key(&self.active_skill_id),
+            AliasRank::Id,
+        );
+        if self.action_type.ends_with("New") {
+            if let Some(stripped) = self.action_key.strip_suffix("new") {
+                push_min_len_alias(&mut aliases, stripped.to_string(), AliasRank::Action);
+            }
+        }
+        aliases
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum AliasRank {
+    Id,
+    Display,
+    Action,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum EvidenceConfidence {
+    FolderName,
     Medium,
     High,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum FolderNameMatch {
+    None,
+    Affix,
+    StrongAffix,
+    Exact,
 }
 
 #[derive(Debug)]
@@ -198,6 +229,39 @@ struct FolderCandidate {
     display: String,
     action_type: String,
     confidence: EvidenceConfidence,
+    alias_rank: AliasRank,
+    match_len: usize,
+    folder_match: FolderNameMatch,
+}
+
+impl FolderCandidate {
+    fn score(&self) -> (u8, FolderNameMatch, usize) {
+        candidate_score(
+            self.confidence,
+            self.alias_rank,
+            self.folder_match,
+            self.match_len,
+        )
+    }
+}
+
+fn candidate_score(
+    confidence: EvidenceConfidence,
+    alias_rank: AliasRank,
+    folder_match: FolderNameMatch,
+    match_len: usize,
+) -> (u8, FolderNameMatch, usize) {
+    let source_rank = match (confidence, alias_rank, folder_match) {
+        (EvidenceConfidence::High, _, _) => 6,
+        (EvidenceConfidence::FolderName, _, FolderNameMatch::Exact) => 5,
+        (EvidenceConfidence::FolderName, _, FolderNameMatch::StrongAffix) => 4,
+        (EvidenceConfidence::Medium, AliasRank::Action, _) => 3,
+        (EvidenceConfidence::FolderName, _, FolderNameMatch::Affix) => 2,
+        (EvidenceConfidence::Medium, AliasRank::Display, _) => 1,
+        (EvidenceConfidence::Medium, AliasRank::Id, _) => 0,
+        (EvidenceConfidence::FolderName, _, FolderNameMatch::None) => 0,
+    };
+    (source_rank, folder_match, match_len)
 }
 
 fn active_skills_with_actions(
@@ -255,7 +319,15 @@ fn collect_itemvisual_catalog_candidates(
         };
         for folder in effect_folders_in_row(row, heap, valid_folders) {
             for skill in skills {
-                insert_folder_candidate(candidates, &folder, skill, EvidenceConfidence::High);
+                insert_folder_candidate(
+                    candidates,
+                    &folder,
+                    skill,
+                    EvidenceConfidence::High,
+                    AliasRank::Action,
+                    action_key.len(),
+                    FolderNameMatch::None,
+                );
             }
         }
     }
@@ -270,6 +342,10 @@ fn collect_miscanimated_catalog_candidates(
     let Some(table) = parse_table(bytes) else {
         return;
     };
+    let skill_aliases: Vec<_> = skills
+        .iter()
+        .map(|skill| (skill, skill.label_aliases()))
+        .collect();
     let heap = table.heap();
     for row in table.rows() {
         let Some(label) = row
@@ -285,14 +361,99 @@ fn collect_miscanimated_catalog_candidates(
         if folders.is_empty() {
             continue;
         }
-        for skill in skills {
-            if !label_key.starts_with(&skill.action_key) {
+        for (skill, aliases) in &skill_aliases {
+            if skill.action_key == "donothing" {
                 continue;
             }
+            let Some(match_len) = aliases
+                .iter()
+                .filter(|(alias, _)| label_key.starts_with(alias))
+                .map(|(alias, rank)| (alias.len(), *rank))
+                .max()
+            else {
+                continue;
+            };
             for folder in &folders {
-                insert_folder_candidate(candidates, folder, skill, EvidenceConfidence::Medium);
+                insert_folder_candidate(
+                    candidates,
+                    folder,
+                    skill,
+                    EvidenceConfidence::Medium,
+                    match_len.1,
+                    match_len.0,
+                    FolderNameMatch::None,
+                );
             }
         }
+    }
+}
+
+fn collect_folder_name_catalog_candidates(
+    skills: &[ActiveSkillEffectRow],
+    valid_folders: &BTreeSet<String>,
+    candidates: &mut BTreeMap<String, BTreeMap<String, FolderCandidate>>,
+) {
+    let skill_display_keys: Vec<_> = skills
+        .iter()
+        .filter_map(|skill| {
+            let display_key = normalize_label_key(&skill.display);
+            (!display_key.is_empty()).then_some((skill, display_key))
+        })
+        .collect();
+    for folder in valid_folders {
+        let folder_key = normalize_label_key(folder);
+        if folder_key.is_empty() {
+            continue;
+        }
+        for (skill, display_key) in &skill_display_keys {
+            if skill.action_key == "donothing" {
+                continue;
+            }
+            let id_key = normalize_label_key(&skill.active_skill_id);
+            let Some((folder_match, match_len)) =
+                folder_name_match(display_key, &id_key, &folder_key)
+            else {
+                continue;
+            };
+            if folder_match == FolderNameMatch::Affix && match_len < 6 {
+                continue;
+            }
+            {
+                insert_folder_candidate(
+                    candidates,
+                    folder,
+                    skill,
+                    EvidenceConfidence::FolderName,
+                    AliasRank::Display,
+                    match_len,
+                    folder_match,
+                );
+            }
+        }
+    }
+}
+
+fn folder_name_match(
+    display_key: &str,
+    id_key: &str,
+    folder_key: &str,
+) -> Option<(FolderNameMatch, usize)> {
+    if display_key == folder_key {
+        Some((FolderNameMatch::Exact, display_key.len()))
+    } else if display_key.ends_with(folder_key) || folder_key.ends_with(display_key) {
+        let match_kind = if id_key == folder_key
+            || id_key.ends_with(folder_key)
+            || folder_key.ends_with(id_key)
+            || id_key.starts_with(folder_key)
+            || folder_key.starts_with(id_key)
+        {
+            FolderNameMatch::StrongAffix
+        } else {
+            FolderNameMatch::Affix
+        };
+        Some((match_kind, display_key.len().min(folder_key.len())))
+    } else {
+        None
     }
 }
 
@@ -326,20 +487,101 @@ fn insert_folder_candidate(
     folder: &str,
     skill: &ActiveSkillEffectRow,
     confidence: EvidenceConfidence,
+    alias_rank: AliasRank,
+    match_len: usize,
+    folder_match: FolderNameMatch,
 ) {
     candidates
         .entry(folder.to_string())
         .or_default()
         .entry(skill.active_skill_id.clone())
         .and_modify(|candidate| {
-            candidate.confidence = candidate.confidence.max(confidence);
+            let incoming_score = candidate_score(confidence, alias_rank, folder_match, match_len);
+            if incoming_score > candidate.score() {
+                candidate.confidence = confidence;
+                candidate.alias_rank = alias_rank;
+                candidate.match_len = match_len;
+                candidate.folder_match = folder_match;
+            }
         })
         .or_insert_with(|| FolderCandidate {
             active_skill_id: skill.active_skill_id.clone(),
             display: skill.display.clone(),
             action_type: skill.action_type.clone(),
             confidence,
+            alias_rank,
+            match_len,
+            folder_match,
         });
+}
+
+fn select_folder_candidate<'a>(
+    folder: &str,
+    skill_candidates: &'a BTreeMap<String, FolderCandidate>,
+) -> Option<&'a FolderCandidate> {
+    let best_score = skill_candidates
+        .values()
+        .map(FolderCandidate::score)
+        .max()?;
+    let best_candidates: Vec<_> = skill_candidates
+        .values()
+        .filter(|candidate| candidate.score() == best_score)
+        .collect();
+    match best_candidates.as_slice() {
+        [] => None,
+        [candidate] => Some(*candidate),
+        _ => select_same_display_candidate(folder, &best_candidates),
+    }
+}
+
+fn select_same_display_candidate<'a>(
+    folder: &str,
+    candidates: &[&'a FolderCandidate],
+) -> Option<&'a FolderCandidate> {
+    let display = &candidates.first()?.display;
+    if candidates
+        .iter()
+        .any(|candidate| candidate.display != *display)
+    {
+        return None;
+    }
+
+    let folder_key = normalize_label_key(folder);
+    candidates.iter().copied().min_by(|a, b| {
+        same_display_tiebreak_key(a, &folder_key).cmp(&same_display_tiebreak_key(b, &folder_key))
+    })
+}
+
+fn same_display_tiebreak_key<'a>(
+    candidate: &'a FolderCandidate,
+    folder_key: &str,
+) -> (u8, u8, usize, &'a str) {
+    let id_key = normalize_label_key(&candidate.active_skill_id);
+    let folder_relation = if id_key == folder_key {
+        0
+    } else if id_key.ends_with(folder_key)
+        || folder_key.ends_with(&id_key)
+        || id_key.starts_with(folder_key)
+        || folder_key.starts_with(&id_key)
+    {
+        1
+    } else {
+        2
+    };
+    let variant_penalty = if candidate.active_skill_id.starts_with("new_")
+        || candidate.active_skill_id.ends_with("_new")
+        || candidate.active_skill_id.contains("_new_")
+    {
+        1
+    } else {
+        0
+    };
+    (
+        folder_relation,
+        variant_penalty,
+        candidate.active_skill_id.len(),
+        candidate.active_skill_id.as_str(),
+    )
 }
 
 pub const ACTIVESKILLS_DATC64_PATH: &str = "data/balance/activeskills.datc64";
@@ -482,6 +724,24 @@ fn normalize_label_key(s: &str) -> String {
 fn push_unique(values: &mut Vec<String>, value: String) {
     if !values.iter().any(|existing| existing == &value) {
         values.push(value);
+    }
+}
+
+fn push_unique_alias(values: &mut Vec<(String, AliasRank)>, value: String, rank: AliasRank) {
+    if value.is_empty() {
+        return;
+    }
+    match values.iter_mut().find(|(existing, _)| existing == &value) {
+        Some((_, existing_rank)) => {
+            *existing_rank = (*existing_rank).max(rank);
+        }
+        None => values.push((value, rank)),
+    }
+}
+
+fn push_min_len_alias(values: &mut Vec<(String, AliasRank)>, value: String, rank: AliasRank) {
+    if value.len() >= MIN_LABEL_ALIAS_LEN {
+        push_unique_alias(values, value, rank);
     }
 }
 
@@ -700,6 +960,15 @@ mod tests {
         paths.iter().map(|path| path.to_string()).collect()
     }
 
+    fn row<'a>(
+        rows: &'a [EffectSkillCatalogEntry],
+        active_skill_id: &str,
+    ) -> &'a EffectSkillCatalogEntry {
+        rows.iter()
+            .find(|row| row.active_skill_id == active_skill_id)
+            .unwrap()
+    }
+
     fn push_utf16(heap: &mut Vec<u8>, s: &str) -> u64 {
         let offset = heap.len() as u64;
         for unit in s.encode_utf16() {
@@ -707,6 +976,28 @@ mod tests {
         }
         heap.extend_from_slice(&0u16.to_le_bytes());
         offset
+    }
+
+    #[test]
+    fn effect_catalog_returns_empty_when_no_effect_folders_exist() {
+        let activeskills = build_activeskills_with_actions(&[("ice_shot", "Ice Shot", 0)]);
+        let actiontypes = build_actiontypes_bytes(&["IceShot"]);
+        let miscanimated = build_miscanimated_bytes(&[(
+            "IceShotCone",
+            "Metadata/Effects/Spells/bow_ice_shot/cone_impact.ao",
+        )]);
+        let paths = effect_paths(&["metadata/effects/spells/bow_ice_shot/readme.txt"]);
+
+        let rows = build_effect_skill_catalog(
+            &activeskills,
+            &actiontypes,
+            None,
+            Some(&miscanimated),
+            &paths,
+        )
+        .unwrap();
+
+        assert!(rows.is_empty());
     }
 
     #[test]
@@ -796,9 +1087,14 @@ mod tests {
         )]);
         let paths = effect_paths(&["metadata/effects/spells/bow_ice_shot/cone_impact.ao"]);
 
-        let rows =
-            build_effect_skill_catalog(&activeskills, &actiontypes, None, Some(&miscanimated), &paths)
-                .unwrap();
+        let rows = build_effect_skill_catalog(
+            &activeskills,
+            &actiontypes,
+            None,
+            Some(&miscanimated),
+            &paths,
+        )
+        .unwrap();
 
         // Without the fix, "broken" (empty action_key) also matches "IceShotCone",
         // making bow_ice_shot ambiguous and the result empty.
@@ -829,6 +1125,266 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].active_skill_id, "freezing_salvo");
         assert_eq!(rows[0].folders, vec!["bow_freezingsalvo".to_string()]);
+    }
+
+    #[test]
+    fn effect_catalog_uses_active_skill_alias_before_shorter_stale_action() {
+        let activeskills = build_activeskills_with_actions(&[
+            ("elemental_storm", "Elemental Storm", 0),
+            ("tornado_shot", "Tornado Shot", 1),
+        ]);
+        let actiontypes = build_actiontypes_bytes(&["Tornado", "TornadoShotNew"]);
+        let miscanimated = build_miscanimated_bytes(&[(
+            "TornadoShotImpact",
+            "Metadata/Effects/Spells/bow_tornado_shot/impact.ao",
+        )]);
+        let paths = effect_paths(&["metadata/effects/spells/bow_tornado_shot/impact.ao"]);
+
+        let rows = build_effect_skill_catalog(
+            &activeskills,
+            &actiontypes,
+            None,
+            Some(&miscanimated),
+            &paths,
+        )
+        .unwrap();
+
+        assert_eq!(
+            row(&rows, "tornado_shot").folders,
+            vec!["bow_tornado_shot".to_string()]
+        );
+        assert!(!rows
+            .iter()
+            .any(|row| row.active_skill_id == "elemental_storm"));
+    }
+
+    #[test]
+    fn effect_catalog_does_not_strip_bare_new_from_action_words() {
+        let activeskills = build_activeskills_with_actions(&[("renew", "Renew", 0)]);
+        let actiontypes = build_actiontypes_bytes(&["Renew"]);
+        let miscanimated = build_miscanimated_bytes(&[(
+            "ReImpact",
+            "Metadata/Effects/Spells/re_impact/impact.ao",
+        )]);
+        let paths = effect_paths(&["metadata/effects/spells/re_impact/impact.ao"]);
+
+        let rows = build_effect_skill_catalog(
+            &activeskills,
+            &actiontypes,
+            None,
+            Some(&miscanimated),
+            &paths,
+        )
+        .unwrap();
+
+        let aliases = ActiveSkillEffectRow {
+            active_skill_id: "renew".to_string(),
+            display: "Renew".to_string(),
+            action_type: "Renew".to_string(),
+            action_key: "renew".to_string(),
+        }
+        .label_aliases();
+        assert!(!aliases.iter().any(|(alias, _)| alias == "re"));
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn effect_catalog_ignores_empty_display_key_for_folder_name_fallback() {
+        let activeskills = build_activeskills_with_actions(&[("empty_display", "???", 0)]);
+        let actiontypes = build_actiontypes_bytes(&["Placeholder"]);
+        let paths = effect_paths(&["metadata/effects/spells/empty_display/rig.ao"]);
+
+        let rows =
+            build_effect_skill_catalog(&activeskills, &actiontypes, None, None, &paths).unwrap();
+
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn effect_catalog_ignores_short_display_aliases_for_animation_labels() {
+        let activeskills = build_activeskills_with_actions(&[("short_display", "Re", 0)]);
+        let actiontypes = build_actiontypes_bytes(&["Placeholder"]);
+        let miscanimated = build_miscanimated_bytes(&[(
+            "ReImpact",
+            "Metadata/Effects/Spells/re_impact/impact.ao",
+        )]);
+        let paths = effect_paths(&["metadata/effects/spells/re_impact/impact.ao"]);
+
+        let rows = build_effect_skill_catalog(
+            &activeskills,
+            &actiontypes,
+            None,
+            Some(&miscanimated),
+            &paths,
+        )
+        .unwrap();
+
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn effect_catalog_keeps_active_skill_visible_and_uses_folder_name_fallback() {
+        let activeskills = build_activeskills_with_actions(&[
+            ("tempest_flurry", "Tempest Flurry", 0),
+            ("charged_attack_channel", "Blade Flurry", 1),
+        ]);
+        let actiontypes = build_actiontypes_bytes(&["TempestFlurry", "DoNothing"]);
+        let miscanimated =
+            build_miscanimated_bytes(&[("BladeFlurry", "Metadata/Effects/Spells/flurry/rig.ao")]);
+        let paths = effect_paths(&["metadata/effects/spells/flurry/rig.ao"]);
+
+        let rows = build_effect_skill_catalog(
+            &activeskills,
+            &actiontypes,
+            None,
+            Some(&miscanimated),
+            &paths,
+        )
+        .unwrap();
+
+        assert_eq!(
+            row(&rows, "tempest_flurry").folders,
+            vec!["flurry".to_string()]
+        );
+        assert!(!rows
+            .iter()
+            .any(|row| row.active_skill_id == "charged_attack_channel"));
+    }
+
+    #[test]
+    fn effect_catalog_prefers_action_alias_over_duplicate_display_alias() {
+        let activeskills = build_activeskills_with_actions(&[
+            ("avian_tornado", "Twister", 0),
+            ("twister", "Twister", 1),
+        ]);
+        let actiontypes = build_actiontypes_bytes(&["Spark", "Twister"]);
+        let miscanimated = build_miscanimated_bytes(&[(
+            "TwisterChilled",
+            "Metadata/Effects/Spells/spear_tornadoes/twister.ao",
+        )]);
+        let paths = effect_paths(&["metadata/effects/spells/spear_tornadoes/twister.ao"]);
+
+        let rows = build_effect_skill_catalog(
+            &activeskills,
+            &actiontypes,
+            None,
+            Some(&miscanimated),
+            &paths,
+        )
+        .unwrap();
+
+        assert_eq!(
+            row(&rows, "twister").folders,
+            vec!["spear_tornadoes".to_string()]
+        );
+        assert!(!rows
+            .iter()
+            .any(|row| row.active_skill_id == "avian_tornado"));
+        let twister_rows: Vec<_> = rows
+            .iter()
+            .filter(|row| row.display == "Twister")
+            .map(|row| row.active_skill_id.as_str())
+            .collect();
+        assert_eq!(twister_rows, vec!["twister"]);
+    }
+
+    #[test]
+    fn effect_catalog_does_not_let_generic_folder_name_steal_action_match() {
+        let activeskills = build_activeskills_with_actions(&[
+            ("earthquake", "Earthquake", 0),
+            ("companion_bear_slam", "Slam", 1),
+        ]);
+        let actiontypes = build_actiontypes_bytes(&["QuakeSlam", "BearCompanionSlam"]);
+        let miscanimated = build_miscanimated_bytes(&[(
+            "QuakeSlamCrack",
+            "Metadata/Effects/Spells/quake_slam/crack.ao",
+        )]);
+        let paths = effect_paths(&["metadata/effects/spells/quake_slam/crack.ao"]);
+
+        let rows = build_effect_skill_catalog(
+            &activeskills,
+            &actiontypes,
+            None,
+            Some(&miscanimated),
+            &paths,
+        )
+        .unwrap();
+
+        assert_eq!(
+            row(&rows, "earthquake").folders,
+            vec!["quake_slam".to_string()]
+        );
+        assert!(!rows
+            .iter()
+            .any(|row| row.active_skill_id == "companion_bear_slam"));
+    }
+
+    #[test]
+    fn effect_catalog_prefers_exact_folder_name_over_longer_affix_match() {
+        let activeskills = build_activeskills_with_actions(&[
+            ("barrage", "Barrage", 0),
+            ("oil_barrage", "Oil Barrage", 1),
+        ]);
+        let actiontypes = build_actiontypes_bytes(&["Barrage", "ElectricSpit"]);
+        let paths = effect_paths(&["metadata/effects/spells/barrage/rig.ao"]);
+
+        let rows =
+            build_effect_skill_catalog(&activeskills, &actiontypes, None, None, &paths).unwrap();
+
+        assert_eq!(row(&rows, "barrage").folders, vec!["barrage".to_string()]);
+        assert!(!rows.iter().any(|row| row.active_skill_id == "oil_barrage"));
+    }
+
+    #[test]
+    fn effect_catalog_collapses_same_display_tie_deterministically() {
+        let activeskills = build_activeskills_with_actions(&[
+            ("lightning_strike", "Lightning Strike", 0),
+            ("new_lightning_strike", "Lightning Strike", 1),
+        ]);
+        let actiontypes = build_actiontypes_bytes(&["LightningStrike", "NewLightningStrike"]);
+        let paths = effect_paths(&["metadata/effects/spells/lightning_strike/rig.ao"]);
+
+        let rows =
+            build_effect_skill_catalog(&activeskills, &actiontypes, None, None, &paths).unwrap();
+
+        assert_eq!(
+            row(&rows, "lightning_strike").folders,
+            vec!["lightning_strike".to_string()]
+        );
+        assert!(!rows
+            .iter()
+            .any(|row| row.active_skill_id == "new_lightning_strike"));
+    }
+
+    #[test]
+    fn effect_catalog_keeps_different_display_tie_ambiguous() {
+        let activeskills = build_activeskills_with_actions(&[
+            ("fireball", "Fireball", 0),
+            ("iceblast", "Iceblast", 1),
+        ]);
+        let actiontypes = build_actiontypes_bytes(&["Fireball", "Iceblast"]);
+        let itemvisual = build_item_visual_effect_bytes(&[
+            (
+                "Skill_Fireball",
+                "Metadata/Effects/Spells/supports/shared.ao",
+            ),
+            (
+                "Skill_Iceblast",
+                "Metadata/Effects/Spells/supports/shared.ao",
+            ),
+        ]);
+        let paths = effect_paths(&["metadata/effects/spells/supports/shared.ao"]);
+
+        let rows = build_effect_skill_catalog(
+            &activeskills,
+            &actiontypes,
+            Some(&itemvisual),
+            None,
+            &paths,
+        )
+        .unwrap();
+
+        assert!(rows.is_empty());
     }
 
     #[test]
@@ -886,8 +1442,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].active_skill_id, "firebolt");
-        assert_eq!(rows[0].folders, vec!["fire_fireball".to_string()]);
+        assert_eq!(
+            row(&rows, "firebolt").folders,
+            vec!["fire_fireball".to_string()]
+        );
+        assert!(!rows.iter().any(|row| row.active_skill_id == "fireball"));
     }
 
     #[test]
@@ -947,7 +1506,10 @@ mod tests {
         assert_eq!(table.row_len, 16);
         let first = table.rows().next().unwrap();
         let off = u64::from_le_bytes(first[0..8].try_into().unwrap()) as usize;
-        assert_eq!(utf16le_string_at(table.heap(), off).as_deref(), Some("Hello"));
+        assert_eq!(
+            utf16le_string_at(table.heap(), off).as_deref(),
+            Some("Hello")
+        );
     }
 
     #[test]
