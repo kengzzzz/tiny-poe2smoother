@@ -223,11 +223,15 @@ fn active_skills_with_actions(
         let Some(action_type) = action_types.get(action_idx).filter(|s| !s.is_empty()) else {
             continue;
         };
+        let action_key = normalize_label_key(action_type);
+        if action_key.is_empty() {
+            continue;
+        }
         skills.push(ActiveSkillEffectRow {
             active_skill_id,
             display: display.clone(),
             action_type: action_type.clone(),
-            action_key: normalize_label_key(action_type),
+            action_key,
         });
     }
     (!skills.is_empty()).then_some(skills)
@@ -773,6 +777,31 @@ mod tests {
         assert_eq!(rows[0].display, "Ice Shot");
         assert_eq!(rows[0].action_type, "IceShot");
         assert_eq!(rows[0].folders, vec!["bow_ice_shot".to_string()]);
+    }
+
+    #[test]
+    fn malformed_action_type_does_not_make_folders_ambiguous() {
+        // "ice_shot" resolves normally; "broken" has action type "_" which
+        // normalizes to "" and must not match every label.
+        let activeskills = build_activeskills_with_actions(&[
+            ("ice_shot", "Ice Shot", 0),
+            ("broken", "Broken Skill", 1),
+        ]);
+        let actiontypes = build_actiontypes_bytes(&["IceShot", "_"]);
+        let miscanimated = build_miscanimated_bytes(&[(
+            "IceShotCone",
+            "Metadata/Effects/Spells/bow_ice_shot/cone_impact.ao",
+        )]);
+        let paths = effect_paths(&["metadata/effects/spells/bow_ice_shot/cone_impact.ao"]);
+
+        let rows =
+            build_effect_skill_catalog(&activeskills, &actiontypes, None, Some(&miscanimated), &paths)
+                .unwrap();
+
+        // Without the fix, "broken" (empty action_key) also matches "IceShotCone",
+        // making bow_ice_shot ambiguous and the result empty.
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].active_skill_id, "ice_shot");
     }
 
     #[test]
