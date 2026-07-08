@@ -395,17 +395,30 @@ fn parse_table(bytes: &[u8]) -> Option<DatTable<'_>> {
     if row_count == 0 {
         return None;
     }
-    let marker_pos = bytes
-        .windows(ACTIVESKILLS_ROW_MARKER.len())
-        .position(|w| w == ACTIVESKILLS_ROW_MARKER)?;
+    // The heap marker is 0xBB×8 -- the same bytes a future fixed-row field
+    // could hold (e.g. two adjacent 0xBBBBBBBB sentinels). Accept a candidate
+    // only when the preceding block splits cleanly into rows of >=8 bytes;
+    // otherwise it's a false positive inside row data, so keep scanning.
+    let marker_pos = {
+        let mut pos = None;
+        let mut search_from = 4; // offsets 0..4 are the row_count header
+        while let Some(rel) = bytes.get(search_from..).and_then(|s| {
+            s.windows(ACTIVESKILLS_ROW_MARKER.len())
+                .position(|w| w == ACTIVESKILLS_ROW_MARKER)
+        }) {
+            let candidate = search_from + rel;
+            let block_len = candidate - 4;
+            if block_len % row_count == 0 && block_len / row_count >= 8 {
+                pos = Some(candidate);
+                break;
+            }
+            search_from = candidate + 1; // step by 1: 0xBB runs can overlap
+        }
+        pos?
+    };
+    // `marker_pos - 4` divides evenly into >=8-byte rows by construction above.
     let row_block = bytes.get(4..marker_pos)?;
-    if row_block.len() % row_count != 0 {
-        return None;
-    }
     let row_len = row_block.len() / row_count;
-    if row_len < 8 {
-        return None;
-    }
     let heap = bytes.get(marker_pos..)?;
     Some(DatTable {
         row_count,
@@ -492,9 +505,11 @@ fn push_unique(values: &mut Vec<String>, value: String) {
 fn utf16le_string_at(heap: &[u8], offset: usize) -> Option<String> {
     let mut units = Vec::new();
     let mut i = offset;
+    let mut terminated = false;
     while i + 1 < heap.len() {
         let unit = u16::from_le_bytes([heap[i], heap[i + 1]]);
         if unit == 0 {
+            terminated = true;
             break;
         }
         units.push(unit);
@@ -503,7 +518,8 @@ fn utf16le_string_at(heap: &[u8], offset: usize) -> Option<String> {
             return None;
         }
     }
-    if units.is_empty() {
+    // A run that reaches end-of-heap without a NUL isn't a real string pointer.
+    if !terminated || units.is_empty() {
         return None;
     }
     String::from_utf16(&units).ok()
@@ -920,5 +936,45 @@ mod tests {
         .unwrap();
 
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn parse_table_skips_false_marker_inside_row_data() {
+        // 3 rows x 16 bytes. Row 0's second field is the heap marker's own
+        // bytes (0xBB x8) -- a decoy a naive first-match scan would mistake for
+        // the heap boundary. It sits at file offset 12, giving block_len 8 and
+        // 8 % 3 != 0, so it's rejected; the real marker is at 4 + 3*16 = 52.
+        let mut heap = ACTIVESKILLS_ROW_MARKER.to_vec();
+        let hello_off = push_utf16(&mut heap, "Hello");
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        // row 0: real string offset, then the decoy marker
+        bytes.extend_from_slice(&hello_off.to_le_bytes());
+        bytes.extend_from_slice(&ACTIVESKILLS_ROW_MARKER);
+        // rows 1 and 2: empty
+        bytes.extend_from_slice(&[0u8; 32]);
+        bytes.extend_from_slice(&heap);
+
+        let table = parse_table(&bytes).expect("real marker found past the decoy");
+        assert_eq!(table.row_count, 3);
+        assert_eq!(table.row_len, 16);
+        let first = table.rows().next().unwrap();
+        let off = u64::from_le_bytes(first[0..8].try_into().unwrap()) as usize;
+        assert_eq!(utf16le_string_at(table.heap(), off).as_deref(), Some("Hello"));
+    }
+
+    #[test]
+    fn utf16le_string_at_requires_terminator() {
+        let mut terminated = Vec::new();
+        for unit in "Hi".encode_utf16() {
+            terminated.extend_from_slice(&unit.to_le_bytes());
+        }
+        // A properly NUL-terminated run still resolves.
+        let mut with_nul = terminated.clone();
+        with_nul.extend_from_slice(&0u16.to_le_bytes());
+        assert_eq!(utf16le_string_at(&with_nul, 0).as_deref(), Some("Hi"));
+        // The same bytes without a terminator run off the end of the heap.
+        assert_eq!(utf16le_string_at(&terminated, 0), None);
     }
 }
