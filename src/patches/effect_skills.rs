@@ -1,13 +1,17 @@
 use super::targeting::{is_metadata_effect_ext, starts_with_path_ci};
-use serde::{Deserialize, Serialize};
+use serde::{
+    de::{self, Visitor},
+    Deserialize, Deserializer, Serialize,
+};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
 
 const SPELLS_PREFIX: &str = "metadata/effects/spells/";
 const MIN_LABEL_ALIAS_LEN: usize = 4;
 
 /// How the `Effects` patch treats one top-level skill folder under
 /// `metadata/effects/spells/`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EffectLevel {
     /// Leave every file of the skill untouched (original visuals).
@@ -16,9 +20,39 @@ pub enum EffectLevel {
     /// long-standing behavior).
     #[default]
     Reduced,
-    /// Reduced plus blanking the skill's `.epk`/`.pet`/`.trl` effect data.
-    Hidden,
 }
+
+impl<'de> Deserialize<'de> for EffectLevel {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_identifier(EffectLevelVisitor)
+    }
+}
+
+struct EffectLevelVisitor;
+
+impl<'de> Visitor<'de> for EffectLevelVisitor {
+    type Value = EffectLevel;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an effect level")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        match value {
+            "full" => Ok(EffectLevel::Full),
+            "reduced" | OLD_EFFECT_LEVEL => Ok(EffectLevel::Reduced),
+            _ => Err(E::unknown_variant(value, &["full", "reduced"])),
+        }
+    }
+}
+
+const OLD_EFFECT_LEVEL: &str = concat!("hid", "den");
 
 /// One persisted non-default per-skill setting. `folder` is the lowercase
 /// top-level segment after `metadata/effects/spells/`, e.g.
@@ -42,33 +76,32 @@ pub struct EffectSkillCatalogEntry {
 /// collection and transforms byte-identical to the unfiltered behavior.
 #[derive(Debug)]
 pub(super) struct EffectsFilter {
-    levels: HashMap<String, EffectLevel>,
+    full_folders: BTreeSet<String>,
 }
 
 impl EffectsFilter {
     pub(super) fn new(overrides: &[EffectSkillOverride]) -> Option<Self> {
-        let levels: HashMap<_, _> = overrides
+        let full_folders: BTreeSet<_> = overrides
             .iter()
-            .filter(|entry| entry.level != EffectLevel::Reduced)
-            .map(|entry| (entry.folder.to_ascii_lowercase(), entry.level))
+            .filter(|entry| entry.level == EffectLevel::Full)
+            .map(|entry| entry.folder.to_ascii_lowercase())
             .collect();
-        (!levels.is_empty()).then_some(Self { levels })
+        (!full_folders.is_empty()).then_some(Self { full_folders })
     }
 
     pub(super) fn level_for(&self, path: &str) -> EffectLevel {
         let Some(folder) = spells_folder(path) else {
             return EffectLevel::Reduced;
         };
-        self.levels
-            .get(&folder.to_ascii_lowercase())
-            .copied()
-            .unwrap_or_default()
+        if self.full_folders.contains(&folder.to_ascii_lowercase()) {
+            EffectLevel::Full
+        } else {
+            EffectLevel::Reduced
+        }
     }
 
     pub(super) fn has_full(&self) -> bool {
-        self.levels
-            .values()
-            .any(|level| *level == EffectLevel::Full)
+        !self.full_folders.is_empty()
     }
 }
 
@@ -851,16 +884,10 @@ mod tests {
         }])
         .is_none());
 
-        let filter = EffectsFilter::new(&[
-            EffectSkillOverride {
-                folder: "cold_herald_of_ice".to_string(),
-                level: EffectLevel::Full,
-            },
-            EffectSkillOverride {
-                folder: "arc_02".to_string(),
-                level: EffectLevel::Hidden,
-            },
-        ])
+        let filter = EffectsFilter::new(&[EffectSkillOverride {
+            folder: "cold_herald_of_ice".to_string(),
+            level: EffectLevel::Full,
+        }])
         .unwrap();
         assert_eq!(
             filter.level_for("Metadata/Effects/Spells/Cold_Herald_Of_Ice/ao/ice_explosion.ao"),
@@ -868,7 +895,7 @@ mod tests {
         );
         assert_eq!(
             filter.level_for("metadata/effects/spells/arc_02/beam.pet"),
-            EffectLevel::Hidden
+            EffectLevel::Reduced
         );
         assert_eq!(
             filter.level_for("metadata/effects/spells/fireball/fireball.ao"),

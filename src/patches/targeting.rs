@@ -132,8 +132,7 @@ pub(super) fn patch_targets_path(patch: PatchId, path: &str) -> bool {
 
 /// Filter-aware target predicate for `Effects`. Without a filter this is the
 /// long-standing rule (`.ao`/`.aoc` under spells). With one, `Full` folders
-/// drop out entirely and `Hidden` folders additionally pull in their
-/// `.epk`/`.pet`/`.trl` effect data for blanking.
+/// drop out entirely.
 pub(super) fn effects_targets_path(path: &str, filter: Option<&EffectsFilter>) -> bool {
     if !starts_with_path_ci(path, "metadata/effects/spells") {
         return false;
@@ -145,7 +144,6 @@ pub(super) fn effects_targets_path(path: &str, filter: Option<&EffectsFilter>) -
     match filter.level_for(path) {
         EffectLevel::Full => false,
         EffectLevel::Reduced => is_anim,
-        EffectLevel::Hidden => is_metadata_effect_ext(path),
     }
 }
 
@@ -178,11 +176,7 @@ pub(super) fn patch_applies_path(patch: PatchId, path: &str) -> bool {
             starts_with_path_ci(path, "metadata/particles")
                 && (ends_with_path_ci(path, ".pet") || ends_with_path_ci(path, ".trl"))
         }
-        // Broader than the target rule so Hidden folders' `.epk`/`.pet`/`.trl`
-        // candidates pass this gate; the transform itself decides per level.
-        PatchId::Effects => {
-            starts_with_path_ci(path, "metadata/effects/spells") && is_metadata_effect_ext(path)
-        }
+        PatchId::Effects => effects_targets_path(path, None),
         PatchId::DisableSounds => is_sound_target(path),
         PatchId::SkillSounds => {
             starts_with_path_ci(path, "metadata/effects/spells")
@@ -365,15 +359,9 @@ mod tests {
             assert!(!effects_targets_path(path, None), "path: {path}");
             assert!(!patch_targets_path(PatchId::Effects, path));
         }
-        // The applies gate is broader (Hidden folders' data files must pass
-        // it), but still never matches outside spells.
-        assert!(patch_applies_path(
-            PatchId::Effects,
-            "metadata/effects/spells/fireball/fx/impact.pet"
-        ));
         assert!(!patch_applies_path(
             PatchId::Effects,
-            "metadata/particles/enviro/foo.pet"
+            "metadata/effects/spells/fireball/fx/impact.pet"
         ));
     }
 
@@ -381,16 +369,10 @@ mod tests {
     fn effects_targeting_with_filter_honors_per_skill_levels() {
         use super::super::effect_skills::EffectSkillOverride;
 
-        let filter = EffectsFilter::new(&[
-            EffectSkillOverride {
-                folder: "cold_herald_of_ice".to_string(),
-                level: EffectLevel::Full,
-            },
-            EffectSkillOverride {
-                folder: "arc_02".to_string(),
-                level: EffectLevel::Hidden,
-            },
-        ])
+        let filter = EffectsFilter::new(&[EffectSkillOverride {
+            folder: "cold_herald_of_ice".to_string(),
+            level: EffectLevel::Full,
+        }])
         .unwrap();
         let filter = Some(&filter);
 
@@ -399,15 +381,14 @@ mod tests {
             "metadata/effects/spells/cold_herald_of_ice/ao/ice_explosion.ao",
             filter
         ));
-        // Hidden folders also pull in their effect data files.
-        for path in [
+        assert!(effects_targets_path(
             "metadata/effects/spells/arc_02/arc.aoc",
-            "metadata/effects/spells/arc_02/epk/buff.epk",
-            "metadata/effects/spells/arc_02/fx/beam.pet",
+            filter
+        ));
+        assert!(!effects_targets_path(
             "metadata/effects/spells/arc_02/fx/beam.trl",
-        ] {
-            assert!(effects_targets_path(path, filter), "path: {path}");
-        }
+            filter
+        ));
         // Unlisted folders keep the .ao/.aoc-only rule.
         assert!(effects_targets_path(
             "metadata/effects/spells/fireball/fireball.ao",

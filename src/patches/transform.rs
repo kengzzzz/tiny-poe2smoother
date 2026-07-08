@@ -279,14 +279,6 @@ fn effects(path: &str, bytes: &[u8], filter: Option<&EffectsFilter>) -> Result<V
         return Ok(bytes.to_vec());
     }
     if !(ends_with_path_ci(path, ".ao") || ends_with_path_ci(path, ".aoc")) {
-        // Hidden blanks the skill's effect data with the mtx_soft
-        // ground-truth rules (`.epk` must be empty; a bare "0" makes its
-        // parser throw). Any other level leaves non-animation files alone.
-        if level == EffectLevel::Hidden {
-            if let Some(blanked) = blank_effect_data(path) {
-                return Ok(blanked);
-            }
-        }
         return Ok(bytes.to_vec());
     }
     let text = decode_utf16(bytes)?;
@@ -498,52 +490,24 @@ mod tests {
     }
 
     #[test]
-    fn effect_skill_levels_control_strip_and_blank_behavior() {
+    fn effect_skill_levels_control_strip_behavior() {
         use super::super::effect_skills::EffectSkillOverride;
 
-        let filter = EffectsFilter::new(&[
-            EffectSkillOverride {
-                folder: "cold_herald_of_ice".to_string(),
-                level: EffectLevel::Hidden,
-            },
-            EffectSkillOverride {
-                folder: "fireball".to_string(),
-                level: EffectLevel::Full,
-            },
-        ])
+        let filter = EffectsFilter::new(&[EffectSkillOverride {
+            folder: "fireball".to_string(),
+            level: EffectLevel::Full,
+        }])
         .unwrap();
         let filter = Some(&filter);
 
-        // Hidden strips .ao/.aoc exactly like the default Reduced level.
+        // Unlisted folders strip .ao/.aoc exactly like the default Reduced level.
         let anim = encode_utf16_bom(
             "client\r\n{\r\n\tParticleEffects\r\n\t{\r\n\t}\r\n\tSoundEvents\r\n\t{\r\n\t}\r\n}",
         );
         let herald_ao = "metadata/effects/spells/cold_herald_of_ice/ao/ice_explosion.ao";
-        let hidden_ao = effects(herald_ao, &anim, filter).unwrap();
-        assert_eq!(hidden_ao, effects(herald_ao, &anim, None).unwrap());
-        assert_ne!(hidden_ao, anim);
-
-        // Hidden blanks the skill's effect data with the mtx_soft rules.
-        let data = encode_utf16_bom("some effect data");
-        assert_eq!(
-            effects(
-                "metadata/effects/spells/cold_herald_of_ice/epk/unarmed_buff.epk",
-                &data,
-                filter
-            )
-            .unwrap(),
-            encode_utf16_bom("")
-        );
-        for path in [
-            "metadata/effects/spells/cold_herald_of_ice/fx/burst.pet",
-            "metadata/effects/spells/cold_herald_of_ice/fx/trail.trl",
-        ] {
-            assert_eq!(
-                effects(path, &data, filter).unwrap(),
-                encode_utf16_bom("0"),
-                "path: {path}"
-            );
-        }
+        let reduced_ao = effects(herald_ao, &anim, filter).unwrap();
+        assert_eq!(reduced_ao, effects(herald_ao, &anim, None).unwrap());
+        assert_ne!(reduced_ao, anim);
 
         // Full passes everything through — including .ao candidates that
         // reach the transform via another patch's collection (SkillSounds).
@@ -558,6 +522,7 @@ mod tests {
         );
 
         // Without a filter (or at Reduced) non-anim files are never touched.
+        let data = encode_utf16_bom("some effect data");
         assert_eq!(
             effects(
                 "metadata/effects/spells/fireball/fx/impact.pet",
@@ -567,18 +532,11 @@ mod tests {
             .unwrap(),
             data
         );
-
-        // Protected prefixes win even at Hidden.
-        let protected = EffectsFilter::new(&[EffectSkillOverride {
-            folder: "monsters_effects".to_string(),
-            level: EffectLevel::Hidden,
-        }])
-        .unwrap();
         assert_eq!(
             effects(
                 "metadata/effects/spells/monsters_effects/league_ultimatum/mechanics/fx/arena_limit.pet",
                 &data,
-                Some(&protected)
+                filter
             )
             .unwrap(),
             data

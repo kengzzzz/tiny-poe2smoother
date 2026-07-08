@@ -752,10 +752,6 @@ mod tests {
             color_mods: Vec::new(),
             effect_skills: vec![
                 EffectSkillOverride {
-                    folder: "Cold_Herald_Of_Ice".to_string(),
-                    level: EffectLevel::Hidden,
-                },
-                EffectSkillOverride {
                     folder: "arc_02".to_string(),
                     level: EffectLevel::Reduced,
                 },
@@ -767,10 +763,6 @@ mod tests {
         });
 
         assert_eq!(
-            app.effect_overrides.get("cold_herald_of_ice"),
-            Some(&EffectLevel::Hidden)
-        );
-        assert_eq!(
             app.effect_overrides.get("fireball"),
             Some(&EffectLevel::Full)
         );
@@ -780,17 +772,60 @@ mod tests {
         // Saved back folder-sorted, non-default only.
         assert_eq!(
             app.prefs().effect_skills,
-            vec![
-                EffectSkillOverride {
-                    folder: "cold_herald_of_ice".to_string(),
-                    level: EffectLevel::Hidden,
-                },
-                EffectSkillOverride {
-                    folder: "fireball".to_string(),
-                    level: EffectLevel::Full,
-                },
-            ]
+            vec![EffectSkillOverride {
+                folder: "fireball".to_string(),
+                level: EffectLevel::Full,
+            }]
         );
+    }
+
+    #[test]
+    fn legacy_effect_level_pref_deserializes_to_default() {
+        #[derive(Default)]
+        struct TestStorage {
+            values: HashMap<String, String>,
+        }
+
+        impl eframe::Storage for TestStorage {
+            fn get_string(&self, key: &str) -> Option<String> {
+                self.values.get(key).cloned()
+            }
+
+            fn set_string(&mut self, key: &str, value: String) {
+                self.values.insert(key.to_string(), value);
+            }
+
+            fn remove_string(&mut self, key: &str) {
+                self.values.remove(key);
+            }
+
+            fn flush(&mut self) {}
+        }
+
+        let old_level = concat!("hid", "den");
+        let mut storage = TestStorage::default();
+        eframe::set_value(
+            &mut storage,
+            PREFS_KEY,
+            &GuiPrefs {
+                game_dir_input: String::new(),
+                selected_patches: vec!["fog".to_string()],
+                zoom: 2.4,
+                color_mods: Vec::new(),
+                effect_skills: vec![EffectSkillOverride {
+                    folder: "fireball".to_string(),
+                    level: EffectLevel::Reduced,
+                }],
+            },
+        );
+        let saved = storage.values.get_mut(PREFS_KEY).unwrap();
+        *saved = saved.replace("reduced", old_level);
+
+        let prefs = eframe::get_value::<GuiPrefs>(&storage, PREFS_KEY).unwrap();
+        assert_eq!(prefs.effect_skills[0].level, EffectLevel::Reduced);
+        let app = GuiApp::from_prefs(prefs);
+        assert!(app.effect_overrides.is_empty());
+        assert!(app.prefs().effect_skills.is_empty());
     }
 
     #[test]
@@ -813,16 +848,9 @@ mod tests {
             }]
         );
 
-        app.effect_overrides
-            .insert("fireball".to_string(), EffectLevel::Hidden);
+        app.effect_overrides.clear();
         let request = app.patch_request().unwrap();
-        assert_eq!(
-            request.params.effect_skills,
-            vec![EffectSkillOverride {
-                folder: "fireball".to_string(),
-                level: EffectLevel::Hidden,
-            }]
-        );
+        assert!(request.params.effect_skills.is_empty());
     }
 
     #[test]
@@ -876,7 +904,7 @@ mod tests {
             ..GuiApp::default()
         };
         app.effect_overrides
-            .insert("fireball".to_string(), EffectLevel::Hidden);
+            .insert("fireball".to_string(), EffectLevel::Full);
 
         // Same dir: nothing is discarded.
         app.invalidate_effect_catalog_if_stale(&Some(PathBuf::from("/install/A")));
@@ -893,7 +921,7 @@ mod tests {
         assert!(app.effects_filter_rows.is_empty());
         assert_eq!(
             app.effect_overrides.get("fireball"),
-            Some(&EffectLevel::Hidden)
+            Some(&EffectLevel::Full)
         );
     }
 
@@ -924,14 +952,14 @@ mod tests {
         };
 
         app.effects_search = "herald".to_string();
-        app.apply_effect_level_to_filtered_rows(EffectLevel::Hidden);
+        app.apply_effect_level_to_filtered_rows(EffectLevel::Full);
         assert_eq!(
             app.effect_overrides.get("fire_heraldofash"),
-            Some(&EffectLevel::Hidden)
+            Some(&EffectLevel::Full)
         );
         assert_eq!(
             app.effect_overrides.get("herald_of_fire"),
-            Some(&EffectLevel::Hidden)
+            Some(&EffectLevel::Full)
         );
         assert!(!app.effect_overrides.contains_key("fireball"));
 

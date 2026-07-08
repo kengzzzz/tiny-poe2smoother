@@ -73,8 +73,7 @@ fn collect_patch_targets(
     effects: Option<&EffectsFilter>,
 ) -> Result<Vec<(String, BundleFile)>> {
     let patches = unique_patches(patches);
-    // Effects is the one filter-aware patch: Full folders are never read,
-    // Hidden folders also pull in their `.epk`/`.pet`/`.trl` files.
+    // Effects is the one filter-aware patch: Full folders are never read.
     let targets_path = |patch: PatchId, path: &str| match patch {
         PatchId::Effects => effects_targets_path(path, effects),
         _ => patch_targets_path(patch, path),
@@ -433,7 +432,7 @@ mod tests {
         let filter = EffectsFilter::new(&[
             EffectSkillOverride {
                 folder: "cold_herald_of_ice".to_string(),
-                level: EffectLevel::Hidden,
+                level: EffectLevel::Reduced,
             },
             EffectSkillOverride {
                 folder: "fireball".to_string(),
@@ -449,18 +448,19 @@ mod tests {
             .map(|(path, _)| path)
             .collect::<Vec<_>>();
 
-        // Hidden folders pull in their effect data files too.
-        for path in [
-            "metadata/effects/spells/cold_herald_of_ice/ao/ice_explosion.ao",
-            "metadata/effects/spells/cold_herald_of_ice/epk/buff.epk",
-            "metadata/effects/spells/cold_herald_of_ice/fx/burst.pet",
-            "metadata/effects/spells/arc_02/arc.aoc",
-        ] {
-            assert!(paths.contains(&path.to_string()), "missing: {path}");
-        }
+        assert!(paths.contains(
+            &"metadata/effects/spells/cold_herald_of_ice/ao/ice_explosion.ao".to_string()
+        ));
+        assert!(paths.contains(&"metadata/effects/spells/arc_02/arc.aoc".to_string()));
         // Full folders are never even read; unlisted folders keep the
         // .ao/.aoc-only rule.
         assert!(!paths.contains(&"metadata/effects/spells/fireball/fireball.ao".to_string()));
+        assert!(
+            !paths.contains(&"metadata/effects/spells/cold_herald_of_ice/epk/buff.epk".to_string())
+        );
+        assert!(
+            !paths.contains(&"metadata/effects/spells/cold_herald_of_ice/fx/burst.pet".to_string())
+        );
         assert!(!paths.contains(&"metadata/effects/spells/arc_02/beam.trl".to_string()));
     }
 
@@ -521,27 +521,6 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("set to Full"));
         assert!(msg.contains("Edit skills"));
-    }
-
-    #[test]
-    fn hidden_only_effect_selection_falls_back_to_generic_error() {
-        use super::super::effect_skills::{EffectLevel, EffectSkillOverride};
-
-        // No effect files in the index and only Hidden overrides: the bail
-        // must not misreport "Full" and should keep the generic guidance.
-        let mut index = BundleIndex::for_test_paths(&[]);
-        let filter = EffectsFilter::new(&[EffectSkillOverride {
-            folder: "fireball".to_string(),
-            level: EffectLevel::Hidden,
-        }])
-        .unwrap();
-
-        let err =
-            collect_patch_targets(&mut index, &[PatchId::Effects], Some(&filter)).unwrap_err();
-
-        let msg = err.to_string();
-        assert!(!msg.contains("Full"));
-        assert!(msg.contains("verify game files"));
     }
 
     #[test]
