@@ -300,20 +300,6 @@ impl GuiApp {
                 "Color mods is selected but no mods are enabled — use Edit colors…".to_string(),
             );
         }
-        if patches.contains(&PatchId::Effects) {
-            if let Some(catalog) = &self.effect_catalog {
-                let all_full = catalog.iter().any(|row| !row.folders.is_empty())
-                    && catalog.iter().flat_map(|row| &row.folders).all(|folder| {
-                        self.effect_overrides.get(folder) == Some(&EffectLevel::Full)
-                    });
-                if all_full {
-                    return Err(
-                        "Effects is selected but every skill is set to Full — use Edit skills…"
-                            .to_string(),
-                    );
-                }
-            }
-        }
         Ok(PatchRequest {
             game_dir: self.game_dir(),
             patches,
@@ -776,24 +762,24 @@ mod tests {
     }
 
     #[test]
-    fn patch_request_embeds_overrides_and_rejects_all_full_effects() {
+    fn patch_request_embeds_overrides() {
         let mut app = GuiApp {
             selected_patches: [PatchId::Effects].into_iter().collect(),
             ..GuiApp::default()
         };
+        // All-Full is no longer rejected at the GUI layer — the apply-side
+        // bail is the single source of truth. The Full override is still
+        // embedded verbatim.
         app.effect_overrides
             .insert("fireball".to_string(), EffectLevel::Full);
-        app.effect_catalog = Some(vec![EffectFolderRow {
-            folders: vec!["fireball".to_string()],
-            active_skill_id: "fireball".to_string(),
-            action_type: "Fireball".to_string(),
-            display: "Fireball".to_string(),
-            display_lower: "fireball".to_string(),
-            search_lower: "fireball fireball".to_string(),
-        }]);
-
-        let err = app.patch_request().unwrap_err();
-        assert!(err.contains("every skill is set to Full"));
+        let request = app.patch_request().unwrap();
+        assert_eq!(
+            request.params.effect_skills,
+            vec![EffectSkillOverride {
+                folder: "fireball".to_string(),
+                level: EffectLevel::Full,
+            }]
+        );
 
         app.effect_overrides
             .insert("fireball".to_string(), EffectLevel::Hidden);

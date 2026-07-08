@@ -121,10 +121,10 @@ fn collect_patch_targets(
     for &patch in &patches {
         let patch_targets = targets.remove(&patch).unwrap_or_default();
         if patch_targets.is_empty() {
-            if patch == PatchId::Effects && effects.is_some() {
+            if patch == PatchId::Effects && effects.is_some_and(|f| f.has_full()) {
                 bail!(
-                    "patch 'effects' matches no files: every skill effect is set to Full (keep);\n\
-                     change some skill levels in Edit skills… or deselect effects"
+                    "patch 'effects' matches no files;\n\
+                     some skills are set to Full in Edit skills… — change some levels or deselect effects"
                 );
             }
             bail!(
@@ -518,7 +518,30 @@ mod tests {
         let err =
             collect_patch_targets(&mut index, &[PatchId::Effects], Some(&filter)).unwrap_err();
 
-        assert!(err.to_string().contains("set to Full"));
+        let msg = err.to_string();
+        assert!(msg.contains("set to Full"));
+        assert!(msg.contains("Edit skills"));
+    }
+
+    #[test]
+    fn hidden_only_effect_selection_falls_back_to_generic_error() {
+        use super::super::effect_skills::{EffectLevel, EffectSkillOverride};
+
+        // No effect files in the index and only Hidden overrides: the bail
+        // must not misreport "Full" and should keep the generic guidance.
+        let mut index = BundleIndex::for_test_paths(&[]);
+        let filter = EffectsFilter::new(&[EffectSkillOverride {
+            folder: "fireball".to_string(),
+            level: EffectLevel::Hidden,
+        }])
+        .unwrap();
+
+        let err =
+            collect_patch_targets(&mut index, &[PatchId::Effects], Some(&filter)).unwrap_err();
+
+        let msg = err.to_string();
+        assert!(!msg.contains("Full"));
+        assert!(msg.contains("verify game files"));
     }
 
     #[test]

@@ -64,6 +64,12 @@ impl EffectsFilter {
             .map(|(_, level)| *level)
             .unwrap_or_default()
     }
+
+    pub(super) fn has_full(&self) -> bool {
+        self.levels
+            .iter()
+            .any(|(_, level)| *level == EffectLevel::Full)
+    }
 }
 
 /// The top-level folder segment after `metadata/effects/spells/`
