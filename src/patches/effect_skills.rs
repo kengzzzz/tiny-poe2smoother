@@ -469,12 +469,7 @@ fn effect_label_action_name(label: &str) -> Option<&str> {
 }
 
 fn effect_folder_from_metadata_path(path: &str) -> Option<String> {
-    let normalized = path.replace('\\', "/").to_ascii_lowercase();
-    let rest = normalized.strip_prefix("metadata/effects/spells/")?;
-    rest.split('/')
-        .next()
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
+    spells_folder(path).map(str::to_ascii_lowercase)
 }
 
 fn normalize_label_key(s: &str) -> String {

@@ -236,6 +236,20 @@ fn delirium(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(encode_utf16_bom(&out))
 }
 
+/// Ground-truth blanking rule (see docs/capture-findings.md): `.epk` MUST become
+/// empty (a bare "0" makes the parser throw "Unexpected token 0"); `.pet`/`.trl`
+/// become BOM+"0" (a value the engine tolerates). Returns None for any other
+/// extension (notably `.ao`/`.aoc`, which are never blanked).
+fn blank_effect_data(path: &str) -> Option<Vec<u8>> {
+    if ends_with_path_ci(path, ".epk") {
+        return Some(encode_utf16_bom(""));
+    }
+    if ends_with_path_ci(path, ".pet") || ends_with_path_ci(path, ".trl") {
+        return Some(encode_utf16_bom("0"));
+    }
+    None
+}
+
 fn particles(path: &str, bytes: &[u8]) -> Result<Vec<u8>> {
     let normalized = normalize_path(path);
     if PARTICLE_PROTECTED_PREFIXES
@@ -269,11 +283,8 @@ fn effects(path: &str, bytes: &[u8], filter: Option<&EffectsFilter>) -> Result<V
         // ground-truth rules (`.epk` must be empty; a bare "0" makes its
         // parser throw). Any other level leaves non-animation files alone.
         if level == EffectLevel::Hidden {
-            if ends_with_path_ci(path, ".epk") {
-                return Ok(encode_utf16_bom(""));
-            }
-            if ends_with_path_ci(path, ".pet") || ends_with_path_ci(path, ".trl") {
-                return Ok(encode_utf16_bom("0"));
+            if let Some(blanked) = blank_effect_data(path) {
+                return Ok(blanked);
             }
         }
         return Ok(bytes.to_vec());
@@ -313,17 +324,10 @@ fn mtx_soft(path: &str, bytes: &[u8]) -> Result<Vec<u8>> {
     if is_startup_scene_protected(path) {
         return Ok(bytes.to_vec());
     }
-    // Ground-truth rule (see docs/capture-findings.md): empty microtransaction
-    // effect/particle data files. `.epk` MUST become empty
-    // (a bare "0" makes the parser throw "Unexpected token 0"); `.pet`/`.trl`
-    // become BOM+"0" (a value the engine tolerates). Animation files
-    // (`.ao`/`.aoc`) are left untouched; the capture shows they are never
-    // rewritten for the soft-mtx option.
-    if ends_with_path_ci(path, ".epk") {
-        return Ok(encode_utf16_bom(""));
-    }
-    if ends_with_path_ci(path, ".pet") || ends_with_path_ci(path, ".trl") {
-        return Ok(encode_utf16_bom("0"));
+    // Animation files (`.ao`/`.aoc`) are left untouched; the capture shows
+    // they are never rewritten for the soft-mtx option.
+    if let Some(blanked) = blank_effect_data(path) {
+        return Ok(blanked);
     }
     Ok(bytes.to_vec())
 }
