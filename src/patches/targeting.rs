@@ -285,7 +285,7 @@ pub(super) fn ends_with_path_ci(path: &str, suffix: &str) -> bool {
         .all(|(a, b)| path_byte_eq(a, b))
 }
 
-pub(super) fn path_byte_eq(a: u8, b: u8) -> bool {
+fn path_byte_eq(a: u8, b: u8) -> bool {
     let a = if a == b'\\' {
         b'/'
     } else {

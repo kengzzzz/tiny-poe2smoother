@@ -653,14 +653,11 @@ impl GuiApp {
 
     fn apply_effect_level_to_filtered_rows(&mut self, level: EffectLevel) {
         self.refresh_effects_filter();
+        let catalog = self.effect_catalog.as_deref().unwrap_or_default();
         let folders: Vec<String> = self
-            .effect_catalog
-            .as_deref()
-            .unwrap_or_default()
+            .effects_filter_rows
             .iter()
-            .enumerate()
-            .filter(|(idx, _)| self.effects_filter_rows.contains(idx))
-            .flat_map(|(_, row)| row.folders.iter().cloned())
+            .flat_map(|&idx| catalog[idx].folders.iter().cloned())
             .collect();
         for folder in folders {
             if level == EffectLevel::Reduced {

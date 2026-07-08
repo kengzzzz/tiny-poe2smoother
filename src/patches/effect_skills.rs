@@ -1,4 +1,4 @@
-use super::targeting::{is_metadata_effect_ext, path_byte_eq, starts_with_path_ci};
+use super::targeting::{is_metadata_effect_ext, starts_with_path_ci};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -41,15 +41,15 @@ pub struct EffectSkillCatalogEntry {
 /// collection and transforms byte-identical to the unfiltered behavior.
 #[derive(Debug)]
 pub(super) struct EffectsFilter {
-    levels: Vec<(String, EffectLevel)>,
+    levels: HashMap<String, EffectLevel>,
 }
 
 impl EffectsFilter {
     pub(super) fn new(overrides: &[EffectSkillOverride]) -> Option<Self> {
-        let levels: Vec<_> = overrides
+        let levels: HashMap<_, _> = overrides
             .iter()
             .filter(|entry| entry.level != EffectLevel::Reduced)
-            .map(|entry| (entry.folder.clone(), entry.level))
+            .map(|entry| (entry.folder.to_ascii_lowercase(), entry.level))
             .collect();
         (!levels.is_empty()).then_some(Self { levels })
     }
@@ -59,16 +59,15 @@ impl EffectsFilter {
             return EffectLevel::Reduced;
         };
         self.levels
-            .iter()
-            .find(|(name, _)| folder_eq(folder, name))
-            .map(|(_, level)| *level)
+            .get(&folder.to_ascii_lowercase())
+            .copied()
             .unwrap_or_default()
     }
 
     pub(super) fn has_full(&self) -> bool {
         self.levels
-            .iter()
-            .any(|(_, level)| *level == EffectLevel::Full)
+            .values()
+            .any(|level| *level == EffectLevel::Full)
     }
 }
 
@@ -83,14 +82,6 @@ pub(super) fn spells_folder(path: &str) -> Option<&str> {
     let rest = &path[SPELLS_PREFIX.len()..];
     let end = rest.bytes().position(|b| b == b'/' || b == b'\\')?;
     (end > 0).then(|| &rest[..end])
-}
-
-fn folder_eq(folder: &str, name: &str) -> bool {
-    folder.len() == name.len()
-        && folder
-            .bytes()
-            .zip(name.bytes())
-            .all(|(a, b)| path_byte_eq(a, b))
 }
 
 /// Distinct sorted lowercase top-level spell folders that contain at least
