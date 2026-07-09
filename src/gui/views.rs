@@ -299,17 +299,23 @@ fn draw_effect_skills_row(app: &mut GuiApp, ui: &mut egui::Ui) {
     if !app.selected_patches.contains(&PatchId::Effects) {
         return;
     }
+    // The caption groups per skill only once the catalog is in, so start the
+    // load right away instead of waiting for the editor to be opened. The
+    // error guard keeps a failed load from respawning the loader every frame;
+    // the editor's Retry button clears it for manual retries.
+    if app.effect_catalog.is_none()
+        && app.effect_catalog_task.is_none()
+        && app.effect_catalog_error.is_none()
+    {
+        app.ensure_effect_catalog_loading();
+    }
     ui.horizontal(|ui| {
         ui.add_space(26.0);
         if small_action(ui, "Edit skills…") {
             app.show_effects_editor = true;
             app.ensure_effect_catalog_loading();
         }
-        let full = app
-            .effect_overrides
-            .values()
-            .filter(|level| **level == EffectLevel::Full)
-            .count();
+        let full = app.kept_original_effect_skill_count();
         let caption = if full == 0 {
             "all skills reduced".to_string()
         } else {
@@ -756,7 +762,7 @@ fn draw_effect_skill_row(app: &mut GuiApp, ui: &mut egui::Ui, idx: usize) {
     let row = &catalog[idx];
     let folders = row.folders.clone();
     let display = row.display.clone();
-    let level = grouped_effect_level(app, &folders);
+    let level = app.effect_level_for_folders(&folders);
     let mixed = level.is_none();
     let mut reduced = level == Some(EffectLevel::Reduced);
     let hover = format!(
@@ -800,17 +806,6 @@ fn draw_effect_skill_row(app: &mut GuiApp, ui: &mut egui::Ui, idx: usize) {
             toggle.on_hover_text(hover);
         },
     );
-}
-
-fn grouped_effect_level(app: &GuiApp, folders: &[String]) -> Option<EffectLevel> {
-    let mut levels = folders.iter().map(|folder| {
-        app.effect_overrides
-            .get(folder)
-            .copied()
-            .unwrap_or_default()
-    });
-    let first = levels.next()?;
-    levels.all(|level| level == first).then_some(first)
 }
 
 /// Shows a modal with shared styling; returns true when it should close

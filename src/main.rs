@@ -667,6 +667,49 @@ impl GuiApp {
             }
         }
     }
+
+    fn effect_level_for_folders(&self, folders: &[String]) -> Option<EffectLevel> {
+        let mut levels = folders.iter().map(|folder| {
+            self.effect_overrides
+                .get(folder)
+                .copied()
+                .unwrap_or_default()
+        });
+        let first = levels.next()?;
+        levels.all(|level| level == first).then_some(first)
+    }
+
+    /// Runs on every repaint of the main view, so it stays linear in
+    /// catalog + overrides.
+    fn kept_original_effect_skill_count(&self) -> usize {
+        let catalog = self.effect_catalog.as_deref().unwrap_or(&[]);
+        // A row counts as kept when any of its folders is overridden to Full —
+        // a mixed row (stale prefs after the game regrouped folders) still
+        // renders original visuals for part of the skill.
+        let catalog_kept = catalog
+            .iter()
+            .filter(|row| {
+                row.folders
+                    .iter()
+                    .any(|folder| self.effect_overrides.contains_key(folder))
+            })
+            .count();
+        let cataloged: HashSet<&str> = catalog
+            .iter()
+            .flat_map(|row| row.folders.iter().map(String::as_str))
+            .collect();
+        // Stale folders absent from the catalog count once each: their
+        // grouping is unknowable, and dropping them would hide skills the
+        // user really kept original.
+        let uncataloged_full = self
+            .effect_overrides
+            .iter()
+            .filter(|(folder, level)| {
+                **level == EffectLevel::Full && !cataloged.contains(folder.as_str())
+            })
+            .count();
+        catalog_kept + uncataloged_full
+    }
 }
 
 fn effect_skill_catalog_rows(entries: Vec<EffectSkillCatalogEntry>) -> Vec<EffectFolderRow> {
@@ -965,6 +1008,80 @@ mod tests {
 
         app.apply_effect_level_to_filtered_rows(EffectLevel::Reduced);
         assert!(app.effect_overrides.is_empty());
+    }
+
+    #[test]
+    fn kept_original_count_uses_skill_rows_when_catalog_is_loaded() {
+        let mut app = GuiApp {
+            effect_catalog: Some(vec![
+                EffectFolderRow {
+                    folders: vec!["lightning_herald".to_string(), "herald_of_thunder".to_string()],
+                    active_skill_id: "herald_of_thunder".to_string(),
+                    action_type: "HeraldOfThunder".to_string(),
+                    display: "Herald of Thunder".to_string(),
+                    display_lower: "herald of thunder".to_string(),
+                    search_lower: "herald of thunder herald_of_thunder heraldofthunder lightning_herald herald_of_thunder".to_string(),
+                },
+                EffectFolderRow {
+                    folders: vec!["fireball".to_string()],
+                    active_skill_id: "fireball".to_string(),
+                    action_type: "GreaterFireball".to_string(),
+                    display: "Fireball".to_string(),
+                    display_lower: "fireball".to_string(),
+                    search_lower: "fireball greaterfireball".to_string(),
+                },
+            ]),
+            ..GuiApp::default()
+        };
+        app.effect_overrides
+            .insert("lightning_herald".to_string(), EffectLevel::Full);
+        app.effect_overrides
+            .insert("herald_of_thunder".to_string(), EffectLevel::Full);
+        assert_eq!(app.kept_original_effect_skill_count(), 1);
+
+        app.effect_overrides
+            .insert("fireball".to_string(), EffectLevel::Full);
+        assert_eq!(app.kept_original_effect_skill_count(), 2);
+
+        // A mixed row (only one of the skill's folders still Full) keeps
+        // rendering original visuals, so it stays counted.
+        app.effect_overrides.remove("herald_of_thunder");
+        assert_eq!(app.kept_original_effect_skill_count(), 2);
+    }
+
+    #[test]
+    fn kept_original_count_falls_back_to_folders_without_catalog_rows() {
+        let mut app = GuiApp::default();
+        app.effect_overrides
+            .insert("lightning_herald".to_string(), EffectLevel::Full);
+        app.effect_overrides
+            .insert("herald_of_thunder".to_string(), EffectLevel::Full);
+        // No catalog and an empty catalog count the same way: per folder.
+        assert_eq!(app.kept_original_effect_skill_count(), 2);
+        app.effect_catalog = Some(Vec::new());
+        assert_eq!(app.kept_original_effect_skill_count(), 2);
+    }
+
+    #[test]
+    fn kept_original_count_preserves_folder_fallbacks() {
+        let mut app = GuiApp::default();
+        app.effect_overrides
+            .insert("lightning_herald".to_string(), EffectLevel::Full);
+        app.effect_overrides
+            .insert("herald_of_thunder".to_string(), EffectLevel::Full);
+        assert_eq!(app.kept_original_effect_skill_count(), 2);
+
+        app.effect_catalog = Some(vec![EffectFolderRow {
+            folders: vec!["fireball".to_string()],
+            active_skill_id: "fireball".to_string(),
+            action_type: "GreaterFireball".to_string(),
+            display: "Fireball".to_string(),
+            display_lower: "fireball".to_string(),
+            search_lower: "fireball greaterfireball".to_string(),
+        }]);
+        app.effect_overrides
+            .insert("fireball".to_string(), EffectLevel::Full);
+        assert_eq!(app.kept_original_effect_skill_count(), 3);
     }
 
     #[test]
