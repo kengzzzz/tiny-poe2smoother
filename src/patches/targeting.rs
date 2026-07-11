@@ -369,10 +369,13 @@ mod tests {
     fn effects_targeting_with_filter_honors_per_skill_levels() {
         use super::super::effect_skills::EffectSkillOverride;
 
-        let filter = EffectsFilter::new(&[EffectSkillOverride {
-            folder: "cold_herald_of_ice".to_string(),
-            level: EffectLevel::Full,
-        }])
+        let filter = EffectsFilter::new(
+            &[EffectSkillOverride {
+                folder: "cold_herald_of_ice".to_string(),
+                level: EffectLevel::Full,
+            }],
+            Default::default(),
+        )
         .unwrap();
         let filter = Some(&filter);
 

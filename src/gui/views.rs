@@ -275,6 +275,7 @@ fn draw_patch_group(app: &mut GuiApp, ui: &mut egui::Ui, title: &str, patch_ids:
             }
             if patch_id == PatchId::Effects {
                 draw_effect_skills_row(app, ui);
+                draw_effect_monsters_row(app, ui);
             }
         }
     });
@@ -318,6 +319,28 @@ fn draw_effect_skills_row(app: &mut GuiApp, ui: &mut egui::Ui) {
         let full = app.kept_original_effect_skill_count();
         let caption = if full == 0 {
             "all skills reduced".to_string()
+        } else {
+            format!("{full} kept original")
+        };
+        ui.label(theme::caption_text(&caption));
+    });
+}
+
+fn draw_effect_monsters_row(app: &mut GuiApp, ui: &mut egui::Ui) {
+    if !app.selected_patches.contains(&PatchId::Effects) {
+        return;
+    }
+    // Unlike the skill catalog, the monster catalog reads every monster
+    // metadata file, so its load starts only when the editor is opened.
+    ui.horizontal(|ui| {
+        ui.add_space(26.0);
+        if small_action(ui, "Edit monsters…") {
+            app.show_monsters_editor = true;
+            app.ensure_monster_catalog_loading();
+        }
+        let full = app.kept_original_monster_count();
+        let caption = if full == 0 {
+            "all monsters reduced".to_string()
         } else {
             format!("{full} kept original")
         };
@@ -484,6 +507,10 @@ fn draw_modals(app: &mut GuiApp, ctx: &egui::Context) {
 
     if app.show_effects_editor {
         draw_effects_editor(app, ctx);
+    }
+
+    if app.show_monsters_editor {
+        draw_monsters_editor(app, ctx);
     }
 
     if app.show_game_running_dialog {
@@ -806,6 +833,158 @@ fn draw_effect_skill_row(app: &mut GuiApp, ui: &mut egui::Ui, idx: usize) {
             toggle.on_hover_text(hover);
         },
     );
+}
+
+/// The per-monster effects editor: search box over the monsters mapped from
+/// the game files, one row per monster name with an on/off smoothing toggle.
+/// Same layout as the per-skill editor.
+fn draw_monsters_editor(app: &mut GuiApp, ctx: &egui::Context) {
+    let modal = egui::Modal::new(egui::Id::new("monster_effects_editor"))
+        .frame(widgets::card().inner_margin(20))
+        .backdrop_color(egui::Color32::from_black_alpha(140))
+        .show(ctx, |ui| {
+            ui.set_width(640.0);
+            ui.label(theme::heading_text("Monster effects"));
+            ui.add_space(2.0);
+            ui.label(theme::caption_text(
+                "Toggled on strips heavy client effects (default) · off keeps original visuals. \
+                 Effect files shared between monsters stay original for all of them. \
+                 Only monsters with identifiable effect files are listed.",
+            ));
+            ui.add_space(8.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut app.monsters_search)
+                    .hint_text(
+                        "Search monsters — regex like in-game search, \"quotes\", !exclude…",
+                    )
+                    .desired_width(f32::INFINITY)
+                    .margin(egui::Margin::symmetric(10, 8)),
+            );
+            ui.add_space(6.0);
+            if app.monster_catalog_task.is_some() {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().color(palette::ACCENT));
+                    ui.label(theme::caption_text(
+                        "Loading monster list from game files… (first open takes a moment)",
+                    ));
+                });
+                ui.add_space(4.0);
+            } else if let Some(error) = app.monster_catalog_error.clone() {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("Monster list unavailable: {error}"))
+                            .size(11.5)
+                            .color(palette::WARNING),
+                    );
+                    if small_action(ui, "Retry") {
+                        app.monster_catalog_error = None;
+                        app.ensure_monster_catalog_loading();
+                    }
+                });
+                ui.add_space(4.0);
+            }
+
+            app.refresh_monsters_filter();
+            let row_count = app.monsters_filter_rows.len();
+            ui.horizontal(|ui| {
+                ui.label(theme::caption_text(&format!("{row_count} shown")));
+            });
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical()
+                .max_height(380.0)
+                .auto_shrink([false, false])
+                .show_rows(ui, COLOR_ROW_HEIGHT, row_count, |ui, range| {
+                    for i in range {
+                        let idx = app.monsters_filter_rows[i];
+                        draw_monster_row(app, ui, idx);
+                    }
+                });
+
+            ui.add_space(10.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add(widgets::primary_button("Close")).clicked() {
+                    app.show_monsters_editor = false;
+                }
+                ui.add_enabled_ui(row_count > 0, |ui| {
+                    if ui.add(widgets::secondary_button("Uncheck all")).clicked() {
+                        app.apply_monster_level_to_filtered_rows(EffectLevel::Full);
+                    }
+                    if ui.add(widgets::secondary_button("Check all")).clicked() {
+                        app.apply_monster_level_to_filtered_rows(EffectLevel::Reduced);
+                    }
+                });
+            });
+        })
+        .should_close();
+    if modal {
+        app.show_monsters_editor = false;
+    }
+}
+
+/// One monster row: smoothing toggle plus the monster name. A row controls
+/// every variant sharing the display name (runemarked etc.); toggling on
+/// removes all their overrides.
+fn draw_monster_row(app: &mut GuiApp, ui: &mut egui::Ui, idx: usize) {
+    let Some(catalog) = &app.monster_catalog else {
+        return;
+    };
+    let row = &catalog[idx];
+    let keys = row.monster_keys.clone();
+    let display = row.display.clone();
+    let level = app.monster_level_for_keys(&keys);
+    let mixed = level.is_none();
+    let mut reduced = level == Some(EffectLevel::Reduced);
+    let hover = hover_key_list(&keys);
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), COLOR_ROW_HEIGHT),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let toggle = ui.add(egui::Checkbox::without_text(&mut reduced).indeterminate(mixed));
+            if toggle.changed() {
+                let new_level = if reduced {
+                    EffectLevel::Reduced
+                } else {
+                    EffectLevel::Full
+                };
+                for key in &keys {
+                    if new_level == EffectLevel::Reduced {
+                        app.monster_overrides.remove(key);
+                    } else {
+                        app.monster_overrides.insert(key.clone(), new_level);
+                    }
+                }
+            }
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(egui::RichText::new(&display).size(11.5).color(
+                    if level == Some(EffectLevel::Reduced) {
+                        palette::TEXT_MUTED
+                    } else {
+                        palette::TEXT
+                    },
+                ))
+                .truncate(),
+            )
+            .on_hover_text(&hover);
+            toggle.on_hover_text(hover);
+        },
+    );
+}
+
+/// Variant keys for a row hover, truncated so huge groups stay readable.
+fn hover_key_list(keys: &[String]) -> String {
+    const MAX_HOVER_KEYS: usize = 12;
+    let mut hover = keys
+        .iter()
+        .take(MAX_HOVER_KEYS)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+    if keys.len() > MAX_HOVER_KEYS {
+        hover.push_str(&format!("\n… {} more", keys.len() - MAX_HOVER_KEYS));
+    }
+    hover
 }
 
 /// Shows a modal with shared styling; returns true when it should close

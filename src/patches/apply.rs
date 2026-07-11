@@ -1,6 +1,7 @@
 use super::catalog::{patch_label, PatchChange, PatchId, PatchParams, PatchSet};
 use super::color_mods::ColorMatcher;
 use super::effect_skills::EffectsFilter;
+use super::monster_effects::resolve_full_monster_effect_paths;
 use super::targeting::{
     effects_targets_path, exact_patch_targets, patch_applies_path, patch_targets_path,
 };
@@ -8,7 +9,7 @@ use super::transform::{transform, TransformCtx};
 use crate::bundle::{BundleFile, BundleIndex, BundleStore};
 use anyhow::{anyhow, bail, Result};
 use rayon::prelude::*;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 pub fn compute_patch_set(
     store: &BundleStore,
@@ -20,7 +21,15 @@ pub fn compute_patch_set(
 
     let patches = unique_patches(patches);
     let color_matcher = ColorMatcher::new(&params.color_mods);
-    let effects_filter = EffectsFilter::new(&params.effect_skills);
+    // Per-monster exclusions are resolved against the live index, but only
+    // when Effects is selected and Full monster overrides exist — the
+    // default path stays free of extra reads and byte-identical.
+    let full_monster_paths = if patches.contains(&PatchId::Effects) {
+        resolve_full_monster_effect_paths(store, index, &params.monster_effects)?
+    } else {
+        BTreeSet::new()
+    };
+    let effects_filter = EffectsFilter::new(&params.effect_skills, full_monster_paths);
     let ctx = TransformCtx {
         zoom: params.zoom,
         color: color_matcher.as_ref(),
@@ -123,7 +132,7 @@ fn collect_patch_targets(
             if patch == PatchId::Effects && effects.is_some_and(|f| f.has_full()) {
                 bail!(
                     "patch 'effects' matches no files;\n\
-                     some skills are set to Full in Edit skills… — change some levels or deselect effects"
+                     some skills or monsters keep original visuals in Edit skills… / Edit monsters… — change some levels or deselect effects"
                 );
             }
             bail!(
@@ -429,16 +438,19 @@ mod tests {
             ("metadata/effects/spells/arc_02/arc.aoc", "effects", 12),
             ("metadata/effects/spells/arc_02/beam.trl", "effects", 12),
         ]);
-        let filter = EffectsFilter::new(&[
-            EffectSkillOverride {
-                folder: "cold_herald_of_ice".to_string(),
-                level: EffectLevel::Reduced,
-            },
-            EffectSkillOverride {
-                folder: "fireball".to_string(),
-                level: EffectLevel::Full,
-            },
-        ])
+        let filter = EffectsFilter::new(
+            &[
+                EffectSkillOverride {
+                    folder: "cold_herald_of_ice".to_string(),
+                    level: EffectLevel::Reduced,
+                },
+                EffectSkillOverride {
+                    folder: "fireball".to_string(),
+                    level: EffectLevel::Full,
+                },
+            ],
+            BTreeSet::new(),
+        )
         .unwrap();
 
         let candidates =
@@ -465,6 +477,49 @@ mod tests {
     }
 
     #[test]
+    fn per_monster_paths_filter_effect_target_collection() {
+        let kept = "metadata/effects/spells/monsters_effects/act3/anchoritemother/idle.ao";
+        let mut index = BundleIndex::for_test_paths(&[
+            (kept, "effects", 12),
+            (
+                "metadata/effects/spells/monsters_effects/act3/anchoritemother/death.ao",
+                "effects",
+                12,
+            ),
+            (
+                "metadata/effects/spells/fireball/fireball.ao",
+                "effects",
+                12,
+            ),
+        ]);
+        let filter = EffectsFilter::new(&[], BTreeSet::from([kept.to_string()])).unwrap();
+
+        let candidates = collect_patch_targets(
+            &mut index,
+            &[PatchId::Effects, PatchId::MonsterSounds],
+            Some(&filter),
+        )
+        .unwrap();
+        let mut effects_paths = Vec::new();
+        let mut all_paths = Vec::new();
+        for (path, _) in candidates {
+            if effects_targets_path(&path, Some(&filter)) {
+                effects_paths.push(path.clone());
+            }
+            all_paths.push(path);
+        }
+
+        // The kept monster path drops out of Effects targeting but still
+        // flows to MonsterSounds; sibling and unrelated paths stay targeted.
+        assert!(!effects_paths.contains(&kept.to_string()));
+        assert!(all_paths.contains(&kept.to_string()));
+        assert!(effects_paths.contains(
+            &"metadata/effects/spells/monsters_effects/act3/anchoritemother/death.ao".to_string()
+        ));
+        assert!(effects_paths.contains(&"metadata/effects/spells/fireball/fireball.ao".to_string()));
+    }
+
+    #[test]
     fn full_skill_folders_still_flow_to_other_selected_patches() {
         use super::super::effect_skills::{EffectLevel, EffectSkillOverride};
 
@@ -476,10 +531,13 @@ mod tests {
             ),
             ("metadata/effects/spells/arc_02/arc.ao", "effects", 12),
         ]);
-        let filter = EffectsFilter::new(&[EffectSkillOverride {
-            folder: "fireball".to_string(),
-            level: EffectLevel::Full,
-        }])
+        let filter = EffectsFilter::new(
+            &[EffectSkillOverride {
+                folder: "fireball".to_string(),
+                level: EffectLevel::Full,
+            }],
+            BTreeSet::new(),
+        )
         .unwrap();
 
         let candidates = collect_patch_targets(
@@ -509,18 +567,22 @@ mod tests {
             "effects",
             12,
         )]);
-        let filter = EffectsFilter::new(&[EffectSkillOverride {
-            folder: "fireball".to_string(),
-            level: EffectLevel::Full,
-        }])
+        let filter = EffectsFilter::new(
+            &[EffectSkillOverride {
+                folder: "fireball".to_string(),
+                level: EffectLevel::Full,
+            }],
+            BTreeSet::new(),
+        )
         .unwrap();
 
         let err =
             collect_patch_targets(&mut index, &[PatchId::Effects], Some(&filter)).unwrap_err();
 
         let msg = err.to_string();
-        assert!(msg.contains("set to Full"));
+        assert!(msg.contains("keep original visuals"));
         assert!(msg.contains("Edit skills"));
+        assert!(msg.contains("Edit monsters"));
     }
 
     #[test]

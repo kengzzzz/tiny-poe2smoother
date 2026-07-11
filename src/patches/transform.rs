@@ -493,10 +493,13 @@ mod tests {
     fn effect_skill_levels_control_strip_behavior() {
         use super::super::effect_skills::EffectSkillOverride;
 
-        let filter = EffectsFilter::new(&[EffectSkillOverride {
-            folder: "fireball".to_string(),
-            level: EffectLevel::Full,
-        }])
+        let filter = EffectsFilter::new(
+            &[EffectSkillOverride {
+                folder: "fireball".to_string(),
+                level: EffectLevel::Full,
+            }],
+            Default::default(),
+        )
         .unwrap();
         let filter = Some(&filter);
 

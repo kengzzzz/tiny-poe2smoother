@@ -1,3 +1,4 @@
+use super::datc64::{parse_table, utf16le_string_at};
 use super::targeting::{is_metadata_effect_ext, starts_with_path_ci};
 use serde::{
     de::{self, Visitor},
@@ -72,36 +73,52 @@ pub struct EffectSkillCatalogEntry {
     pub folders: Vec<String>,
 }
 
-/// Per-request view over the overrides. `None` (no overrides) keeps target
-/// collection and transforms byte-identical to the unfiltered behavior.
+/// Per-request view over the overrides. `None` (no overrides at all) keeps
+/// target collection and transforms byte-identical to the unfiltered
+/// behavior. `full_paths` holds the per-monster exclusions: exact normalized
+/// lowercase patch-target paths kept original (see `monster_effects`).
 #[derive(Debug)]
 pub(super) struct EffectsFilter {
     full_folders: BTreeSet<String>,
+    full_paths: BTreeSet<String>,
 }
 
 impl EffectsFilter {
-    pub(super) fn new(overrides: &[EffectSkillOverride]) -> Option<Self> {
+    pub(super) fn new(
+        overrides: &[EffectSkillOverride],
+        full_paths: BTreeSet<String>,
+    ) -> Option<Self> {
         let full_folders: BTreeSet<_> = overrides
             .iter()
             .filter(|entry| entry.level == EffectLevel::Full)
             .map(|entry| entry.folder.to_ascii_lowercase())
             .collect();
-        (!full_folders.is_empty()).then_some(Self { full_folders })
+        (!full_folders.is_empty() || !full_paths.is_empty()).then_some(Self {
+            full_folders,
+            full_paths,
+        })
     }
 
     pub(super) fn level_for(&self, path: &str) -> EffectLevel {
-        let Some(folder) = spells_folder(path) else {
-            return EffectLevel::Reduced;
-        };
-        if self.full_folders.contains(&folder.to_ascii_lowercase()) {
-            EffectLevel::Full
-        } else {
-            EffectLevel::Reduced
+        if let Some(folder) = spells_folder(path) {
+            if self.full_folders.contains(&folder.to_ascii_lowercase()) {
+                return EffectLevel::Full;
+            }
         }
+        // Only allocates for paths already under `metadata/effects/spells/`
+        // (all callers pre-filter) and only when monster overrides exist.
+        if !self.full_paths.is_empty()
+            && self
+                .full_paths
+                .contains(&super::targeting::normalize_path(path))
+        {
+            return EffectLevel::Full;
+        }
+        EffectLevel::Reduced
     }
 
     pub(super) fn has_full(&self) -> bool {
-        !self.full_folders.is_empty()
+        !self.full_folders.is_empty() || !self.full_paths.is_empty()
     }
 }
 
@@ -620,7 +637,6 @@ fn same_display_tiebreak_key<'a>(
 pub const ACTIVESKILLS_DATC64_PATH: &str = "data/balance/activeskills.datc64";
 pub const ACTIONTYPES_DATC64_PATH: &str = "data/balance/actiontypes.datc64";
 pub const ITEM_VISUAL_EFFECT_DATC64_PATH: &str = "data/balance/itemvisualeffect.datc64";
-const ACTIVESKILLS_ROW_MARKER: [u8; 8] = [0xbb; 8];
 type ActiveSkillRows = (HashMap<String, String>, Vec<(String, usize)>);
 
 fn parse_first_string_rows(bytes: &[u8]) -> Option<Vec<String>> {
@@ -637,61 +653,6 @@ fn parse_first_string_rows(bytes: &[u8]) -> Option<Vec<String>> {
         rows.push(value);
     }
     Some(rows)
-}
-
-struct DatTable<'a> {
-    row_count: usize,
-    row_len: usize,
-    row_block: &'a [u8],
-    heap: &'a [u8],
-}
-
-impl<'a> DatTable<'a> {
-    fn rows(&self) -> impl Iterator<Item = &'a [u8]> {
-        self.row_block.chunks_exact(self.row_len)
-    }
-
-    fn heap(&self) -> &'a [u8] {
-        self.heap
-    }
-}
-
-fn parse_table(bytes: &[u8]) -> Option<DatTable<'_>> {
-    let row_count = u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?) as usize;
-    if row_count == 0 {
-        return None;
-    }
-    // The heap marker is 0xBB×8 -- the same bytes a future fixed-row field
-    // could hold (e.g. two adjacent 0xBBBBBBBB sentinels). Accept a candidate
-    // only when the preceding block splits cleanly into rows of >=8 bytes;
-    // otherwise it's a false positive inside row data, so keep scanning.
-    let marker_pos = {
-        let mut pos = None;
-        let mut search_from = 4; // offsets 0..4 are the row_count header
-        while let Some(rel) = bytes.get(search_from..).and_then(|s| {
-            s.windows(ACTIVESKILLS_ROW_MARKER.len())
-                .position(|w| w == ACTIVESKILLS_ROW_MARKER)
-        }) {
-            let candidate = search_from + rel;
-            let block_len = candidate - 4;
-            if block_len % row_count == 0 && block_len / row_count >= 8 {
-                pos = Some(candidate);
-                break;
-            }
-            search_from = candidate + 1; // step by 1: 0xBB runs can overlap
-        }
-        pos?
-    };
-    // `marker_pos - 4` divides evenly into >=8-byte rows by construction above.
-    let row_block = bytes.get(4..marker_pos)?;
-    let row_len = row_block.len() / row_count;
-    let heap = bytes.get(marker_pos..)?;
-    Some(DatTable {
-        row_count,
-        row_len,
-        row_block,
-        heap,
-    })
 }
 
 fn parse_activeskill_rows(bytes: &[u8]) -> Option<ActiveSkillRows> {
@@ -778,32 +739,6 @@ fn push_min_len_alias(values: &mut Vec<(String, AliasRank)>, value: String, rank
     }
 }
 
-/// Reads a null-terminated UTF-16LE string starting at `offset` in `heap`.
-/// `None` for an out-of-range offset, an unterminated run, or invalid
-/// UTF-16 -- any of which mean `offset` wasn't really a string pointer.
-fn utf16le_string_at(heap: &[u8], offset: usize) -> Option<String> {
-    let mut units = Vec::new();
-    let mut i = offset;
-    let mut terminated = false;
-    while i + 1 < heap.len() {
-        let unit = u16::from_le_bytes([heap[i], heap[i + 1]]);
-        if unit == 0 {
-            terminated = true;
-            break;
-        }
-        units.push(unit);
-        i += 2;
-        if units.len() > 200 {
-            return None;
-        }
-    }
-    // A run that reaches end-of-heap without a NUL isn't a real string pointer.
-    if !terminated || units.is_empty() {
-        return None;
-    }
-    String::from_utf16(&units).ok()
-}
-
 fn is_plausible_skill_id(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 100
@@ -815,18 +750,12 @@ fn is_plausible_display_name(s: &str) -> bool {
     !s.is_empty() && s.len() <= 100 && s.chars().all(|c| !c.is_control())
 }
 
-/// GGG's translation tooling tags some rows with a leading bracketed
-/// annotation (`"[DNT] ..."`, `"[DNT-UNUSED] ..."`, `"[UNUSED] ..."`). The
-/// tag is not a reliability signal by itself: `smite`'s only row is
-/// `"[DNT-UNUSED] Smite"` despite Smite being a real, current skill, and
-/// `herald_of_blood`'s was `"[DNT] herald_of_blood"` despite that skill
-/// being live (confirmed against a real install and the wiki). Strip the
-/// tag and trust the remainder, except where the remainder itself reads as
-/// a dead/placeholder marker rather than a name -- checked against all 113
-/// tagged rows in a live install (2026-07-08): exactly 4 matched one of
-/// these markers ("DISCONTINUED", "(NOT CURRENTLY USED)", "A placeholder
-/// self-buff"), the other 109 were real skill names.
-fn clean_display_name(name: &str) -> Option<String> {
+/// Leading bracketed tags (`[DNT]`, `[DNT-UNUSED]`, `[UNUSED]`) are not a
+/// reliability signal: live skills like Smite carry them. Strip the tag and
+/// trust the remainder unless it reads as a dead/placeholder marker — of
+/// 113 tagged rows on a live install, only 4 matched such markers
+/// ("DISCONTINUED", "(NOT CURRENTLY USED)", "A placeholder self-buff").
+pub(super) fn clean_display_name(name: &str) -> Option<String> {
     let stripped = match name.strip_prefix('[') {
         Some(rest) => rest.split_once(']')?.1.trim_start(),
         None => name,
@@ -853,6 +782,8 @@ fn clean_display_name(name: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    const TEST_ROW_MARKER: [u8; 8] = [0xbb; 8];
+
     #[test]
     fn spells_folder_extracts_top_level_segment_across_spellings() {
         for (path, expected) in [
@@ -876,18 +807,24 @@ mod tests {
 
     #[test]
     fn filter_resolves_levels_case_insensitively_and_defaults_to_reduced() {
-        assert!(EffectsFilter::new(&[]).is_none());
+        assert!(EffectsFilter::new(&[], BTreeSet::new()).is_none());
         // Explicit Reduced entries are meaningless and collapse to None.
-        assert!(EffectsFilter::new(&[EffectSkillOverride {
-            folder: "arc_02".to_string(),
-            level: EffectLevel::Reduced,
-        }])
+        assert!(EffectsFilter::new(
+            &[EffectSkillOverride {
+                folder: "arc_02".to_string(),
+                level: EffectLevel::Reduced,
+            }],
+            BTreeSet::new()
+        )
         .is_none());
 
-        let filter = EffectsFilter::new(&[EffectSkillOverride {
-            folder: "cold_herald_of_ice".to_string(),
-            level: EffectLevel::Full,
-        }])
+        let filter = EffectsFilter::new(
+            &[EffectSkillOverride {
+                folder: "cold_herald_of_ice".to_string(),
+                level: EffectLevel::Full,
+            }],
+            BTreeSet::new(),
+        )
         .unwrap();
         assert_eq!(
             filter.level_for("Metadata/Effects/Spells/Cold_Herald_Of_Ice/ao/ice_explosion.ao"),
@@ -903,6 +840,52 @@ mod tests {
         );
         assert_eq!(
             filter.level_for("metadata/effects/spells/loose_file.ao"),
+            EffectLevel::Reduced
+        );
+    }
+
+    #[test]
+    fn filter_resolves_monster_paths_exactly_and_composes_with_folders() {
+        let monster_paths: BTreeSet<String> = [
+            "metadata/effects/spells/monsters_effects/act3/anchoritemother/idle.ao".to_string(),
+        ]
+        .into();
+        // Monster paths alone are enough to construct a filter.
+        let filter = EffectsFilter::new(&[], monster_paths.clone()).unwrap();
+        assert!(filter.has_full());
+        assert_eq!(
+            filter.level_for(
+                "Metadata\\Effects\\Spells\\monsters_effects\\act3\\AnchoriteMother\\idle.ao"
+            ),
+            EffectLevel::Full
+        );
+        // Sibling files of the same monster folder stay Reduced.
+        assert_eq!(
+            filter.level_for("metadata/effects/spells/monsters_effects/act3/anchoritemother/death.ao"),
+            EffectLevel::Reduced
+        );
+
+        // Skill folders and monster paths compose.
+        let filter = EffectsFilter::new(
+            &[EffectSkillOverride {
+                folder: "fireball".to_string(),
+                level: EffectLevel::Full,
+            }],
+            monster_paths,
+        )
+        .unwrap();
+        assert_eq!(
+            filter.level_for("metadata/effects/spells/fireball/fireball.ao"),
+            EffectLevel::Full
+        );
+        assert_eq!(
+            filter.level_for(
+                "metadata/effects/spells/monsters_effects/act3/anchoritemother/idle.ao"
+            ),
+            EffectLevel::Full
+        );
+        assert_eq!(
+            filter.level_for("metadata/effects/spells/arc_02/arc.aoc"),
             EffectLevel::Reduced
         );
     }
@@ -924,7 +907,7 @@ mod tests {
     }
 
     fn build_activeskills_with_actions(rows: &[(&str, &str, u32)]) -> Vec<u8> {
-        let mut heap = ACTIVESKILLS_ROW_MARKER.to_vec();
+        let mut heap = TEST_ROW_MARKER.to_vec();
         let mut offsets = Vec::new();
         for (id, name, action_idx) in rows {
             let id_off = push_utf16(&mut heap, id);
@@ -946,7 +929,7 @@ mod tests {
     }
 
     fn build_actiontypes_bytes(rows: &[&str]) -> Vec<u8> {
-        let mut heap = ACTIVESKILLS_ROW_MARKER.to_vec();
+        let mut heap = TEST_ROW_MARKER.to_vec();
         let offsets: Vec<_> = rows.iter().map(|id| push_utf16(&mut heap, id)).collect();
 
         let mut bytes = Vec::new();
@@ -967,7 +950,7 @@ mod tests {
     }
 
     fn build_label_path_table_bytes(rows: &[(&str, &str)]) -> Vec<u8> {
-        let mut heap = ACTIVESKILLS_ROW_MARKER.to_vec();
+        let mut heap = TEST_ROW_MARKER.to_vec();
         let offsets: Vec<_> = rows
             .iter()
             .map(|(label, path)| (push_utf16(&mut heap, label), push_utf16(&mut heap, path)))
@@ -1516,14 +1499,14 @@ mod tests {
         // bytes (0xBB x8) -- a decoy a naive first-match scan would mistake for
         // the heap boundary. It sits at file offset 12, giving block_len 8 and
         // 8 % 3 != 0, so it's rejected; the real marker is at 4 + 3*16 = 52.
-        let mut heap = ACTIVESKILLS_ROW_MARKER.to_vec();
+        let mut heap = TEST_ROW_MARKER.to_vec();
         let hello_off = push_utf16(&mut heap, "Hello");
 
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&3u32.to_le_bytes());
         // row 0: real string offset, then the decoy marker
         bytes.extend_from_slice(&hello_off.to_le_bytes());
-        bytes.extend_from_slice(&ACTIVESKILLS_ROW_MARKER);
+        bytes.extend_from_slice(&TEST_ROW_MARKER);
         // rows 1 and 2: empty
         bytes.extend_from_slice(&[0u8; 32]);
         bytes.extend_from_slice(&heap);

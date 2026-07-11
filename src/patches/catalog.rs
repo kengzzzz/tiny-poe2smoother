@@ -1,5 +1,6 @@
 use super::color_mods::{default_color_mods, ColorModEntry};
 use super::effect_skills::EffectSkillOverride;
+use super::monster_effects::MonsterEffectOverride;
 use crate::bundle::BundleFile;
 use std::collections::HashMap;
 
@@ -64,6 +65,9 @@ pub struct PatchParams {
     /// Non-default per-skill overrides for `Effects`; empty = every skill
     /// folder at `Reduced` (the patch's long-standing behavior).
     pub effect_skills: Vec<EffectSkillOverride>,
+    /// Non-default per-monster overrides for `Effects`; empty = every
+    /// monster at `Reduced`.
+    pub monster_effects: Vec<MonsterEffectOverride>,
 }
 
 impl Default for PatchParams {
@@ -72,6 +76,7 @@ impl Default for PatchParams {
             zoom: 2.4,
             color_mods: default_color_mods(),
             effect_skills: Vec::new(),
+            monster_effects: Vec::new(),
         }
     }
 }

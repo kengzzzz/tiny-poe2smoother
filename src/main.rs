@@ -9,13 +9,14 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use tiny_poe2smoother::app::{
-    apply_patches, load_effect_skill_catalog, load_stat_catalog, load_status, restore_backup,
-    AppStatus, ApplyReport, PatchRequest, RestoreReport,
+    apply_patches, load_effect_skill_catalog, load_monster_effect_catalog, load_stat_catalog,
+    load_status, restore_backup, AppStatus, ApplyReport, PatchRequest, RestoreReport,
 };
 use tiny_poe2smoother::install::display_path;
 use tiny_poe2smoother::patches::{
     all_patches, default_color_mods, display_stat_text, merge_with_defaults, parse_patch,
-    ColorModEntry, EffectLevel, EffectSkillCatalogEntry, EffectSkillOverride, PatchId, PatchParams,
+    ColorModEntry, EffectLevel, EffectSkillCatalogEntry, EffectSkillOverride,
+    MonsterEffectCatalogEntry, MonsterEffectOverride, PatchId, PatchParams,
 };
 
 const PREFS_KEY: &str = "tiny-poe2smoother.gui.v1";
@@ -69,6 +70,15 @@ struct GuiApp {
     effect_catalog_dir: Option<PathBuf>,
     effects_filter_key: Option<(String, usize)>,
     effects_filter_rows: Vec<usize>,
+    monster_overrides: HashMap<String, EffectLevel>,
+    show_monsters_editor: bool,
+    monsters_search: String,
+    monster_catalog: Option<Vec<MonsterCatalogRow>>,
+    monster_catalog_task: Option<Receiver<Result<Vec<MonsterCatalogRow>, String>>>,
+    monster_catalog_error: Option<String>,
+    monster_catalog_dir: Option<PathBuf>,
+    monsters_filter_key: Option<(String, usize)>,
+    monsters_filter_rows: Vec<usize>,
     status: Option<AppStatus>,
     message: String,
     message_kind: MessageKind,
@@ -116,6 +126,15 @@ struct EffectFolderRow {
     search_lower: String,
 }
 
+/// One visible monster row in the per-monster effects editor. A row owns
+/// every monster variant (runemarked etc.) sharing its display name.
+struct MonsterCatalogRow {
+    monster_keys: Vec<String>,
+    display: String,
+    display_lower: String,
+    search_lower: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GuiPrefs {
     game_dir_input: String,
@@ -125,6 +144,8 @@ struct GuiPrefs {
     color_mods: Vec<ColorModEntry>,
     #[serde(default)]
     effect_skills: Vec<EffectSkillOverride>,
+    #[serde(default)]
+    monster_effects: Vec<MonsterEffectOverride>,
 }
 
 enum TaskResult {
@@ -163,6 +184,15 @@ impl Default for GuiApp {
             effect_catalog_dir: None,
             effects_filter_key: None,
             effects_filter_rows: Vec::new(),
+            monster_overrides: HashMap::new(),
+            show_monsters_editor: false,
+            monsters_search: String::new(),
+            monster_catalog: None,
+            monster_catalog_task: None,
+            monster_catalog_error: None,
+            monster_catalog_dir: None,
+            monsters_filter_key: None,
+            monsters_filter_rows: Vec::new(),
             status: None,
             message: "Ready.".to_string(),
             message_kind: MessageKind::Info,
@@ -190,6 +220,7 @@ impl eframe::App for GuiApp {
         self.poll_task(ctx);
         self.poll_catalog(ctx);
         self.poll_effect_catalog(ctx);
+        self.poll_monster_catalog(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -235,12 +266,20 @@ impl GuiApp {
             .filter(|entry| entry.level != EffectLevel::Reduced)
             .map(|entry| (entry.folder.to_ascii_lowercase(), entry.level))
             .collect();
+        // Same policy for monsters: stale keys resolve to no paths at apply.
+        let monster_overrides = prefs
+            .monster_effects
+            .into_iter()
+            .filter(|entry| entry.level != EffectLevel::Reduced)
+            .map(|entry| (entry.monster.to_ascii_lowercase(), entry.level))
+            .collect();
         Self {
             game_dir_input: prefs.game_dir_input,
             selected_patches,
             zoom: prefs.zoom.clamp(1.2, 2.4),
             color_mods,
             effect_overrides,
+            monster_overrides,
             ..Self::default()
         }
     }
@@ -257,6 +296,7 @@ impl GuiApp {
             zoom: self.zoom,
             color_mods: self.color_mods.clone(),
             effect_skills: self.effect_skill_overrides(),
+            monster_effects: self.monster_effect_overrides(),
         }
     }
 
@@ -272,6 +312,21 @@ impl GuiApp {
             })
             .collect();
         overrides.sort_by(|a, b| a.folder.cmp(&b.folder));
+        overrides
+    }
+
+    /// The non-default per-monster levels as a key-sorted list (stable
+    /// serialization order for prefs and `PatchParams`).
+    fn monster_effect_overrides(&self) -> Vec<MonsterEffectOverride> {
+        let mut overrides: Vec<MonsterEffectOverride> = self
+            .monster_overrides
+            .iter()
+            .map(|(monster, level)| MonsterEffectOverride {
+                monster: monster.clone(),
+                level: *level,
+            })
+            .collect();
+        overrides.sort_by(|a, b| a.monster.cmp(&b.monster));
         overrides
     }
 
@@ -311,6 +366,7 @@ impl GuiApp {
                 zoom: self.zoom,
                 color_mods: self.color_mods.clone(),
                 effect_skills: self.effect_skill_overrides(),
+                monster_effects: self.monster_effect_overrides(),
             },
         })
     }
@@ -710,6 +766,184 @@ impl GuiApp {
             .count();
         catalog_kept + uncataloged_full
     }
+
+    /// Discard a stale monster catalog (and its in-flight load / filter
+    /// cache) when the target game dir no longer matches the one it was
+    /// loaded for. `monster_overrides` intentionally survive — stale keys
+    /// simply resolve to no paths at apply (see `from_prefs`).
+    fn invalidate_monster_catalog_if_stale(&mut self, game_dir: &Option<PathBuf>) {
+        if self.monster_catalog_dir.as_deref() != game_dir.as_deref() {
+            self.monster_catalog = None;
+            self.monster_catalog_task = None;
+            self.monster_catalog_error = None;
+            self.monsters_filter_key = None;
+            self.monsters_filter_rows.clear();
+        }
+    }
+
+    /// Kick off the background monster-catalog load for the monster editor
+    /// if it hasn't run yet. Like the other catalog loads, deliberately NOT
+    /// `spawn`: the editor should stay usable while it loads. Unlike the
+    /// skill catalog this reads every monster metadata file, so it is only
+    /// started when the editor is actually opened.
+    fn ensure_monster_catalog_loading(&mut self) {
+        let game_dir = self.game_dir();
+        self.invalidate_monster_catalog_if_stale(&game_dir);
+        if self.monster_catalog.is_some() || self.monster_catalog_task.is_some() {
+            return;
+        }
+        self.monster_catalog_error = None;
+        let (tx, rx) = mpsc::channel();
+        self.monster_catalog_task = Some(rx);
+        self.monster_catalog_dir = game_dir.clone();
+        thread::spawn(move || {
+            let result = load_monster_effect_catalog(game_dir)
+                .map(monster_effect_catalog_rows)
+                .map_err(|err| err.to_string());
+            let _ = tx.send(result);
+        });
+    }
+
+    fn poll_monster_catalog(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.monster_catalog_task else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(rows)) => {
+                self.monster_catalog_task = None;
+                self.monster_catalog = Some(rows);
+            }
+            Ok(Err(err)) => {
+                self.monster_catalog_task = None;
+                self.monster_catalog_error = Some(err);
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                if self.show_monsters_editor {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(33));
+                }
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.monster_catalog_task = None;
+                self.monster_catalog_error = Some("monster catalog task failed".to_string());
+            }
+        }
+    }
+
+    /// Rebuild `monsters_filter_rows` (indices into `monster_catalog`
+    /// matching the query) if stale. Level edits never invalidate the cache —
+    /// the visible set only depends on the query and the catalog.
+    fn refresh_monsters_filter(&mut self) {
+        let catalog_len = self.monster_catalog.as_ref().map_or(0, Vec::len);
+        let fresh = self
+            .monsters_filter_key
+            .as_ref()
+            .is_some_and(|(query, catalog)| {
+                *query == self.monsters_search && *catalog == catalog_len
+            });
+        if !fresh {
+            let query = gui::search::SearchQuery::parse(&self.monsters_search);
+            self.monsters_filter_rows = self
+                .monster_catalog
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| query.matches(&row.search_lower, &row.display_lower))
+                .map(|(idx, _)| idx)
+                .collect();
+            self.monsters_filter_key = Some((self.monsters_search.clone(), catalog_len));
+        }
+    }
+
+    fn apply_monster_level_to_filtered_rows(&mut self, level: EffectLevel) {
+        self.refresh_monsters_filter();
+        let catalog = self.monster_catalog.as_deref().unwrap_or_default();
+        let keys: Vec<String> = self
+            .monsters_filter_rows
+            .iter()
+            .flat_map(|&idx| catalog[idx].monster_keys.iter().cloned())
+            .collect();
+        for key in keys {
+            if level == EffectLevel::Reduced {
+                self.monster_overrides.remove(&key);
+            } else {
+                self.monster_overrides.insert(key, level);
+            }
+        }
+    }
+
+    fn monster_level_for_keys(&self, keys: &[String]) -> Option<EffectLevel> {
+        let mut levels = keys.iter().map(|key| {
+            self.monster_overrides
+                .get(key)
+                .copied()
+                .unwrap_or_default()
+        });
+        let first = levels.next()?;
+        levels.all(|level| level == first).then_some(first)
+    }
+
+    /// Runs on every repaint of the main view, so it stays linear in
+    /// catalog + overrides. Same counting policy as the skill caption: a row
+    /// counts once however many of its variants are kept, and overridden
+    /// keys absent from the catalog count once each.
+    fn kept_original_monster_count(&self) -> usize {
+        let catalog = self.monster_catalog.as_deref().unwrap_or(&[]);
+        let catalog_kept = catalog
+            .iter()
+            .filter(|row| {
+                row.monster_keys
+                    .iter()
+                    .any(|key| self.monster_overrides.contains_key(key))
+            })
+            .count();
+        let cataloged: HashSet<&str> = catalog
+            .iter()
+            .flat_map(|row| row.monster_keys.iter().map(String::as_str))
+            .collect();
+        let uncataloged_full = self
+            .monster_overrides
+            .iter()
+            .filter(|(key, level)| {
+                **level == EffectLevel::Full && !cataloged.contains(key.as_str())
+            })
+            .count();
+        catalog_kept + uncataloged_full
+    }
+}
+
+fn monster_effect_catalog_rows(entries: Vec<MonsterEffectCatalogEntry>) -> Vec<MonsterCatalogRow> {
+    // Rows are grouped per (display, family): when several families share a
+    // display name ("Daemon"), suffix the family so the rows stay tellable
+    // apart in the list.
+    let mut display_counts: HashMap<String, usize> = HashMap::new();
+    for entry in &entries {
+        *display_counts.entry(entry.display.to_lowercase()).or_default() += 1;
+    }
+    entries
+        .into_iter()
+        .map(|entry| {
+            let search_lower = format!(
+                "{} {} {} {}",
+                entry.display.to_lowercase(),
+                entry.family,
+                entry.monster_keys.join(" "),
+                entry.search_aliases.join(" ")
+            );
+            let display_lower = entry.display.to_lowercase();
+            let display = if display_counts.get(&display_lower).copied().unwrap_or(0) > 1 {
+                format!("{} ({})", entry.display, entry.family)
+            } else {
+                entry.display
+            };
+            MonsterCatalogRow {
+                monster_keys: entry.monster_keys,
+                display_lower,
+                display,
+                search_lower,
+            }
+        })
+        .collect()
 }
 
 fn effect_skill_catalog_rows(entries: Vec<EffectSkillCatalogEntry>) -> Vec<EffectFolderRow> {
@@ -747,6 +981,7 @@ mod tests {
             zoom: 9.0,
             color_mods: Vec::new(),
             effect_skills: Vec::new(),
+            monster_effects: Vec::new(),
         });
 
         assert_eq!(
@@ -773,6 +1008,7 @@ mod tests {
             zoom: 2.4,
             color_mods: saved,
             effect_skills: Vec::new(),
+            monster_effects: Vec::new(),
         });
 
         let edited = app
@@ -803,6 +1039,7 @@ mod tests {
                     level: EffectLevel::Full,
                 },
             ],
+            monster_effects: Vec::new(),
         });
 
         assert_eq!(
@@ -859,6 +1096,7 @@ mod tests {
                     folder: "fireball".to_string(),
                     level: EffectLevel::Reduced,
                 }],
+                monster_effects: Vec::new(),
             },
         );
         let saved = storage.values.get_mut(PREFS_KEY).unwrap();
@@ -894,6 +1132,237 @@ mod tests {
         app.effect_overrides.clear();
         let request = app.patch_request().unwrap();
         assert!(request.params.effect_skills.is_empty());
+    }
+
+    fn monster_row(display: &str, keys: &[&str]) -> MonsterCatalogRow {
+        let monster_keys: Vec<String> = keys.iter().map(|key| key.to_string()).collect();
+        MonsterCatalogRow {
+            display_lower: display.to_lowercase(),
+            search_lower: format!("{} {}", display.to_lowercase(), monster_keys.join(" ")),
+            display: display.to_string(),
+            monster_keys,
+        }
+    }
+
+    #[test]
+    fn prefs_round_trip_monster_overrides_and_drop_reduced_entries() {
+        let mother = "metadata/monsters/anchorite/anchoritemother/anchoritemother";
+        let app = GuiApp::from_prefs(GuiPrefs {
+            game_dir_input: String::new(),
+            selected_patches: vec!["fog".to_string()],
+            zoom: 2.4,
+            color_mods: Vec::new(),
+            effect_skills: Vec::new(),
+            monster_effects: vec![
+                MonsterEffectOverride {
+                    monster: "metadata/monsters/boghulk/boghulk".to_string(),
+                    level: EffectLevel::Reduced,
+                },
+                MonsterEffectOverride {
+                    // Mixed case in old prefs still keys correctly.
+                    monster: mother.to_uppercase(),
+                    level: EffectLevel::Full,
+                },
+            ],
+        });
+
+        assert_eq!(app.monster_overrides.get(mother), Some(&EffectLevel::Full));
+        // Explicit Reduced entries are meaningless and dropped on load.
+        assert!(!app
+            .monster_overrides
+            .contains_key("metadata/monsters/boghulk/boghulk"));
+
+        // Saved back key-sorted, non-default only.
+        assert_eq!(
+            app.prefs().monster_effects,
+            vec![MonsterEffectOverride {
+                monster: mother.to_string(),
+                level: EffectLevel::Full,
+            }]
+        );
+    }
+
+    #[test]
+    fn patch_request_embeds_monster_overrides() {
+        let mut app = GuiApp {
+            selected_patches: [PatchId::Effects].into_iter().collect(),
+            ..GuiApp::default()
+        };
+        app.monster_overrides.insert(
+            "metadata/monsters/boghulk/boghulk".to_string(),
+            EffectLevel::Full,
+        );
+
+        let request = app.patch_request().unwrap();
+
+        assert_eq!(
+            request.params.monster_effects,
+            vec![MonsterEffectOverride {
+                monster: "metadata/monsters/boghulk/boghulk".to_string(),
+                level: EffectLevel::Full,
+            }]
+        );
+    }
+
+    #[test]
+    fn monsters_filter_matches_display_and_key_text() {
+        let mut app = GuiApp {
+            monster_catalog: Some(vec![
+                monster_row(
+                    "Filthy First-born",
+                    &["metadata/monsters/anchorite/anchoritemother/anchoritemother"],
+                ),
+                monster_row("Bog Hulk", &["metadata/monsters/boghulk/boghulk"]),
+            ]),
+            ..GuiApp::default()
+        };
+
+        app.monsters_search = "anchoritemother".to_string();
+        app.refresh_monsters_filter();
+        assert_eq!(app.monsters_filter_rows, vec![0]);
+
+        app.monsters_search.clear();
+        app.refresh_monsters_filter();
+        assert_eq!(app.monsters_filter_rows, vec![0, 1]);
+    }
+
+    #[test]
+    fn monster_bulk_level_applies_to_filtered_rows_only() {
+        let mother = "metadata/monsters/anchorite/anchoritemother/anchoritemother";
+        let runemarked =
+            "metadata/monsters/anchorite/anchoritemother/runemarked/anchoritemotherrunemarked";
+        let mut app = GuiApp {
+            monster_catalog: Some(vec![
+                monster_row("Filthy First-born", &[mother, runemarked]),
+                monster_row("Bog Hulk", &["metadata/monsters/boghulk/boghulk"]),
+            ]),
+            ..GuiApp::default()
+        };
+
+        app.monsters_search = "first-born".to_string();
+        app.apply_monster_level_to_filtered_rows(EffectLevel::Full);
+        assert_eq!(app.monster_overrides.get(mother), Some(&EffectLevel::Full));
+        assert_eq!(
+            app.monster_overrides.get(runemarked),
+            Some(&EffectLevel::Full)
+        );
+        assert!(!app
+            .monster_overrides
+            .contains_key("metadata/monsters/boghulk/boghulk"));
+
+        app.apply_monster_level_to_filtered_rows(EffectLevel::Reduced);
+        assert!(app.monster_overrides.is_empty());
+    }
+
+    #[test]
+    fn kept_original_monster_count_groups_rows_and_keeps_stale_keys() {
+        let mother = "metadata/monsters/anchorite/anchoritemother/anchoritemother";
+        let runemarked =
+            "metadata/monsters/anchorite/anchoritemother/runemarked/anchoritemotherrunemarked";
+        let mut app = GuiApp::default();
+        app.monster_overrides
+            .insert(mother.to_string(), EffectLevel::Full);
+        app.monster_overrides
+            .insert(runemarked.to_string(), EffectLevel::Full);
+        // Without a catalog every overridden key counts once.
+        assert_eq!(app.kept_original_monster_count(), 2);
+
+        // With the catalog the two variants collapse into one row; a stale
+        // key absent from the catalog still counts.
+        app.monster_catalog = Some(vec![monster_row("Filthy First-born", &[mother, runemarked])]);
+        assert_eq!(app.kept_original_monster_count(), 1);
+        app.monster_overrides.insert(
+            "metadata/monsters/removed/removed".to_string(),
+            EffectLevel::Full,
+        );
+        assert_eq!(app.kept_original_monster_count(), 2);
+
+        // A mixed row (only one variant still Full) stays counted.
+        app.monster_overrides.remove(runemarked);
+        assert_eq!(app.kept_original_monster_count(), 2);
+    }
+
+    #[test]
+    fn monster_catalog_invalidates_only_when_game_dir_changes() {
+        let mut app = GuiApp {
+            monster_catalog: Some(vec![monster_row(
+                "Bog Hulk",
+                &["metadata/monsters/boghulk/boghulk"],
+            )]),
+            monster_catalog_dir: Some(PathBuf::from("/install/A")),
+            monsters_filter_key: Some(("q".to_string(), 1)),
+            monsters_filter_rows: vec![0],
+            ..GuiApp::default()
+        };
+        app.monster_overrides.insert(
+            "metadata/monsters/boghulk/boghulk".to_string(),
+            EffectLevel::Full,
+        );
+
+        // Same dir: nothing is discarded.
+        app.invalidate_monster_catalog_if_stale(&Some(PathBuf::from("/install/A")));
+        assert!(app.monster_catalog.is_some());
+        assert_eq!(app.monsters_filter_rows, vec![0]);
+
+        // Different dir: catalog + filter cache reset, overrides untouched.
+        app.invalidate_monster_catalog_if_stale(&Some(PathBuf::from("/install/B")));
+        assert!(app.monster_catalog.is_none());
+        assert!(app.monster_catalog_task.is_none());
+        assert!(app.monster_catalog_error.is_none());
+        assert!(app.monsters_filter_key.is_none());
+        assert!(app.monsters_filter_rows.is_empty());
+        assert_eq!(
+            app.monster_overrides
+                .get("metadata/monsters/boghulk/boghulk"),
+            Some(&EffectLevel::Full)
+        );
+    }
+
+    #[test]
+    fn monster_catalog_rows_carry_search_text_and_variant_keys() {
+        let rows = monster_effect_catalog_rows(vec![MonsterEffectCatalogEntry {
+            display: "Filthy First-born".to_string(),
+            monster_keys: vec![
+                "metadata/monsters/anchorite/anchoritemother/anchoritemother".to_string(),
+            ],
+            family: "anchorite".to_string(),
+            search_aliases: vec!["shroomlady".to_string()],
+        }]);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].display, "Filthy First-born");
+        assert_eq!(rows[0].display_lower, "filthy first-born");
+        assert!(rows[0].search_lower.contains("anchorite"));
+        assert!(rows[0].search_lower.contains("anchoritemother"));
+        // Hand-verified aliases are searchable but never shown as the name.
+        assert!(rows[0].search_lower.contains("shroomlady"));
+        assert!(!rows[0].display.contains("shroomlady"));
+    }
+
+    #[test]
+    fn monster_catalog_rows_suffix_family_on_duplicate_display_names() {
+        let entry = |display: &str, family: &str, key: &str| MonsterEffectCatalogEntry {
+            display: display.to_string(),
+            monster_keys: vec![key.to_string()],
+            family: family.to_string(),
+            search_aliases: Vec::new(),
+        };
+        let rows = monster_effect_catalog_rows(vec![
+            entry("Daemon", "daemon", "metadata/monsters/daemon/daemon"),
+            entry(
+                "Daemon",
+                "leaguedelirium",
+                "metadata/monsters/leaguedelirium/deliriumskilldaemoncold",
+            ),
+            entry("Bog Hulk", "boghulk", "metadata/monsters/boghulk/boghulk"),
+        ]);
+
+        // Duplicate display names get the family suffix; unique ones do not.
+        assert_eq!(rows[0].display, "Daemon (daemon)");
+        assert_eq!(rows[1].display, "Daemon (leaguedelirium)");
+        assert_eq!(rows[2].display, "Bog Hulk");
+        // The filter still keys off the raw display text.
+        assert!(rows.iter().take(2).all(|row| row.display_lower == "daemon"));
     }
 
     #[test]
@@ -1136,6 +1605,7 @@ mod tests {
             zoom: 2.4,
             color_mods: Vec::new(),
             effect_skills: Vec::new(),
+            monster_effects: Vec::new(),
         });
         app.stat_catalog = Some(vec![
             catalog_row(
