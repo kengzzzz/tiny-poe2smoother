@@ -3,7 +3,7 @@ use super::ggpk::{
     ggpk_file_record, ggpk_find_file, ggpk_find_pdir, ggpk_name_hash, ggpk_pdir_record,
     GgpkArchive, GgpkFileSpan, GgpkPatchPlan, GgpkPdirEntry,
 };
-use super::hashing::HashMode;
+use super::hashing::{fnv1a_bundle_hash, HashMode};
 use super::index::{BundleFile, BundleIndex, BundleInfo, DirectoryRecord};
 use crate::backup::GgpkBackupMeta;
 use crate::install::{detect_install_layout, InstallLayout};
@@ -215,7 +215,11 @@ impl BundleStore {
         let base = dirs::data_local_dir()
             .or_else(dirs::data_dir)
             .unwrap_or_else(|| PathBuf::from("/tmp"));
-        base.join("tiny-poe2smoother").join("index-cache.bin")
+        // Scoped per install: a shared file would let a second install (or a
+        // test suite's temp store) clobber or clear the real install's cache.
+        let tag = fnv1a_bundle_hash(&self.index_path.to_string_lossy());
+        base.join("tiny-poe2smoother")
+            .join(format!("index-cache-{tag:016x}.bin"))
     }
 
     fn read_cache(&self) -> Option<BundleIndex> {
@@ -284,10 +288,19 @@ impl BundleStore {
         } else {
             data.write_u8(0).ok();
         }
-        if let Some(parent) = self.cache_path().parent() {
+        let path = self.cache_path();
+        if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let _ = fs::write(self.cache_path(), &data);
+        // Write-then-rename so concurrent readers never observe a torn
+        // cache file (a failed parse silently forces a full index rebuild).
+        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        if fs::write(&tmp, &data).is_ok() && fs::rename(&tmp, &path).is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        // Pre-scoping releases used one shared file; drop it so upgrades
+        // don't leave a large orphan behind.
+        let _ = fs::remove_file(path.with_file_name("index-cache.bin"));
     }
 
     pub fn clear_cache(&self) {
@@ -301,6 +314,18 @@ impl BundleStore {
         crate::timing!("index_read");
         if let Some(cached) = self.read_cache() {
             tracing::debug!("using cached index metadata");
+            return Ok(cached);
+        }
+        // Cache miss. Rebuilds are expensive (full decompress + path build
+        // across all cores), and several background threads may open the
+        // index at once, so collapse concurrent misses into one rebuild;
+        // late arrivals re-read the cache the winner just wrote.
+        static REBUILD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = REBUILD_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cached) = self.read_cache() {
+            tracing::debug!("using index metadata cached by concurrent rebuild");
             return Ok(cached);
         }
         let bytes = self.read_index_bytes()?;
