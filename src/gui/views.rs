@@ -9,7 +9,7 @@ use tiny_poe2smoother::patches::{
 use super::icon;
 use super::theme::{self, palette};
 use super::widgets;
-use crate::{ColorRowRef, GuiApp, MessageKind};
+use crate::{ColorRowRef, EffectsEditorTab, GuiApp, MessageKind};
 
 const GROUPS: &[(&str, &[PatchId])] = &[
     (
@@ -274,11 +274,19 @@ fn draw_patch_group(app: &mut GuiApp, ui: &mut egui::Ui, title: &str, patch_ids:
                 draw_color_mods_row(app, ui);
             }
             if patch_id == PatchId::Effects {
-                draw_effect_skills_row(app, ui);
-                draw_effect_monsters_row(app, ui);
+                draw_effects_row(app, ui);
             }
         }
     });
+}
+
+/// `1 skill`, `2 skills` — count with a singular/plural noun.
+fn count_label(count: usize, noun: &str) -> String {
+    if count == 1 {
+        format!("{count} {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
 }
 
 fn draw_color_mods_row(app: &mut GuiApp, ui: &mut egui::Ui) {
@@ -292,18 +300,23 @@ fn draw_color_mods_row(app: &mut GuiApp, ui: &mut egui::Ui) {
             app.ensure_catalog_loading();
         }
         let enabled = app.color_mods.iter().filter(|entry| entry.enabled).count();
-        ui.label(theme::caption_text(&format!("{enabled} mod(s) enabled")));
+        ui.label(theme::caption_text(&format!(
+            "{} enabled",
+            count_label(enabled, "mod")
+        )));
     });
 }
 
-fn draw_effect_skills_row(app: &mut GuiApp, ui: &mut egui::Ui) {
+fn draw_effects_row(app: &mut GuiApp, ui: &mut egui::Ui) {
     if !app.selected_patches.contains(&PatchId::Effects) {
         return;
     }
     // The caption groups per skill only once the catalog is in, so start the
     // load right away instead of waiting for the editor to be opened. The
     // error guard keeps a failed load from respawning the loader every frame;
-    // the editor's Retry button clears it for manual retries.
+    // the editor's Retry button clears it for manual retries. The monster
+    // catalog reads every monster metadata file, so it only loads once its
+    // editor tab is shown.
     if app.effect_catalog.is_none()
         && app.effect_catalog_task.is_none()
         && app.effect_catalog_error.is_none()
@@ -312,37 +325,20 @@ fn draw_effect_skills_row(app: &mut GuiApp, ui: &mut egui::Ui) {
     }
     ui.horizontal(|ui| {
         ui.add_space(26.0);
-        if small_action(ui, "Edit skills…") {
+        if small_action(ui, "Edit effects…") {
             app.show_effects_editor = true;
-            app.ensure_effect_catalog_loading();
+            app.ensure_active_effects_tab_loading();
         }
-        let full = app.kept_original_effect_skill_count();
-        let caption = if full == 0 {
-            "all skills reduced".to_string()
+        let skills = app.kept_original_effect_skill_count();
+        let monsters = app.kept_original_monster_count();
+        let caption = if skills == 0 && monsters == 0 {
+            "all effects reduced".to_string()
         } else {
-            format!("{full} kept original")
-        };
-        ui.label(theme::caption_text(&caption));
-    });
-}
-
-fn draw_effect_monsters_row(app: &mut GuiApp, ui: &mut egui::Ui) {
-    if !app.selected_patches.contains(&PatchId::Effects) {
-        return;
-    }
-    // Unlike the skill catalog, the monster catalog reads every monster
-    // metadata file, so its load starts only when the editor is opened.
-    ui.horizontal(|ui| {
-        ui.add_space(26.0);
-        if small_action(ui, "Edit monsters…") {
-            app.show_monsters_editor = true;
-            app.ensure_monster_catalog_loading();
-        }
-        let full = app.kept_original_monster_count();
-        let caption = if full == 0 {
-            "all monsters reduced".to_string()
-        } else {
-            format!("{full} kept original")
+            format!(
+                "{} · {} kept original",
+                count_label(skills, "skill"),
+                count_label(monsters, "monster")
+            )
         };
         ui.label(theme::caption_text(&caption));
     });
@@ -507,10 +503,6 @@ fn draw_modals(app: &mut GuiApp, ctx: &egui::Context) {
 
     if app.show_effects_editor {
         draw_effects_editor(app, ctx);
-    }
-
-    if app.show_monsters_editor {
-        draw_monsters_editor(app, ctx);
     }
 
     if app.show_game_running_dialog {
@@ -699,84 +691,110 @@ fn color_row_ui(ui: &mut egui::Ui, entry: &mut ColorModEntry, text: Option<&str>
     changed
 }
 
-/// The per-skill effects editor: search box over the skill folders found in
-/// the game files, one row per skill with an on/off smoothing toggle. Same
-/// layout as the color-mods editor.
+/// The effects editor: one modal, a tab per exception list (skills and
+/// monsters). Each tab is a search box over its catalog with one on/off
+/// smoothing toggle per row, same layout as the color-mods editor. Tab
+/// bodies keep separate search/filter/scroll state, and the bulk buttons
+/// only ever touch the active tab's filtered rows.
 fn draw_effects_editor(app: &mut GuiApp, ctx: &egui::Context) {
-    let modal = egui::Modal::new(egui::Id::new("effect_skills_editor"))
+    let modal = egui::Modal::new(egui::Id::new("effects_editor"))
         .frame(widgets::card().inner_margin(20))
         .backdrop_color(egui::Color32::from_black_alpha(140))
         .show(ctx, |ui| {
             ui.set_width(640.0);
-            ui.label(theme::heading_text("Skill effects"));
-            ui.add_space(2.0);
-            ui.label(theme::caption_text(
-                "Toggled on strips heavy client effects (default) · off keeps original visuals.",
-            ));
-            ui.add_space(8.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut app.effects_search)
-                    .hint_text("Search skills — regex like in-game search, \"quotes\", !exclude…")
-                    .desired_width(f32::INFINITY)
-                    .margin(egui::Margin::symmetric(10, 8)),
-            );
-            ui.add_space(6.0);
-            if app.effect_catalog_task.is_some() {
-                ui.horizontal(|ui| {
-                    ui.add(egui::Spinner::new().color(palette::ACCENT));
-                    ui.label(theme::caption_text("Loading skill list from game files…"));
-                });
-                ui.add_space(4.0);
-            } else if let Some(error) = app.effect_catalog_error.clone() {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!("Skill list unavailable: {error}"))
-                            .size(11.5)
-                            .color(palette::WARNING),
-                    );
-                    if small_action(ui, "Retry") {
-                        app.effect_catalog_error = None;
-                        app.ensure_effect_catalog_loading();
-                    }
-                });
-                ui.add_space(4.0);
-            }
-
-            app.refresh_effects_filter();
-            let row_count = app.effects_filter_rows.len();
             ui.horizontal(|ui| {
-                ui.label(theme::caption_text(&format!("{row_count} shown")));
-            });
-            ui.add_space(4.0);
-            egui::ScrollArea::vertical()
-                .max_height(380.0)
-                .auto_shrink([false, false])
-                .show_rows(ui, COLOR_ROW_HEIGHT, row_count, |ui, range| {
-                    for i in range {
-                        let idx = app.effects_filter_rows[i];
-                        draw_effect_skill_row(app, ui, idx);
+                ui.label(theme::heading_text("Effects"));
+                ui.add_space(8.0);
+                for (tab, label) in [
+                    (EffectsEditorTab::Skills, "Skills"),
+                    (EffectsEditorTab::Monsters, "Monsters"),
+                ] {
+                    let active = app.effects_editor_tab == tab;
+                    if ui.add(widgets::chip(label, active)).clicked() && !active {
+                        app.effects_editor_tab = tab;
+                        app.ensure_active_effects_tab_loading();
                     }
-                });
-
-            ui.add_space(10.0);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add(widgets::primary_button("Close")).clicked() {
-                    app.show_effects_editor = false;
                 }
-                ui.add_enabled_ui(row_count > 0, |ui| {
-                    if ui.add(widgets::secondary_button("Uncheck all")).clicked() {
-                        app.apply_effect_level_to_filtered_rows(EffectLevel::Full);
-                    }
-                    if ui.add(widgets::secondary_button("Check all")).clicked() {
-                        app.apply_effect_level_to_filtered_rows(EffectLevel::Reduced);
-                    }
-                });
             });
+            ui.add_space(2.0);
+            match app.effects_editor_tab {
+                EffectsEditorTab::Skills => draw_effects_skills_tab(app, ui),
+                EffectsEditorTab::Monsters => draw_effects_monsters_tab(app, ui),
+            }
         })
         .should_close();
     if modal {
         app.show_effects_editor = false;
     }
+}
+
+fn draw_effects_skills_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
+    ui.label(theme::caption_text(
+        "Toggled on strips heavy client effects (default) · off keeps original visuals.",
+    ));
+    ui.add_space(8.0);
+    ui.add(
+        egui::TextEdit::singleline(&mut app.effects_search)
+            .id_salt("effects_skills_search")
+            .hint_text("Search skills — regex like in-game search, \"quotes\", !exclude…")
+            .desired_width(f32::INFINITY)
+            .margin(egui::Margin::symmetric(10, 8)),
+    );
+    ui.add_space(6.0);
+    if app.effect_catalog_task.is_some() {
+        ui.horizontal(|ui| {
+            ui.add(egui::Spinner::new().color(palette::ACCENT));
+            ui.label(theme::caption_text("Loading skill list from game files…"));
+        });
+        ui.add_space(4.0);
+    } else if let Some(error) = app.effect_catalog_error.clone() {
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!("Skill list unavailable: {error}"))
+                    .size(11.5)
+                    .color(palette::WARNING),
+            );
+            if small_action(ui, "Retry") {
+                app.effect_catalog_error = None;
+                app.ensure_effect_catalog_loading();
+            }
+        });
+        ui.add_space(4.0);
+    }
+
+    app.refresh_effects_filter();
+    let row_count = app.effects_filter_rows.len();
+    ui.horizontal(|ui| {
+        ui.label(theme::caption_text(&format!("{row_count} shown")));
+    });
+    ui.add_space(4.0);
+    // Distinct salt per tab: both lists sit at the same spot in the modal,
+    // so without it they would share one persisted scroll offset.
+    egui::ScrollArea::vertical()
+        .id_salt("effects_skills_list")
+        .max_height(380.0)
+        .auto_shrink([false, false])
+        .show_rows(ui, COLOR_ROW_HEIGHT, row_count, |ui, range| {
+            for i in range {
+                let idx = app.effects_filter_rows[i];
+                draw_effect_skill_row(app, ui, idx);
+            }
+        });
+
+    ui.add_space(10.0);
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if ui.add(widgets::primary_button("Close")).clicked() {
+            app.show_effects_editor = false;
+        }
+        ui.add_enabled_ui(row_count > 0, |ui| {
+            if ui.add(widgets::secondary_button("Uncheck all")).clicked() {
+                app.apply_effect_level_to_filtered_rows(EffectLevel::Full);
+            }
+            if ui.add(widgets::secondary_button("Check all")).clicked() {
+                app.apply_effect_level_to_filtered_rows(EffectLevel::Reduced);
+            }
+        });
+    });
 }
 
 /// One skill row: smoothing toggle plus the skill name. A row can control
@@ -835,90 +853,78 @@ fn draw_effect_skill_row(app: &mut GuiApp, ui: &mut egui::Ui, idx: usize) {
     );
 }
 
-/// The per-monster effects editor: search box over the monsters mapped from
-/// the game files, one row per monster name with an on/off smoothing toggle.
-/// Same layout as the per-skill editor.
-fn draw_monsters_editor(app: &mut GuiApp, ctx: &egui::Context) {
-    let modal = egui::Modal::new(egui::Id::new("monster_effects_editor"))
-        .frame(widgets::card().inner_margin(20))
-        .backdrop_color(egui::Color32::from_black_alpha(140))
-        .show(ctx, |ui| {
-            ui.set_width(640.0);
-            ui.label(theme::heading_text("Monster effects"));
-            ui.add_space(2.0);
+/// The monsters tab: search box over the monsters mapped from the game
+/// files, one row per monster name with an on/off smoothing toggle. Same
+/// layout as the skills tab.
+fn draw_effects_monsters_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
+    ui.label(theme::caption_text(
+        "Toggled on strips heavy client effects (default) · off keeps original visuals. \
+         Effect files shared between monsters stay original for all of them. \
+         Only monsters with identifiable effect files are listed.",
+    ));
+    ui.add_space(8.0);
+    ui.add(
+        egui::TextEdit::singleline(&mut app.monsters_search)
+            .id_salt("effects_monsters_search")
+            .hint_text("Search monsters — regex like in-game search, \"quotes\", !exclude…")
+            .desired_width(f32::INFINITY)
+            .margin(egui::Margin::symmetric(10, 8)),
+    );
+    ui.add_space(6.0);
+    if app.monster_catalog_task.is_some() {
+        ui.horizontal(|ui| {
+            ui.add(egui::Spinner::new().color(palette::ACCENT));
             ui.label(theme::caption_text(
-                "Toggled on strips heavy client effects (default) · off keeps original visuals. \
-                 Effect files shared between monsters stay original for all of them. \
-                 Only monsters with identifiable effect files are listed.",
+                "Loading monster list from game files… (first open takes a moment)",
             ));
-            ui.add_space(8.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut app.monsters_search)
-                    .hint_text(
-                        "Search monsters — regex like in-game search, \"quotes\", !exclude…",
-                    )
-                    .desired_width(f32::INFINITY)
-                    .margin(egui::Margin::symmetric(10, 8)),
+        });
+        ui.add_space(4.0);
+    } else if let Some(error) = app.monster_catalog_error.clone() {
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!("Monster list unavailable: {error}"))
+                    .size(11.5)
+                    .color(palette::WARNING),
             );
-            ui.add_space(6.0);
-            if app.monster_catalog_task.is_some() {
-                ui.horizontal(|ui| {
-                    ui.add(egui::Spinner::new().color(palette::ACCENT));
-                    ui.label(theme::caption_text(
-                        "Loading monster list from game files… (first open takes a moment)",
-                    ));
-                });
-                ui.add_space(4.0);
-            } else if let Some(error) = app.monster_catalog_error.clone() {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!("Monster list unavailable: {error}"))
-                            .size(11.5)
-                            .color(palette::WARNING),
-                    );
-                    if small_action(ui, "Retry") {
-                        app.monster_catalog_error = None;
-                        app.ensure_monster_catalog_loading();
-                    }
-                });
-                ui.add_space(4.0);
+            if small_action(ui, "Retry") {
+                app.monster_catalog_error = None;
+                app.ensure_monster_catalog_loading();
             }
-
-            app.refresh_monsters_filter();
-            let row_count = app.monsters_filter_rows.len();
-            ui.horizontal(|ui| {
-                ui.label(theme::caption_text(&format!("{row_count} shown")));
-            });
-            ui.add_space(4.0);
-            egui::ScrollArea::vertical()
-                .max_height(380.0)
-                .auto_shrink([false, false])
-                .show_rows(ui, COLOR_ROW_HEIGHT, row_count, |ui, range| {
-                    for i in range {
-                        let idx = app.monsters_filter_rows[i];
-                        draw_monster_row(app, ui, idx);
-                    }
-                });
-
-            ui.add_space(10.0);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add(widgets::primary_button("Close")).clicked() {
-                    app.show_monsters_editor = false;
-                }
-                ui.add_enabled_ui(row_count > 0, |ui| {
-                    if ui.add(widgets::secondary_button("Uncheck all")).clicked() {
-                        app.apply_monster_level_to_filtered_rows(EffectLevel::Full);
-                    }
-                    if ui.add(widgets::secondary_button("Check all")).clicked() {
-                        app.apply_monster_level_to_filtered_rows(EffectLevel::Reduced);
-                    }
-                });
-            });
-        })
-        .should_close();
-    if modal {
-        app.show_monsters_editor = false;
+        });
+        ui.add_space(4.0);
     }
+
+    app.refresh_monsters_filter();
+    let row_count = app.monsters_filter_rows.len();
+    ui.horizontal(|ui| {
+        ui.label(theme::caption_text(&format!("{row_count} shown")));
+    });
+    ui.add_space(4.0);
+    egui::ScrollArea::vertical()
+        .id_salt("effects_monsters_list")
+        .max_height(380.0)
+        .auto_shrink([false, false])
+        .show_rows(ui, COLOR_ROW_HEIGHT, row_count, |ui, range| {
+            for i in range {
+                let idx = app.monsters_filter_rows[i];
+                draw_monster_row(app, ui, idx);
+            }
+        });
+
+    ui.add_space(10.0);
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if ui.add(widgets::primary_button("Close")).clicked() {
+            app.show_effects_editor = false;
+        }
+        ui.add_enabled_ui(row_count > 0, |ui| {
+            if ui.add(widgets::secondary_button("Uncheck all")).clicked() {
+                app.apply_monster_level_to_filtered_rows(EffectLevel::Full);
+            }
+            if ui.add(widgets::secondary_button("Check all")).clicked() {
+                app.apply_monster_level_to_filtered_rows(EffectLevel::Reduced);
+            }
+        });
+    });
 }
 
 /// One monster row: smoothing toggle plus the monster name. A row controls
@@ -1047,4 +1053,38 @@ fn small_action(ui: &mut egui::Ui, text: &str) -> bool {
         .stroke(egui::Stroke::new(1.0, palette::BORDER)),
     )
     .clicked()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn count_label_pluralizes() {
+        assert_eq!(count_label(0, "skill"), "0 skills");
+        assert_eq!(count_label(1, "skill"), "1 skill");
+        assert_eq!(count_label(2, "monster"), "2 monsters");
+    }
+
+    /// Both tab search fields sit at the same auto-widget position in the
+    /// modal, so without distinct salts egui persists one shared
+    /// `TextEditState` (cursor, selection, undo history) across tabs.
+    #[test]
+    fn effects_tab_search_fields_persist_state_under_distinct_ids() {
+        use egui::widgets::text_edit::TextEditState;
+
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let mut app = GuiApp::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_effects_skills_tab(&mut app, ui);
+        });
+        assert_eq!(ctx.data(|d| d.count::<TextEditState>()), 1);
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_effects_monsters_tab(&mut app, ui);
+        });
+        // A second state entry proves the two fields have distinct widget
+        // IDs; a shared ID would overwrite the first entry in place.
+        assert_eq!(ctx.data(|d| d.count::<TextEditState>()), 2);
+    }
 }

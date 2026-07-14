@@ -48,6 +48,14 @@ enum MessageKind {
     Error,
 }
 
+/// Which tab of the effects editor modal is showing. Remembered across
+/// open/close for the session so the editor reopens where the user left off.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EffectsEditorTab {
+    Skills,
+    Monsters,
+}
+
 struct GuiApp {
     game_dir_input: String,
     selected_patches: HashSet<PatchId>,
@@ -63,6 +71,7 @@ struct GuiApp {
     color_filter_rows: Vec<ColorRowRef>,
     effect_overrides: HashMap<String, EffectLevel>,
     show_effects_editor: bool,
+    effects_editor_tab: EffectsEditorTab,
     effects_search: String,
     effect_catalog: Option<Vec<EffectFolderRow>>,
     effect_catalog_task: Option<Receiver<Result<Vec<EffectFolderRow>, String>>>,
@@ -71,7 +80,6 @@ struct GuiApp {
     effects_filter_key: Option<(String, usize)>,
     effects_filter_rows: Vec<usize>,
     monster_overrides: HashMap<String, EffectLevel>,
-    show_monsters_editor: bool,
     monsters_search: String,
     monster_catalog: Option<Vec<MonsterCatalogRow>>,
     monster_catalog_task: Option<Receiver<Result<Vec<MonsterCatalogRow>, String>>>,
@@ -177,6 +185,7 @@ impl Default for GuiApp {
             color_filter_rows: Vec::new(),
             effect_overrides: HashMap::new(),
             show_effects_editor: false,
+            effects_editor_tab: EffectsEditorTab::Skills,
             effects_search: String::new(),
             effect_catalog: None,
             effect_catalog_task: None,
@@ -185,7 +194,6 @@ impl Default for GuiApp {
             effects_filter_key: None,
             effects_filter_rows: Vec::new(),
             monster_overrides: HashMap::new(),
-            show_monsters_editor: false,
             monsters_search: String::new(),
             monster_catalog: None,
             monster_catalog_task: None,
@@ -781,11 +789,21 @@ impl GuiApp {
         }
     }
 
-    /// Kick off the background monster-catalog load for the monster editor
+    /// Kick off the catalog load backing the active effects-editor tab.
+    /// Called on editor open and on every tab switch, so it also revalidates
+    /// a catalog loaded for a different game dir.
+    fn ensure_active_effects_tab_loading(&mut self) {
+        match self.effects_editor_tab {
+            EffectsEditorTab::Skills => self.ensure_effect_catalog_loading(),
+            EffectsEditorTab::Monsters => self.ensure_monster_catalog_loading(),
+        }
+    }
+
+    /// Kick off the background monster-catalog load for the monsters tab
     /// if it hasn't run yet. Like the other catalog loads, deliberately NOT
     /// `spawn`: the editor should stay usable while it loads. Unlike the
     /// skill catalog this reads every monster metadata file, so it is only
-    /// started when the editor is actually opened.
+    /// started when its tab is actually shown.
     fn ensure_monster_catalog_loading(&mut self) {
         let game_dir = self.game_dir();
         self.invalidate_monster_catalog_if_stale(&game_dir);
@@ -818,7 +836,10 @@ impl GuiApp {
                 self.monster_catalog_error = Some(err);
             }
             Err(mpsc::TryRecvError::Empty) => {
-                if self.show_monsters_editor {
+                // Gated on the whole editor, not just the monsters tab: a
+                // load left in flight by a tab switch should still finish
+                // animating its spinner when the user switches back.
+                if self.show_effects_editor {
                     ctx.request_repaint_after(std::time::Duration::from_millis(33));
                 }
             }
