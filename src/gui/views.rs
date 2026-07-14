@@ -859,8 +859,7 @@ fn draw_effect_skill_row(app: &mut GuiApp, ui: &mut egui::Ui, idx: usize) {
 fn draw_effects_monsters_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
     ui.label(theme::caption_text(
         "Toggled on strips heavy client effects (default) · off keeps original visuals. \
-         Effect files shared between monsters stay original for all of them. \
-         Only monsters with identifiable effect files are listed.",
+         Shared effects stay original for all monsters using them · unlisted monsters stay reduced.",
     ));
     ui.add_space(8.0);
     ui.add(
