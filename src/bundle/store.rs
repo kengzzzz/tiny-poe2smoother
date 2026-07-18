@@ -30,15 +30,15 @@ pub struct BundleStore {
     cache_dir: PathBuf,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CacheKey {
     source: String,
     size: u64,
     mtime: u128,
 }
 
-const CACHE_MAGIC: &[u8; 4] = b"2SI3";
-const CACHE_MIGRATION_MARKER: &str = "index-cache-v2.migrated";
+const CACHE_MAGIC: &[u8; 4] = b"2SI4";
+const CACHE_MIGRATION_MARKER: &str = "index-cache-v3.migrated";
 
 fn default_cache_dir() -> PathBuf {
     dirs::data_local_dir()
@@ -77,16 +77,16 @@ fn is_legacy_cache_name(name: &std::ffi::OsStr) -> bool {
     if name == "index-cache.bin" {
         return true;
     }
-    let Some(tag) = name
-        .strip_prefix("index-cache-")
-        .and_then(|name| name.strip_suffix(".bin"))
-    else {
-        return false;
-    };
-    tag.len() == 16
-        && tag
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    ["index-cache-", "index-cache-v2-"]
+        .into_iter()
+        .filter_map(|prefix| name.strip_prefix(prefix))
+        .filter_map(|name| name.strip_suffix(".bin"))
+        .any(|tag| {
+            tag.len() == 16
+                && tag
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
 }
 
 fn retire_legacy_caches(cache_dir: &std::path::Path) {
@@ -98,7 +98,7 @@ fn retire_legacy_caches_with(
     remove: impl Fn(&std::path::Path) -> std::io::Result<()>,
 ) {
     // The marker makes this a one-time, app-wide sweep. Exact legacy matching
-    // deliberately excludes v2, temporary, and unrelated files.
+    // deliberately excludes v3, temporary, and unrelated files.
     let marker = cache_dir.join(CACHE_MIGRATION_MARKER);
     if marker.exists() || fs::create_dir_all(cache_dir).is_err() {
         return;
@@ -331,29 +331,63 @@ impl BundleStore {
         // Unlike bundle-path hashing, cache identity must preserve path case.
         let tag = hash_fnv1a(self.cache_source.as_bytes());
         self.cache_dir
-            .join(format!("index-cache-v2-{tag:016x}.bin"))
+            .join(format!("index-cache-v3-{tag:016x}.bin"))
+    }
+
+    /// Refresh storage that is held open across index and bundle reads, then
+    /// return the metadata key for that exact snapshot. In particular, a GGPK
+    /// pathname may be replaced while an older memory map remains readable.
+    fn refresh_source_snapshot(&mut self) -> Result<Option<CacheKey>> {
+        let key_before = self.cache_key()?;
+        if matches!(self.layout, InstallLayout::ContentGgpk) {
+            let ggpk = GgpkArchive::from_file(&self.content_path)?;
+            if self.cache_key()? != key_before {
+                bail!(
+                    "game data changed while opening Content.ggpk; \
+                     wait for the standalone launcher to finish updating, then retry"
+                );
+            }
+            self.ggpk = Some(Arc::new(ggpk));
+        }
+        Ok(key_before)
+    }
+
+    fn ensure_source_unchanged(
+        &self,
+        source_key: &Option<CacheKey>,
+        phase: &str,
+    ) -> Result<()> {
+        if &self.cache_key()? != source_key {
+            bail!(
+                "game data changed while {phase} the bundle index; \
+                 wait for Steam or the standalone launcher to finish updating, then retry"
+            );
+        }
+        Ok(())
     }
 
     fn read_cache(&self) -> Option<BundleIndex> {
         crate::timing!("cache_read");
         retire_legacy_caches(&self.cache_dir);
-        let key = self.cache_key().ok()??;
+        let key_before = self.cache_key().ok()??;
         let data = fs::read(self.cache_path()).ok()?;
-        parse_index_cache(&data, &key)
+        let index = parse_index_cache(&data, &key_before)?;
+        let key_after = self.cache_key().ok()??;
+        (key_before == key_after).then_some(index)
     }
 
-    fn write_cache(&self, index: &BundleIndex) {
+    fn write_cache(&self, index: &BundleIndex, source_key: &CacheKey) {
         retire_legacy_caches(&self.cache_dir);
-        let key = match self.cache_key() {
-            Ok(Some(k)) => k,
-            _ => return,
-        };
+        if self.cache_key().ok().flatten().as_ref() != Some(source_key) {
+            return;
+        }
         let mut data = Vec::new();
         data.extend_from_slice(CACHE_MAGIC);
-        data.write_u64::<LittleEndian>(key.source.len() as u64).ok();
-        data.extend_from_slice(key.source.as_bytes());
-        data.write_u64::<LittleEndian>(key.size).ok();
-        data.write_u128::<LittleEndian>(key.mtime).ok();
+        data.write_u64::<LittleEndian>(source_key.source.len() as u64)
+            .ok();
+        data.extend_from_slice(source_key.source.as_bytes());
+        data.write_u64::<LittleEndian>(source_key.size).ok();
+        data.write_u128::<LittleEndian>(source_key.mtime).ok();
         data.write_u64::<LittleEndian>(index.raw_decompressed.len() as u64)
             .ok();
         data.extend_from_slice(&index.raw_decompressed);
@@ -402,6 +436,11 @@ impl BundleStore {
         } else {
             data.write_u8(0).ok();
         }
+        // Serializing a large live index can take seconds. If the game updater
+        // changed the source meanwhile, do not publish this stale snapshot.
+        if self.cache_key().ok().flatten().as_ref() != Some(source_key) {
+            return;
+        }
         let path = self.cache_path();
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
@@ -420,9 +459,11 @@ impl BundleStore {
         }
     }
 
-    pub fn open_index(&self) -> Result<BundleIndex> {
+    pub fn open_index(&mut self) -> Result<BundleIndex> {
         crate::timing!("index_read");
+        let source_key_before = self.refresh_source_snapshot()?;
         if let Some(cached) = self.read_cache() {
+            self.ensure_source_unchanged(&source_key_before, "loading")?;
             tracing::debug!("using cached index metadata");
             return Ok(cached);
         }
@@ -434,7 +475,9 @@ impl BundleStore {
         let _guard = REBUILD_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let source_key_before = self.refresh_source_snapshot()?;
         if let Some(cached) = self.read_cache() {
+            self.ensure_source_unchanged(&source_key_before, "loading")?;
             tracing::debug!("using index metadata cached by concurrent rebuild");
             return Ok(cached);
         }
@@ -447,7 +490,11 @@ impl BundleStore {
         // Build paths before caching so cache hits skip dir_decompress +
         // build_paths, the dominant cost of a warm launch.
         index.ensure_paths_built()?;
-        self.write_cache(&index);
+        self.ensure_source_unchanged(&source_key_before, "building")?;
+        if let Some(source_key) = source_key_before.as_ref() {
+            self.write_cache(&index, source_key);
+        }
+        self.ensure_source_unchanged(&source_key_before, "caching")?;
         Ok(index)
     }
 
@@ -814,6 +861,61 @@ mod tests {
         assert!(parse_index_cache(&absurd_count, &key).is_none());
     }
 
+    #[test]
+    fn changed_source_cannot_publish_a_stale_index_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game");
+        write_test_install(&game, InstallLayout::ContentGgpk);
+        let store = BundleStore::new_with_cache_dir(game.clone(), temp.path().join("cache"));
+        let source_key_before = store.cache_key().unwrap().unwrap();
+        let stale_index =
+            BundleIndex::for_test_paths(&[("data/balance/activeskills.datc64", "old", 1)]);
+
+        // Model a launcher update finishing after the index was read but before
+        // its cache was serialized. A size change makes the key change exact.
+        fs::write(game.join("Content.ggpk"), b"updated-ggpk").unwrap();
+        assert_ne!(store.cache_key().unwrap().unwrap(), source_key_before);
+
+        store.write_cache(&stale_index, &source_key_before);
+
+        assert!(!store.cache_path().exists());
+        assert!(store.read_cache().is_none());
+    }
+
+    #[test]
+    fn open_index_remaps_replaced_content_before_caching() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game");
+        fs::create_dir_all(&game).unwrap();
+        let content = game.join("Content.ggpk");
+        write_test_ggpk(
+            &content,
+            "Bundles2/_.index.bin",
+            &test_index_bytes(&["old"]),
+        );
+        let mut store = BundleStore::new_with_cache_dir(game.clone(), temp.path().join("cache"));
+
+        let old = store.open_index().unwrap();
+        assert!(old.has_bundle_prefix("old"));
+
+        let replacement = game.join("Content.replacement.ggpk");
+        write_test_ggpk(
+            &replacement,
+            "Bundles2/_.index.bin",
+            &test_index_bytes(&["replacement"]),
+        );
+        fs::remove_file(&content).unwrap();
+        fs::rename(replacement, &content).unwrap();
+
+        let rebuilt = store.open_index().unwrap();
+        assert!(rebuilt.has_bundle_prefix("replacement"));
+        assert!(!rebuilt.has_bundle_prefix("old"));
+
+        let cached = store.open_index().unwrap();
+        assert!(cached.has_bundle_prefix("replacement"));
+        assert!(!cached.has_bundle_prefix("old"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn aliases_share_cache_identity_for_both_install_layouts() {
@@ -917,8 +1019,9 @@ mod tests {
             let direct = BundleStore::new_with_cache_dir(game, cache_dir.clone());
             let aliased = BundleStore::new_with_cache_dir(alias, cache_dir.clone());
             let index = BundleIndex::for_test_paths(&[("Metadata/Test.dat", "test", 3)]);
+            let source_key = direct.cache_key().unwrap().unwrap();
 
-            direct.write_cache(&index);
+            direct.write_cache(&index, &source_key);
             assert!(!cache_dir.join("index-cache.bin").exists());
             assert!(cache_dir.join(CACHE_MIGRATION_MARKER).exists());
             assert!(direct.cache_path().exists());
@@ -939,10 +1042,15 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let cache_dir = temp.path().join("cache");
         fs::create_dir_all(&cache_dir).unwrap();
-        let legacy = ["index-cache.bin", "index-cache-0123456789abcdef.bin"];
-        let preserved = [
+        let legacy = [
+            "index-cache.bin",
+            "index-cache-0123456789abcdef.bin",
             "index-cache-v2-0123456789abcdef.bin",
-            "index-cache-0123456789abcdef.tmp42",
+        ];
+        let preserved = [
+            "index-cache-v3-0123456789abcdef.bin",
+            "index-cache-v2.migrated",
+            "index-cache-v2-0123456789abcdef.tmp42",
             "index-cache-0123456789ABCDEf.bin",
             "index-cache-0123.bin",
             "unrelated.bin",
@@ -1005,7 +1113,7 @@ mod tests {
         let cache_dir = temp.path().join("cache");
         fs::create_dir_all(&cache_dir).unwrap();
         let legacy = cache_dir.join("index-cache-0123456789abcdef.bin");
-        let current = cache_dir.join("index-cache-v2-0123456789abcdef.bin");
+        let current = cache_dir.join("index-cache-v3-0123456789abcdef.bin");
         fs::write(&legacy, b"legacy").unwrap();
         fs::write(&current, b"current").unwrap();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
@@ -1168,6 +1276,25 @@ mod tests {
     fn write_test_ggpk(path: &Path, file_path: &str, data: &[u8]) {
         let (dir_name, file_name) = file_path.split_once('/').unwrap();
         write_test_ggpk_files(path, dir_name, &[(file_name, data)]);
+    }
+
+    fn test_index_bytes(bundle_names: &[&str]) -> Vec<u8> {
+        let mut raw = Vec::new();
+        raw.write_u32::<LittleEndian>(bundle_names.len() as u32)
+            .unwrap();
+        for bundle_name in bundle_names {
+            raw.write_u32::<LittleEndian>(bundle_name.len() as u32)
+                .unwrap();
+            raw.extend_from_slice(bundle_name.as_bytes());
+            raw.write_u32::<LittleEndian>(0).unwrap();
+        }
+        raw.write_u32::<LittleEndian>(0).unwrap(); // file count
+        raw.write_u32::<LittleEndian>(1).unwrap(); // directory count
+        raw.write_u64::<LittleEndian>(0x07E47507B4A92E53)
+            .unwrap();
+        raw.extend_from_slice(&[0; 12]);
+        raw.extend_from_slice(&crate::bundle::pack_uncompressed_bundle(&[]).unwrap());
+        crate::bundle::pack_uncompressed_bundle(&raw).unwrap()
     }
 
     fn write_test_ggpk_files(path: &Path, dir_name: &str, files: &[(&str, &[u8])]) {
