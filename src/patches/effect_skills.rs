@@ -742,6 +742,7 @@ fn push_min_len_alias(values: &mut Vec<(String, AliasRank)>, value: String, rank
 fn is_plausible_skill_id(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 100
+        && s.bytes().any(|b| b.is_ascii_alphanumeric())
         && s.bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
@@ -989,6 +990,19 @@ mod tests {
     }
 
     #[test]
+    fn plausible_skill_id_requires_ascii_alphanumeric() {
+        for id in ["ice_shot", "new_skill_2", "_skill_", "skill__2"] {
+            assert!(is_plausible_skill_id(id), "valid ID rejected: {id}");
+        }
+        for id in ["_", "___"] {
+            assert!(
+                !is_plausible_skill_id(id),
+                "underscore-only ID accepted: {id}"
+            );
+        }
+    }
+
+    #[test]
     fn effect_catalog_returns_empty_when_no_effect_folders_exist() {
         let activeskills = build_activeskills_with_actions(&[("ice_shot", "Ice Shot", 0)]);
         let actiontypes = build_actiontypes_bytes(&["IceShot"]);
@@ -1080,6 +1094,33 @@ mod tests {
         assert_eq!(rows[0].display, "Ice Shot");
         assert_eq!(rows[0].action_type, "IceShot");
         assert_eq!(rows[0].folders, vec!["bow_ice_shot".to_string()]);
+    }
+
+    #[test]
+    fn effect_catalog_rejects_empty_normalized_skill_id() {
+        let activeskills = build_activeskills_with_actions(&[
+            ("legitimate_skill", "Legitimate Skill", 0),
+            ("___", "Fireball", 1),
+        ]);
+        let actiontypes = build_actiontypes_bytes(&["ImpactFireball", "Placeholder"]);
+        let miscanimated = build_miscanimated_bytes(&[(
+            "ImpactFireballExplosion",
+            "Metadata/Effects/Spells/impact_fireball/explosion.ao",
+        )]);
+        let paths = effect_paths(&["metadata/effects/spells/impact_fireball/explosion.ao"]);
+
+        let rows = build_effect_skill_catalog(
+            &activeskills,
+            &actiontypes,
+            None,
+            Some(&miscanimated),
+            &paths,
+        )
+        .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].active_skill_id, "legitimate_skill");
+        assert_eq!(rows[0].folders, vec!["impact_fireball".to_string()]);
     }
 
     #[test]
