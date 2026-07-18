@@ -158,6 +158,7 @@ pub(super) fn resolve_full_monster_effect_paths(
     index: &mut BundleIndex,
     overrides: &[MonsterEffectOverride],
 ) -> Result<BTreeSet<String>> {
+    crate::timing!("resolve_full_monster_effect_paths");
     let full_keys: BTreeSet<String> = overrides
         .iter()
         .filter(|entry| entry.level == EffectLevel::Full)
@@ -171,7 +172,11 @@ pub(super) fn resolve_full_monster_effect_paths(
     // Alias uniqueness needs the full monster-key population.
     let mut all_keys: BTreeSet<String> = BTreeSet::new();
     let mut candidates: Vec<(String, BundleFile)> = Vec::new();
+    let mut folder_alias_paths: Vec<&str> = Vec::new();
     for path in index.paths() {
+        if is_folder_alias_candidate(path) {
+            folder_alias_paths.push(path.as_str());
+        }
         if let Some(key) = monster_key_of(path) {
             if full_keys.contains(&key) {
                 if let Some(file) = index.file_by_path(path).copied() {
@@ -195,7 +200,7 @@ pub(super) fn resolve_full_monster_effect_paths(
         }
     }
     let aliases = unique_monster_aliases(&all_keys);
-    collect_folder_alias_edges(index.paths(), &aliases, &full_keys, &mut edges);
+    collect_folder_alias_edges(&folder_alias_paths, &aliases, &full_keys, &mut edges);
 
     let mut kept: BTreeSet<String> = BTreeSet::new();
     let mut seeds: BTreeSet<String> = BTreeSet::new();
@@ -686,14 +691,18 @@ fn paths_reaching_targets(graph: &BTreeMap<String, Vec<String>>) -> BTreeSet<Str
 
 /// `monsters_effects` folders whose name unambiguously matches one monster
 /// alias yield low-confidence edges.
+fn is_folder_alias_candidate(path: &str) -> bool {
+    starts_with_path_ci(path, MONSTERS_EFFECTS_PREFIX) && is_target_ext(path)
+}
+
 fn collect_folder_alias_edges(
-    paths: &[String],
+    paths: &[&str],
     aliases: &HashMap<String, String>,
     wanted_keys: &BTreeSet<String>,
     edges: &mut EdgeMap,
 ) {
-    for path in paths {
-        if !starts_with_path_ci(path, MONSTERS_EFFECTS_PREFIX) || !is_target_ext(path) {
+    for &path in paths {
+        if !is_folder_alias_candidate(path) {
             continue;
         }
         let normalized = normalize_path(path);
@@ -1019,6 +1028,8 @@ fn monster_effect_catalog_from_parts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bundle::pack_uncompressed_bundle;
+    use std::fs;
 
     const TEST_ROW_MARKER: [u8; 8] = [0xbb; 8];
 
@@ -1186,20 +1197,29 @@ other = "Metadata/Effects/utility/epks/off.ao"
         assert!(!aliases.contains_key("tiny"));
         assert!(!aliases.contains_key("act"));
 
-        let paths: Vec<String> = [
+        let paths: Vec<&str> = vec![
             "Metadata/Effects/Spells/monsters_effects/act4/anchormangreen/death.ao",
             "metadata/effects/spells/monsters_effects/act4/anchormangreen/death.pet",
             "metadata/effects/spells/monsters_effects/act1/shared/roar.ao",
             "metadata/effects/spells/fireball/fireball.ao",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect();
+        ];
         let wanted: BTreeSet<String> =
             ["metadata/monsters/anchorman/anchormangreen".to_string()].into();
         let mut edges = EdgeMap::new();
 
         collect_folder_alias_edges(&paths, &aliases, &wanted, &mut edges);
+
+        let retained: Vec<&str> = paths
+            .iter()
+            .copied()
+            .filter(|path| is_folder_alias_candidate(path))
+            .collect();
+        let mut retained_edges = EdgeMap::new();
+        collect_folder_alias_edges(&retained, &aliases, &wanted, &mut retained_edges);
+        assert_eq!(
+            retained_edges["metadata/monsters/anchorman/anchormangreen"].low,
+            edges["metadata/monsters/anchorman/anchormangreen"].low
+        );
 
         assert_eq!(edges.len(), 1);
         let edge = &edges["metadata/monsters/anchorman/anchormangreen"];
@@ -1209,6 +1229,75 @@ other = "Metadata/Effects/utility/epks/off.ao"
                 "metadata/effects/spells/monsters_effects/act4/anchormangreen/death.ao"
                     .to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn full_resolution_preserves_all_edge_sources_and_reads_only_wanted_metadata() {
+        const WANTED_KEY: &str = "metadata/monsters/boghulk/boghulk";
+        const STALE_KEY: &str = "metadata/monsters/stale/stale";
+        const METADATA_TARGET: &str = "metadata/effects/spells/npc/task07/metadata.ao";
+        const TABLE_TARGET: &str = "metadata/effects/spells/npc/task07/table.aoc";
+        const ALIAS_TARGET: &str = "metadata/effects/spells/monsters_effects/act1/boghulk/death.ao";
+
+        let metadata = utf16_file(&format!(r#"rig = "{METADATA_TARGET}""#));
+        let varieties = table(&[&[
+            "Metadata/Monsters/BogHulk/BogHulk",
+            "Metadata/Effects/Spells/NPC/Task07/Table.aoc",
+        ]]);
+        let alias_bytes = b"version 1";
+
+        let temp = tempfile::tempdir().unwrap();
+        let bundles_dir = temp.path().join("Bundles2");
+        fs::create_dir_all(&bundles_dir).unwrap();
+        for (name, bytes) in [
+            ("wanted", metadata.as_slice()),
+            ("varieties", varieties.as_slice()),
+            ("alias", alias_bytes.as_slice()),
+        ] {
+            fs::write(
+                bundles_dir.join(format!("{name}.bundle.bin")),
+                pack_uncompressed_bundle(bytes).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let mut index = BundleIndex::for_test_paths(&[
+            (
+                "metadata/monsters/boghulk/boghulk.ot",
+                "wanted",
+                metadata.len() as u32,
+            ),
+            // This bundle is deliberately absent. Resolution succeeds only
+            // when unrelated monster metadata is excluded from the batch.
+            ("metadata/monsters/unrelated/unrelated.ot", "missing", 1),
+            (
+                MONSTER_VARIETIES_DATC64_PATH,
+                "varieties",
+                varieties.len() as u32,
+            ),
+            (ALIAS_TARGET, "alias", alias_bytes.len() as u32),
+        ]);
+        let store = BundleStore::new(temp.path());
+        let overrides = vec![
+            MonsterEffectOverride {
+                monster: WANTED_KEY.to_string(),
+                level: EffectLevel::Full,
+            },
+            MonsterEffectOverride {
+                monster: STALE_KEY.to_string(),
+                level: EffectLevel::Full,
+            },
+        ];
+
+        let kept = resolve_full_monster_effect_paths(&store, &mut index, &overrides).unwrap();
+
+        assert_eq!(
+            kept,
+            [METADATA_TARGET, TABLE_TARGET, ALIAS_TARGET]
+                .into_iter()
+                .map(String::from)
+                .collect()
         );
     }
 
