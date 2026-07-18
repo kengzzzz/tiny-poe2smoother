@@ -109,7 +109,6 @@ impl BackupStore {
             let mut out = Vec::new();
             out.write_u32::<LittleEndian>(MAGIC)?;
             out.write_u32::<LittleEndian>(VERSION)?;
-            // Write manifest: app name, app version, game dir
             let manifest = format!("{APP_NAME} v{APP_VERSION} game={}", game_dir.display());
             out.write_u32::<LittleEndian>(manifest.len() as u32)?;
             out.extend_from_slice(manifest.as_bytes());
@@ -235,7 +234,6 @@ fn read_entries(path: &Path) -> Result<Vec<BackupEntry>> {
     if !(1..=VERSION).contains(&version) {
         bail!("unsupported backup version {version} in {}", path.display());
     }
-    // Skip manifest string if version >= 2
     if version >= 2 {
         let manifest_len = cursor.read_u32::<LittleEndian>()? as usize;
         let _ = cursor.seek(std::io::SeekFrom::Current(manifest_len as i64));

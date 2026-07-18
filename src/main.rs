@@ -595,11 +595,6 @@ impl GuiApp {
                     && *catalog == catalog_len
             });
         if !fresh {
-            // PoE2-style search (see gui::search): space-separated terms are
-            // ANDed regexes matched against the stat id or display text,
-            // quotes keep phrases together, `!` excludes — with a literal
-            // fallback so loose phrasings like "increase chance to be omen"
-            // and pasted stat ids keep working.
             let query = gui::search::SearchQuery::parse(&self.color_search);
             let matches =
                 |stat_id_lower: &str, text_lower: &str| query.matches(stat_id_lower, text_lower);

@@ -42,7 +42,7 @@ static EFFECT_KEEP_BLOCKS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
 // (`SoundEvents { ... }` -> `SoundEvents {}`), leaving every other byte intact.
 // Derived by diffing captured output: across 170 changed `.ao`/`.ot`
 // files these were the only blocks ever emptied, and emptying them reproduces
-// the captured bytes exactly. See docs/capture-findings.md.
+// the captured bytes exactly.
 static SOUND_EMPTY_BLOCKS: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| ["SoundEvents", "SoundParams"].into_iter().collect());
 
@@ -236,7 +236,7 @@ fn delirium(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(encode_utf16_bom(&out))
 }
 
-/// Ground-truth blanking rule (see docs/capture-findings.md): `.epk` MUST become
+/// Captured blanking rule: `.epk` MUST become
 /// empty (a bare "0" makes the parser throw "Unexpected token 0"); `.pet`/`.trl`
 /// become BOM+"0" (a value the engine tolerates). Returns None for any other
 /// extension (notably `.ao`/`.aoc`, which are never blanked).

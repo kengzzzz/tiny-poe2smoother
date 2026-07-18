@@ -220,7 +220,6 @@ pub fn apply_patches(request: PatchRequest) -> Result<ApplyReport> {
         );
     }
 
-    // Verify each patch target exists before proceeding
     for change in &patch_set.changes {
         if !store.bundle_exists(&change.bundle_name)? {
             bail!(
