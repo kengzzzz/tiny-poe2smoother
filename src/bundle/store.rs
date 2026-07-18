@@ -162,6 +162,18 @@ fn parse_index_cache(data: &[u8], key: &CacheKey) -> Option<BundleIndex> {
     })
 }
 
+fn write_cache_file(
+    path: &std::path::Path,
+    tmp: &std::path::Path,
+    data: &[u8],
+    write: impl FnOnce(&std::path::Path, &[u8]) -> std::io::Result<()>,
+) {
+    let result = write(tmp, data).and_then(|_| fs::rename(tmp, path));
+    if result.is_err() {
+        let _ = fs::remove_file(tmp);
+    }
+}
+
 impl BundleStore {
     pub fn new(game_dir: impl Into<PathBuf>) -> Self {
         let game_dir = game_dir.into();
@@ -295,9 +307,7 @@ impl BundleStore {
         // Write-then-rename so concurrent readers never observe a torn
         // cache file (a failed parse silently forces a full index rebuild).
         let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-        if fs::write(&tmp, &data).is_ok() && fs::rename(&tmp, &path).is_err() {
-            let _ = fs::remove_file(&tmp);
-        }
+        write_cache_file(&path, &tmp, &data, |tmp, data| fs::write(tmp, data));
         // Pre-scoping releases used one shared file; drop it so upgrades
         // don't leave a large orphan behind.
         let _ = fs::remove_file(path.with_file_name("index-cache.bin"));
@@ -689,6 +699,50 @@ mod tests {
             .write_u64::<LittleEndian>(u64::MAX / 4)
             .unwrap(); // file count
         assert!(parse_index_cache(&absurd_count, &key).is_none());
+    }
+
+    #[test]
+    fn failed_cache_write_removes_partial_temp_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("index-cache.bin");
+        let tmp = temp.path().join("index-cache.tmp");
+
+        write_cache_file(&path, &tmp, b"partial cache", |tmp, data| {
+            fs::write(tmp, data)?;
+            Err(std::io::Error::other("injected write failure"))
+        });
+
+        assert!(!tmp.exists());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn failed_cache_rename_removes_temp_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("index-cache.bin");
+        let tmp = temp.path().join("index-cache.tmp");
+        fs::create_dir(&path).unwrap();
+
+        write_cache_file(&path, &tmp, b"complete cache", |tmp, data| {
+            fs::write(tmp, data)
+        });
+
+        assert!(!tmp.exists());
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn successful_cache_write_leaves_final_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("index-cache.bin");
+        let tmp = temp.path().join("index-cache.tmp");
+
+        write_cache_file(&path, &tmp, b"complete cache", |tmp, data| {
+            fs::write(tmp, data)
+        });
+
+        assert!(!tmp.exists());
+        assert_eq!(fs::read(path).unwrap(), b"complete cache");
     }
 
     #[test]
