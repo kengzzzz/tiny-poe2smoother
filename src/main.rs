@@ -85,8 +85,9 @@ struct GuiApp {
     monster_catalog_task: Option<Receiver<Result<Vec<MonsterCatalogRow>, String>>>,
     monster_catalog_error: Option<String>,
     monster_catalog_dir: Option<PathBuf>,
-    monsters_filter_key: Option<(String, usize)>,
+    monsters_filter_key: Option<(String, usize, bool)>,
     monsters_filter_rows: Vec<usize>,
+    show_unnamed_monsters: bool,
     status: Option<AppStatus>,
     message: String,
     message_kind: MessageKind,
@@ -136,11 +137,17 @@ struct EffectFolderRow {
 
 /// One visible monster row in the per-monster effects editor. A row owns
 /// every monster variant (runemarked etc.) sharing its display name.
+/// `context` is the muted suffix shown after fallback names from the catalog's
+/// nearest derived ancestry and is `None` for table-named rows. `named`
+/// mirrors the catalog entry's bit; fallback rows are hidden by default
+/// behind the "Show unnamed entities" checkbox.
 struct MonsterCatalogRow {
     monster_keys: Vec<String>,
     display: String,
     display_lower: String,
     search_lower: String,
+    context: Option<String>,
+    named: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,6 +208,7 @@ impl Default for GuiApp {
             monster_catalog_dir: None,
             monsters_filter_key: None,
             monsters_filter_rows: Vec::new(),
+            show_unnamed_monsters: false,
             status: None,
             message: "Ready.".to_string(),
             message_kind: MessageKind::Info,
@@ -852,14 +860,18 @@ impl GuiApp {
 
     /// Rebuild `monsters_filter_rows` (indices into `monster_catalog`
     /// matching the query) if stale. Level edits never invalidate the cache —
-    /// the visible set only depends on the query and the catalog.
+    /// the visible set only depends on the query, the catalog, and the
+    /// "Show unnamed entities" checkbox (fallback rows are hidden while it
+    /// is off; overridden hidden rows are surfaced by a hint, not the list).
     fn refresh_monsters_filter(&mut self) {
         let catalog_len = self.monster_catalog.as_ref().map_or(0, Vec::len);
         let fresh = self
             .monsters_filter_key
             .as_ref()
-            .is_some_and(|(query, catalog)| {
-                *query == self.monsters_search && *catalog == catalog_len
+            .is_some_and(|(query, catalog, show_unnamed)| {
+                *query == self.monsters_search
+                    && *catalog == catalog_len
+                    && *show_unnamed == self.show_unnamed_monsters
             });
         if !fresh {
             let query = gui::search::SearchQuery::parse(&self.monsters_search);
@@ -869,11 +881,47 @@ impl GuiApp {
                 .unwrap_or_default()
                 .iter()
                 .enumerate()
-                .filter(|(_, row)| query.matches(&row.search_lower, &row.display_lower))
+                .filter(|(_, row)| {
+                    (row.named || self.show_unnamed_monsters)
+                        && query.matches(&row.search_lower, &row.display_lower)
+                })
                 .map(|(idx, _)| idx)
                 .collect();
-            self.monsters_filter_key = Some((self.monsters_search.clone(), catalog_len));
+            self.monsters_filter_key = Some((
+                self.monsters_search.clone(),
+                catalog_len,
+                self.show_unnamed_monsters,
+            ));
         }
+    }
+
+    /// Fallback (unnamed) rows in the catalog — what the "Show unnamed
+    /// entities" checkbox governs and counts.
+    fn unnamed_monster_row_count(&self) -> usize {
+        self.monster_catalog
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|row| !row.named)
+            .count()
+    }
+
+    /// Unnamed rows with any variant keeping original visuals. While the
+    /// checkbox hides unnamed rows these are still active settings, so the
+    /// monsters tab flags them with a hint instead of hiding them silently.
+    fn overridden_unnamed_monster_row_count(&self) -> usize {
+        self.monster_catalog
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|row| {
+                !row.named
+                    && row
+                        .monster_keys
+                        .iter()
+                        .any(|key| self.monster_overrides.contains_key(key))
+            })
+            .count()
     }
 
     fn apply_monster_level_to_filtered_rows(&mut self, level: EffectLevel) {
@@ -944,13 +992,16 @@ fn monster_effect_catalog_rows(entries: Vec<MonsterEffectCatalogEntry>) -> Vec<M
     entries
         .into_iter()
         .map(|entry| {
+            let context = monster_context_suffix(&entry.derived_context);
             let search_lower = format!(
-                "{} {} {} {}",
-                entry.display.to_lowercase(),
+                "{} {} {} {} {}",
+                entry.display,
                 entry.family,
                 entry.monster_keys.join(" "),
-                entry.search_aliases.join(" ")
-            );
+                entry.search_aliases.join(" "),
+                entry.derived_context.join(" ")
+            )
+            .to_lowercase();
             let display_lower = entry.display.to_lowercase();
             let display = if display_counts.get(&display_lower).copied().unwrap_or(0) > 1 {
                 format!("{} ({})", entry.display, entry.family)
@@ -962,9 +1013,24 @@ fn monster_effect_catalog_rows(entries: Vec<MonsterEffectCatalogEntry>) -> Vec<M
                 display_lower,
                 display,
                 search_lower,
+                context,
+                named: entry.named,
             }
         })
         .collect()
+}
+
+/// Visible fallback context is capped, while the complete derived set remains
+/// in `search_lower` for local ambiguous identities.
+fn monster_context_suffix(context: &[String]) -> Option<String> {
+    if context.is_empty() {
+        return None;
+    }
+    let mut suffix = context[..context.len().min(2)].join(" / ");
+    if context.len() > 2 {
+        suffix.push_str(" …");
+    }
+    Some(suffix)
 }
 
 fn effect_skill_catalog_rows(entries: Vec<EffectSkillCatalogEntry>) -> Vec<EffectFolderRow> {
@@ -1162,6 +1228,15 @@ mod tests {
             search_lower: format!("{} {}", display.to_lowercase(), monster_keys.join(" ")),
             display: display.to_string(),
             monster_keys,
+            context: None,
+            named: true,
+        }
+    }
+
+    fn unnamed_monster_row(display: &str, keys: &[&str]) -> MonsterCatalogRow {
+        MonsterCatalogRow {
+            named: false,
+            ..monster_row(display, keys)
         }
     }
 
@@ -1311,7 +1386,7 @@ mod tests {
                 &["metadata/monsters/boghulk/boghulk"],
             )]),
             monster_catalog_dir: Some(PathBuf::from("/install/A")),
-            monsters_filter_key: Some(("q".to_string(), 1)),
+            monsters_filter_key: Some(("q".to_string(), 1, false)),
             monsters_filter_rows: vec![0],
             ..GuiApp::default()
         };
@@ -1348,6 +1423,8 @@ mod tests {
             ],
             family: "anchorite".to_string(),
             search_aliases: vec!["shroomlady".to_string()],
+            derived_context: Vec::new(),
+            named: true,
         }]);
 
         assert_eq!(rows.len(), 1);
@@ -1360,6 +1437,223 @@ mod tests {
         assert!(!rows[0].display.contains("shroomlady"));
     }
 
+    fn catalog_entry(
+        display: &str,
+        family: &str,
+        key: &str,
+        named: bool,
+        aliases: &[&str],
+        context: &[&str],
+    ) -> MonsterEffectCatalogEntry {
+        MonsterEffectCatalogEntry {
+            display: display.to_string(),
+            monster_keys: vec![key.to_string()],
+            family: family.to_string(),
+            search_aliases: aliases.iter().map(|alias| alias.to_string()).collect(),
+            derived_context: context.iter().map(|name| name.to_string()).collect(),
+            named,
+        }
+    }
+
+    #[test]
+    fn monsters_filter_scopes_exact_and_poe_style_search_to_local_context() {
+        let alpha = "metadata/monsters/family/alpha/alpha";
+        let beta = "metadata/monsters/family/beta/beta";
+        let helper = "metadata/monsters/family/beta/helper";
+        let mut app = GuiApp {
+            monster_catalog: Some(monster_effect_catalog_rows(vec![
+                catalog_entry("Alpha Monster", "family", alpha, true, &[], &[]),
+                catalog_entry("Beta Monster", "family", beta, true, &[], &[]),
+                catalog_entry("helper", "family", helper, false, &[], &["Beta Monster"]),
+            ])),
+            ..GuiApp::default()
+        };
+
+        app.monsters_search = "beta monster".to_string();
+        app.refresh_monsters_filter();
+        assert_eq!(app.monsters_filter_rows, vec![1]);
+
+        // Toggling unnamed rows invalidates the populated filter cache.
+        app.show_unnamed_monsters = true;
+        app.refresh_monsters_filter();
+        assert_eq!(app.monsters_filter_rows, vec![1, 2]);
+
+        app.monsters_search = "\"Beta Monster\"".to_string();
+        app.refresh_monsters_filter();
+        assert_eq!(app.monsters_filter_rows, vec![1, 2]);
+
+        app.monsters_search = "\"Alpha Monster\"".to_string();
+        app.refresh_monsters_filter();
+        assert_eq!(app.monsters_filter_rows, vec![0]);
+        assert!(!app.monster_catalog.as_ref().unwrap()[2]
+            .search_lower
+            .contains("alpha monster"));
+    }
+
+    #[test]
+    fn monster_bulk_actions_do_not_touch_sibling_context_helpers() {
+        let alpha = "metadata/monsters/family/alpha/alpha";
+        let beta = "metadata/monsters/family/beta/beta";
+        let helper = "metadata/monsters/family/beta/helper";
+        let mut app = GuiApp {
+            monster_catalog: Some(monster_effect_catalog_rows(vec![
+                catalog_entry("Alpha Monster", "family", alpha, true, &[], &[]),
+                catalog_entry("Beta Monster", "family", beta, true, &[], &[]),
+                catalog_entry("helper", "family", helper, false, &[], &["Beta Monster"]),
+            ])),
+            monsters_search: "\"Alpha Monster\"".to_string(),
+            show_unnamed_monsters: true,
+            ..GuiApp::default()
+        };
+
+        app.refresh_monsters_filter();
+        let filtered_keys: Vec<&str> = app
+            .monsters_filter_rows
+            .iter()
+            .flat_map(|&idx| {
+                app.monster_catalog.as_ref().unwrap()[idx]
+                    .monster_keys
+                    .iter()
+            })
+            .map(String::as_str)
+            .collect();
+        assert_eq!(filtered_keys, vec![alpha]);
+
+        app.monster_overrides
+            .insert(helper.to_string(), EffectLevel::Full);
+        app.apply_monster_level_to_filtered_rows(EffectLevel::Reduced);
+        assert_eq!(app.monster_overrides.get(helper), Some(&EffectLevel::Full));
+
+        app.monster_overrides.remove(helper);
+        app.apply_monster_level_to_filtered_rows(EffectLevel::Full);
+        assert!(!app.monster_overrides.contains_key(helper));
+        assert_eq!(app.monster_overrides.get(alpha), Some(&EffectLevel::Full));
+    }
+
+    #[test]
+    fn monsters_filter_hides_unnamed_rows_until_toggled() {
+        let mut app = GuiApp {
+            monster_catalog: Some(vec![
+                monster_row("Bog Hulk", &["metadata/monsters/boghulk/boghulk"]),
+                unnamed_monster_row(
+                    "baronphase 2 wolf",
+                    &["metadata/monsters/baron/phase2/baronphase2wolf"],
+                ),
+            ]),
+            ..GuiApp::default()
+        };
+
+        app.refresh_monsters_filter();
+        assert_eq!(app.monsters_filter_rows, vec![0]);
+        assert_eq!(app.unnamed_monster_row_count(), 1);
+
+        app.show_unnamed_monsters = true;
+        app.refresh_monsters_filter();
+        assert_eq!(app.monsters_filter_rows, vec![0, 1]);
+    }
+
+    #[test]
+    fn monster_bulk_level_skips_hidden_unnamed_rows_and_hint_counts_them() {
+        let hulk = "metadata/monsters/boghulk/boghulk";
+        let wolf = "metadata/monsters/baron/phase2/baronphase2wolf";
+        let mut app = GuiApp {
+            monster_catalog: Some(vec![
+                monster_row("Bog Hulk", &[hulk]),
+                unnamed_monster_row("baronphase 2 wolf", &[wolf]),
+            ]),
+            ..GuiApp::default()
+        };
+        // Old-config style override on a row that is hidden by default.
+        app.monster_overrides
+            .insert(wolf.to_string(), EffectLevel::Full);
+
+        // The active override on the hidden row is surfaced by the hint
+        // count rather than the row list.
+        app.refresh_monsters_filter();
+        assert_eq!(app.monsters_filter_rows, vec![0]);
+        assert_eq!(app.overridden_unnamed_monster_row_count(), 1);
+
+        // "Check all" with unnamed rows hidden touches only visible rows:
+        // the hidden override survives.
+        app.apply_monster_level_to_filtered_rows(EffectLevel::Reduced);
+        assert_eq!(app.monster_overrides.get(wolf), Some(&EffectLevel::Full));
+
+        // "Uncheck all" likewise only reaches the visible named row.
+        app.apply_monster_level_to_filtered_rows(EffectLevel::Full);
+        assert_eq!(app.monster_overrides.get(hulk), Some(&EffectLevel::Full));
+
+        // With the checkbox on the bulk buttons reach everything again.
+        app.show_unnamed_monsters = true;
+        app.apply_monster_level_to_filtered_rows(EffectLevel::Reduced);
+        assert!(app.monster_overrides.is_empty());
+        assert_eq!(app.overridden_unnamed_monster_row_count(), 0);
+    }
+
+    #[test]
+    fn monster_catalog_rows_attach_context_suffix_to_fallback_rows_only() {
+        assert_eq!(
+            monster_context_suffix(&[
+                "Count Geonor".to_string(),
+                "Geonor, the Putrid Wolf".to_string(),
+                "Geonor Guard".to_string(),
+            ]),
+            Some("Count Geonor / Geonor, the Putrid Wolf …".to_string())
+        );
+        assert_eq!(monster_context_suffix(&[]), None);
+
+        let rows = monster_effect_catalog_rows(vec![
+            catalog_entry(
+                "Count Geonor",
+                "baron",
+                "metadata/monsters/baron/a",
+                true,
+                &[],
+                &[],
+            ),
+            catalog_entry(
+                "Geonor, the Putrid Wolf",
+                "baron",
+                "metadata/monsters/baron/b",
+                true,
+                &[],
+                &[],
+            ),
+            catalog_entry(
+                "Geonor Guard",
+                "baron",
+                "metadata/monsters/baron/c",
+                true,
+                &[],
+                &[],
+            ),
+            catalog_entry(
+                "baronphase 2 wolf",
+                "baron",
+                "metadata/monsters/baron/phase2/wolf",
+                false,
+                &[],
+                &["Count Geonor", "Geonor, the Putrid Wolf", "Geonor Guard"],
+            ),
+            catalog_entry(
+                "atziriphase 1",
+                "atziri",
+                "metadata/monsters/atziri/p1",
+                false,
+                &[],
+                &["atziri"],
+            ),
+        ]);
+
+        // Named rows have no suffix; fallback rows use the catalog-derived
+        // nearest context, capped at two visible names.
+        assert!(rows.iter().take(3).all(|row| row.context.is_none()));
+        assert_eq!(
+            rows[3].context.as_deref(),
+            Some("Count Geonor / Geonor, the Putrid Wolf …")
+        );
+        assert_eq!(rows[4].context.as_deref(), Some("atziri"));
+    }
+
     #[test]
     fn monster_catalog_rows_suffix_family_on_duplicate_display_names() {
         let entry = |display: &str, family: &str, key: &str| MonsterEffectCatalogEntry {
@@ -1367,6 +1661,8 @@ mod tests {
             monster_keys: vec![key.to_string()],
             family: family.to_string(),
             search_aliases: Vec::new(),
+            derived_context: Vec::new(),
+            named: true,
         };
         let rows = monster_effect_catalog_rows(vec![
             entry("Daemon", "daemon", "metadata/monsters/daemon/daemon"),

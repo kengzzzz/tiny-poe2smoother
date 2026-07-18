@@ -10,7 +10,7 @@ use crate::bundle::{BundleFile, BundleIndex, BundleStore};
 use anyhow::{Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::LazyLock;
 
 pub const MONSTER_VARIETIES_DATC64_PATH: &str = "data/balance/monstervarieties.datc64";
@@ -51,13 +51,18 @@ pub struct MonsterEffectOverride {
 }
 
 /// One editor row: a display name grouping the monster variants that share
-/// it within one family folder, plus hand-verified search aliases.
+/// it within one family folder. `search_aliases` are hand-verified names;
+/// `derived_context` is the fallback row's nearest recognizable ancestry,
+/// shared by search and the GUI suffix. `named` is true when the display came
+/// from the varieties table rather than the humanized-key fallback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MonsterEffectCatalogEntry {
     pub display: String,
     pub monster_keys: Vec<String>,
     pub family: String,
     pub search_aliases: Vec<String>,
+    pub derived_context: Vec<String>,
+    pub named: bool,
 }
 
 /// Hand-verified extra search terms for monsters players know by another
@@ -109,6 +114,13 @@ pub fn build_monster_effect_catalog(
         }
     }
     let monster_file_bytes = read_candidate_bytes(store, index, candidates)?;
+    // Full candidate key population — a strictly better sample than
+    // edges.keys() for path-column detection (monsters with no edges still
+    // anchor the statistics).
+    let known_keys: BTreeSet<String> = monster_file_bytes
+        .iter()
+        .map(|(key, _)| key.clone())
+        .collect();
     let monstervarieties = store.read_file(index, MONSTER_VARIETIES_DATC64_PATH).ok();
     let extra_tables: Vec<Vec<u8>> = MONSTER_EXTRA_TABLE_PATHS
         .iter()
@@ -133,6 +145,7 @@ pub fn build_monster_effect_catalog(
         &edges,
         monstervarieties.as_deref(),
         &reaching_refs,
+        &known_keys,
     ))
 }
 
@@ -246,45 +259,55 @@ fn collect_edges(
     edges
 }
 
-/// Pure catalog assembly. Rows group variants sharing a display name *within
-/// one family folder* — display text alone couples unrelated monsters
-/// (dozens of distinct monsters are all named "Daemon").
+/// Pure catalog assembly. Rows group variants sharing a display name and name
+/// provenance *within one family folder* — display text alone couples
+/// unrelated monsters (dozens are named "Daemon"), while a humanized fallback
+/// can collide with a table name. Strictly attributable helpers are folded into
+/// named rows afterward (see `merge_unnamed_helper_rows`).
 fn catalog_rows(
     edges: &EdgeMap,
     monstervarieties: Option<&[u8]>,
     reaching_refs: &BTreeSet<String>,
+    known_keys: &BTreeSet<String>,
 ) -> Vec<MonsterEffectCatalogEntry> {
     let displays = monstervarieties
-        .map(monster_display_names)
+        .map(|bytes| monster_display_names(bytes, known_keys))
         .unwrap_or_default();
 
-    let mut by_group: BTreeMap<(String, String), MonsterEffectCatalogEntry> = BTreeMap::new();
+    let mut by_group: BTreeMap<(String, String, bool), MonsterEffectCatalogEntry> = BTreeMap::new();
     for (key, edge) in edges {
         let listed = !edge.high.is_empty()
             || edge.refs.iter().any(|path| reaching_refs.contains(path));
         if !listed {
             continue;
         }
+        let named = displays.contains_key(key.as_str());
         let display = displays
             .get(key.as_str())
             .cloned()
             .unwrap_or_else(|| humanize_key(key));
         let row = by_group
-            .entry((display.to_lowercase(), family_of(key)))
+            .entry((display.to_lowercase(), family_of(key), named))
             .or_insert_with(|| MonsterEffectCatalogEntry {
                 display,
                 monster_keys: Vec::new(),
                 family: family_of(key),
                 search_aliases: Vec::new(),
+                derived_context: Vec::new(),
+                named,
             });
         row.monster_keys.push(key.clone());
     }
 
-    let mut rows: Vec<MonsterEffectCatalogEntry> = by_group.into_values().collect();
+    let grouped: Vec<_> = by_group.into_values().collect();
+    let identities = NamedIdentityIndex::new(&grouped, &displays);
+    let mut rows = merge_unnamed_helper_rows(grouped, &identities);
+    strip_base_prefix_from_fallback_rows(&mut rows);
     for row in &mut rows {
         row.monster_keys.sort();
         row.monster_keys.dedup();
         row.search_aliases = search_aliases_for(&row.monster_keys);
+        row.derived_context = derived_context_for(row, &identities, &displays);
     }
     rows.sort_by(|a, b| {
         a.display
@@ -294,6 +317,188 @@ fn catalog_rows(
             .then_with(|| a.family.cmp(&b.family))
     });
     rows
+}
+
+/// Fallback names like `basemutewindbanditman` read better without the
+/// `base` rig prefix. Skipped when the stripped name is already another
+/// row's text in the same family, so no two rows turn visually identical
+/// (cross-family duplicates already get a family suffix in the GUI).
+fn strip_base_prefix_from_fallback_rows(rows: &mut [MonsterEffectCatalogEntry]) {
+    let mut taken: HashSet<(String, String)> = rows
+        .iter()
+        .map(|row| (row.family.clone(), row.display.to_lowercase()))
+        .collect();
+    for row in rows.iter_mut().filter(|row| !row.named) {
+        let Some(rest) = row.display.strip_prefix("base") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        if !rest.starts_with(|c: char| c.is_ascii_alphabetic()) {
+            continue;
+        }
+        let slot = (row.family.clone(), rest.to_lowercase());
+        if taken.contains(&slot) {
+            continue;
+        }
+        taken.remove(&(row.family.clone(), row.display.to_lowercase()));
+        let rest = rest.to_string();
+        taken.insert(slot);
+        row.display = rest;
+    }
+}
+
+/// All table-named keys under each proper sub-family ancestor, including keys
+/// filtered out of the catalog for lacking a relevant effect edge. A key maps
+/// to a catalog target only when that exact key survived in a named row.
+struct NamedIdentityIndex {
+    keys_by_folder: HashMap<String, BTreeSet<String>>,
+    catalog_target_by_key: HashMap<String, usize>,
+}
+
+impl NamedIdentityIndex {
+    fn new(rows: &[MonsterEffectCatalogEntry], displays: &HashMap<String, String>) -> Self {
+        let mut catalog_target_by_key = HashMap::new();
+        for (idx, row) in rows.iter().enumerate().filter(|(_, row)| row.named) {
+            for key in row
+                .monster_keys
+                .iter()
+                .filter(|key| displays.contains_key(key.as_str()))
+            {
+                catalog_target_by_key.insert(key.clone(), idx);
+            }
+        }
+
+        let mut keys_by_folder: HashMap<String, BTreeSet<String>> = HashMap::new();
+        for key in displays.keys() {
+            for folder in ancestor_folders(key) {
+                keys_by_folder
+                    .entry(folder.to_string())
+                    .or_default()
+                    .insert(key.clone());
+            }
+        }
+
+        Self {
+            keys_by_folder,
+            catalog_target_by_key,
+        }
+    }
+}
+
+/// The complete set of named identities at the nearest proper sub-family
+/// ancestor. An ambiguous or targetless nearest set must not be skipped in
+/// favor of weaker evidence higher in the tree.
+fn nearest_named_candidates<'a>(
+    key: &str,
+    identities: &'a NamedIdentityIndex,
+) -> Option<&'a BTreeSet<String>> {
+    ancestor_folders(key)
+        .into_iter()
+        .find_map(|folder| identities.keys_by_folder.get(folder))
+}
+
+/// Resolve one fallback key only when every named identity at its nearest
+/// branch survived into the same catalog row. A filtered named key has no
+/// target and therefore blocks the merge.
+fn strict_named_target(key: &str, identities: &NamedIdentityIndex) -> Option<usize> {
+    let candidates = nearest_named_candidates(key, identities)?;
+    let mut targets = candidates
+        .iter()
+        .map(|candidate| identities.catalog_target_by_key.get(candidate).copied());
+    let first = targets.next().flatten()?;
+    targets.all(|target| target == Some(first)).then_some(first)
+}
+
+/// Derive one fallback row's search/display context from the same nearest
+/// identity sets used by ownership. Every key must report the identical set;
+/// missing or conflicting evidence falls back to the family folder. Named
+/// rows deliberately carry no derived context.
+fn derived_context_for(
+    row: &MonsterEffectCatalogEntry,
+    identities: &NamedIdentityIndex,
+    displays: &HashMap<String, String>,
+) -> Vec<String> {
+    if row.named {
+        return Vec::new();
+    }
+
+    let mut candidates = row
+        .monster_keys
+        .iter()
+        .map(|key| nearest_named_candidates(key, identities));
+    let Some(Some(first)) = candidates.next() else {
+        return vec![row.family.clone()];
+    };
+    if !candidates.all(|candidate| candidate == Some(first)) {
+        return vec![row.family.clone()];
+    }
+
+    let mut context: Vec<String> = first
+        .iter()
+        .filter_map(|key| displays.get(key).cloned())
+        .collect();
+    context.sort_by(|a, b| {
+        a.to_lowercase()
+            .cmp(&b.to_lowercase())
+            .then_with(|| a.cmp(b))
+    });
+    context.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    if context.is_empty() {
+        vec![row.family.clone()]
+    } else {
+        context
+    }
+}
+
+/// Fold each unnamed helper row (base rigs, phase forms, clones) into the
+/// single named row established by the full table-named identity population.
+/// Every key in the fallback row must resolve to the same target. Missing,
+/// targetless, ambiguous, or contradictory evidence leaves it standalone.
+fn merge_unnamed_helper_rows(
+    mut rows: Vec<MonsterEffectCatalogEntry>,
+    identities: &NamedIdentityIndex,
+) -> Vec<MonsterEffectCatalogEntry> {
+    let mut target_of: Vec<Option<usize>> = vec![None; rows.len()];
+    for (idx, row) in rows.iter().enumerate().filter(|(_, row)| !row.named) {
+        let mut targets = row
+            .monster_keys
+            .iter()
+            .map(|key| strict_named_target(key, identities));
+        if let Some(Some(first)) = targets.next() {
+            if targets.all(|target| target == Some(first)) {
+                target_of[idx] = Some(first);
+            }
+        }
+    }
+
+    for idx in 0..rows.len() {
+        if let Some(dst) = target_of[idx] {
+            let keys = std::mem::take(&mut rows[idx].monster_keys);
+            rows[dst].monster_keys.extend(keys);
+        }
+    }
+    rows.into_iter()
+        .enumerate()
+        .filter_map(|(idx, row)| target_of[idx].is_none().then_some(row))
+        .collect()
+}
+
+/// Proper sub-family folder prefixes of a monster key, deepest first. The
+/// family folder itself is excluded because family-wide uniqueness is not
+/// ownership evidence.
+fn ancestor_folders(key: &str) -> Vec<&str> {
+    let mut folders = Vec::new();
+    let mut end = key.len();
+    while let Some(pos) = key[..end].rfind('/') {
+        let folder = &key[..pos];
+        // Two slashes is exactly `metadata/monsters/<family>`.
+        if folder.bytes().filter(|b| *b == b'/').count() <= 2 {
+            break;
+        }
+        folders.push(folder);
+        end = pos;
+    }
+    folders
 }
 
 /// The lowercase monster key for a monster metadata index path, or `None`
@@ -545,15 +750,23 @@ fn unique_monster_aliases(monster_keys: &BTreeSet<String>) -> HashMap<String, St
 }
 
 /// Monster key -> display name from `monstervarieties` rows. The schema is
-/// unknown, so the name column is detected statistically (see
-/// `detect_display_column`); a naive first-plausible-string scan grouped 237
-/// unrelated monsters under "Any" on a real install.
-fn monster_display_names(bytes: &[u8]) -> HashMap<String, String> {
+/// unknown, so both columns are detected statistically: the name column (see
+/// `detect_display_column`; a naive first-plausible-string scan grouped 237
+/// unrelated monsters under "Any" on a real install) and the monster's own
+/// file-path column (see `detect_path_column`). A row names *only* that
+/// column's key: rows cross-reference other monsters (spawned clones,
+/// sibling varieties), so keying by every path in the row bled names onto
+/// the wrong monsters — "Atziri, the Fell Serpent" showed up on Xipocado,
+/// Royal Architect on a real install.
+fn monster_display_names(bytes: &[u8], known_keys: &BTreeSet<String>) -> HashMap<String, String> {
     let mut displays = HashMap::new();
     let Some(table) = parse_table(bytes) else {
         return displays;
     };
     let Some(column) = detect_display_column(&table) else {
+        return displays;
+    };
+    let Some(path_column) = detect_path_column(&table, known_keys) else {
         return displays;
     };
     for row in table.rows() {
@@ -562,14 +775,13 @@ fn monster_display_names(bytes: &[u8]) -> HashMap<String, String> {
         }) else {
             continue;
         };
-        let keys = row_strings(row, table.heap())
-            .iter()
-            .filter_map(|value| normalized_metadata_path(value))
-            .filter_map(|path| monster_key_from_table_path(&path))
-            .collect::<Vec<_>>();
-        for key in keys {
-            displays.entry(key).or_insert_with(|| display.clone());
-        }
+        let Some(key) = string_at_column(row, table.heap(), path_column)
+            .and_then(|value| normalized_metadata_path(&value))
+            .and_then(|path| monster_key_from_table_path(&path))
+        else {
+            continue;
+        };
+        displays.entry(key).or_insert_with(|| display.clone());
     }
     displays
 }
@@ -583,6 +795,76 @@ struct FieldColumn {
 }
 
 const DISPLAY_COLUMN_SAMPLE_ROWS: usize = 512;
+
+/// Score every candidate (offset, width) by how many sampled rows hold a
+/// known monster key there; the max is the monster's own metadata file-path
+/// column. Column 0 is *not* it: that column is a variety ID, path-shaped
+/// but often not a real file (`Baron/BaronBossHumanForm` where the actual
+/// file is `Baron/BaronHumanForm`), and keying by its basename collapses
+/// coverage.
+fn detect_path_column(table: &DatTable<'_>, known_keys: &BTreeSet<String>) -> Option<FieldColumn> {
+    let heap = table.heap();
+    let known_key_at = |row: &[u8], column| {
+        string_at_column(row, heap, column)
+            .and_then(|value| normalized_metadata_path(&value))
+            .and_then(|path| monster_key_from_table_path(&path))
+            .filter(|key| known_keys.contains(key))
+    };
+    let mut scores: HashMap<(usize, bool), usize> = HashMap::new();
+    for row in table.rows().take(DISPLAY_COLUMN_SAMPLE_ROWS) {
+        for offset in (0..row.len()).step_by(4) {
+            for wide in [true, false] {
+                let column = FieldColumn { offset, wide };
+                if known_key_at(row, column).is_some() {
+                    *scores.entry((offset, wide)).or_default() += 1;
+                }
+            }
+        }
+    }
+
+    let mut by_offset = Vec::new();
+    for offset in (0..table.row_len).step_by(4) {
+        let narrow = FieldColumn {
+            offset,
+            wide: false,
+        };
+        let wide = FieldColumn { offset, wide: true };
+        let narrow_score = scores.get(&(offset, false)).copied().unwrap_or_default();
+        let wide_score = scores.get(&(offset, true)).copied().unwrap_or_default();
+        let score = narrow_score.max(wide_score);
+        if score == 0 {
+            continue;
+        }
+
+        let column = match narrow_score.cmp(&wide_score) {
+            std::cmp::Ordering::Greater => Some(narrow),
+            std::cmp::Ordering::Less => Some(wide),
+            std::cmp::Ordering::Equal => {
+                let mapping = |column| {
+                    table
+                        .rows()
+                        .take(DISPLAY_COLUMN_SAMPLE_ROWS)
+                        .map(|row| known_key_at(row, column))
+                        .collect::<Vec<_>>()
+                };
+                (mapping(narrow) == mapping(wide)).then_some(narrow)
+            }
+        };
+        by_offset.push((score, column));
+    }
+
+    // Equal best evidence at distinct offsets cannot establish which column
+    // owns the row. Fail closed instead of silently preferring a lower offset.
+    let best_score = by_offset.iter().map(|(score, _)| *score).max()?;
+    let mut winners = by_offset
+        .into_iter()
+        .filter(|(score, _)| *score == best_score);
+    let (_, column) = winners.next()?;
+    if winners.next().is_some() {
+        return None;
+    }
+    column
+}
 
 /// Score every candidate (offset, width) by how many sampled rows yield a
 /// multi-word name there. Multi-word only for scoring — shared single-word
@@ -687,12 +969,23 @@ fn family_of(monster_key: &str) -> String {
         .to_string()
 }
 
+/// Fallback display for keys without a table name: path basename, `_` as
+/// space, a space at every digit boundary ("baronphase2wolf" →
+/// "baronphase 2 wolf"). Index paths are lowercase, so digits and
+/// separators are the only word boundaries recoverable from the key.
 fn humanize_key(monster_key: &str) -> String {
-    monster_key
-        .rsplit('/')
-        .next()
-        .unwrap_or(monster_key)
-        .replace('_', " ")
+    let base = monster_key.rsplit('/').next().unwrap_or(monster_key);
+    let mut out = String::with_capacity(base.len() + 4);
+    for ch in base.chars() {
+        let ch = if ch == '_' { ' ' } else { ch };
+        if let Some(prev) = out.chars().next_back() {
+            if prev != ' ' && ch != ' ' && prev.is_ascii_digit() != ch.is_ascii_digit() {
+                out.push(' ');
+            }
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn decode_text_lossy(bytes: &[u8]) -> String {
@@ -715,8 +1008,12 @@ fn monster_effect_catalog_from_parts(
     monstervarieties: Option<&[u8]>,
     extra_tables: &[Vec<u8>],
 ) -> Vec<MonsterEffectCatalogEntry> {
+    let known_keys: BTreeSet<String> = monster_file_bytes
+        .iter()
+        .map(|(key, _)| key.clone())
+        .collect();
     let edges = collect_edges(monster_file_bytes, monstervarieties, extra_tables);
-    catalog_rows(&edges, monstervarieties, &BTreeSet::new())
+    catalog_rows(&edges, monstervarieties, &BTreeSet::new(), &known_keys)
 }
 
 #[cfg(test)]
@@ -990,8 +1287,14 @@ other = "Metadata/Effects/utility/epks/off.ao"
             &["Metadata/Monsters/SandSpitter/SandSpitter", "Any", "Sand Spitter"],
             &["Metadata/Monsters/Unnamed/Unnamed", "Any", ""],
         ]);
+        let known_keys: BTreeSet<String> = [
+            "metadata/monsters/boghulk/boghulk".to_string(),
+            "metadata/monsters/sandspitter/sandspitter".to_string(),
+            "metadata/monsters/unnamed/unnamed".to_string(),
+        ]
+        .into();
 
-        let displays = monster_display_names(&varieties);
+        let displays = monster_display_names(&varieties, &known_keys);
 
         assert_eq!(
             displays
@@ -1009,6 +1312,125 @@ other = "Metadata/Effects/utility/epks/off.ao"
         // fallback happens at catalog assembly), and "Any" never leaks in.
         assert!(!displays.contains_key("metadata/monsters/unnamed/unnamed"));
         assert!(displays.values().all(|display| display != "Any"));
+    }
+
+    #[test]
+    fn display_names_key_by_the_detected_path_column_only() {
+        // Row layout mirrors the real table: [variety ID, own file path,
+        // cross-reference, name]. The variety ID is path-shaped but not a
+        // real file (BaronBossHumanForm vs the actual BaronHumanForm), and
+        // the cross-reference points at *another* monster's key — before
+        // path-column detection, Geonor's row here would have named
+        // TheArchitect "Count Geonor" (the real-install bug put "Atziri,
+        // the Fell Serpent" on Xipocado this way).
+        let geonor = "metadata/monsters/baron/baronhumanform";
+        let architect = "metadata/monsters/leagueincursionnew/architectboss/thearchitect";
+        let varieties = table(&[
+            &[
+                "Metadata/Monsters/Baron/BaronBossHumanForm",
+                "Metadata/Monsters/Baron/BaronHumanForm",
+                "Metadata/Monsters/LeagueIncursionNew/ArchitectBoss/TheArchitect",
+                "Count Geonor",
+            ],
+            &[
+                "Metadata/Monsters/LeagueIncursionNew/ArchitectBoss/TheArchitectId",
+                "Metadata/Monsters/LeagueIncursionNew/ArchitectBoss/TheArchitect",
+                "",
+                "Xipocado, Royal Architect",
+            ],
+        ]);
+        let known_keys: BTreeSet<String> = [geonor.to_string(), architect.to_string()].into();
+        let table = parse_table(&varieties).unwrap();
+
+        assert_eq!(
+            detect_path_column(&table, &known_keys).map(|column| column.offset),
+            Some(8)
+        );
+
+        let displays = monster_display_names(&varieties, &known_keys);
+
+        assert_eq!(
+            displays.get(geonor).map(String::as_str),
+            Some("Count Geonor")
+        );
+        assert_eq!(
+            displays.get(architect).map(String::as_str),
+            Some("Xipocado, Royal Architect")
+        );
+        // Variety-ID keys never enter the map.
+        assert!(!displays.contains_key("metadata/monsters/baron/baronbosshumanform"));
+    }
+
+    #[test]
+    fn path_column_same_offset_width_alias_remains_usable() {
+        let key = "metadata/monsters/a/a";
+        let varieties = table(&[&["Metadata/Monsters/A/A", "Monster A"]]);
+        let known_keys: BTreeSet<String> = [key.to_string()].into();
+        let table = parse_table(&varieties).unwrap();
+        let row = table.rows().next().unwrap();
+
+        assert_eq!(
+            string_at_column(
+                row,
+                table.heap(),
+                FieldColumn {
+                    offset: 0,
+                    wide: false,
+                },
+            ),
+            string_at_column(
+                row,
+                table.heap(),
+                FieldColumn {
+                    offset: 0,
+                    wide: true,
+                },
+            )
+        );
+        assert_eq!(
+            detect_path_column(&table, &known_keys).map(|column| column.offset),
+            Some(0)
+        );
+        assert_eq!(
+            monster_display_names(&varieties, &known_keys)
+                .get(key)
+                .map(String::as_str),
+            Some("Monster A")
+        );
+    }
+
+    #[test]
+    fn path_column_tie_between_distinct_offsets_fails_closed() {
+        let a = "metadata/monsters/a/a";
+        let b = "metadata/monsters/b/b";
+        // Column 0 cross-references the other monster; column 1 is the intended
+        // own path. Both columns contain two known keys and score 2, so the data
+        // does not prove which identity column is correct.
+        let varieties = table(&[
+            &[
+                "Metadata/Monsters/B/B",
+                "Metadata/Monsters/A/A",
+                "Monster A",
+            ],
+            &[
+                "Metadata/Monsters/A/A",
+                "Metadata/Monsters/B/B",
+                "Monster B",
+            ],
+        ]);
+        let known_keys: BTreeSet<String> = [a.to_string(), b.to_string()].into();
+        let table = parse_table(&varieties).unwrap();
+
+        assert_eq!(detect_path_column(&table, &known_keys), None);
+        assert!(monster_display_names(&varieties, &known_keys).is_empty());
+    }
+
+    #[test]
+    fn path_column_without_known_key_evidence_fails_closed() {
+        let varieties = table(&[&["Metadata/Monsters/A/A", "Monster A"]]);
+        let table = parse_table(&varieties).unwrap();
+
+        assert_eq!(detect_path_column(&table, &BTreeSet::new()), None);
     }
 
     #[test]
@@ -1057,7 +1479,85 @@ other = "Metadata/Effects/utility/epks/off.ao"
             .iter()
             .find(|row| row.monster_keys[0].contains("boghulk"))
             .unwrap();
+        // Hand-verified terms attach only to the lich. Derived context is
+        // carried separately for both fallback rows.
+        assert!(!other.search_aliases.iter().any(|alias| alias == "amanamu"));
         assert!(other.search_aliases.is_empty());
+        assert_eq!(other.derived_context, vec!["boghulk".to_string()]);
+    }
+
+    #[test]
+    fn fallback_rows_get_nearest_ambiguous_context() {
+        let rig = r#"rig = "Metadata/Effects/Spells/monsters_effects/act1/baron/slam.ao""#;
+        let monster_files: Vec<(String, Vec<u8>)> = vec![
+            (
+                "metadata/monsters/baron/phase2/baronhumanform".to_string(),
+                utf16_file(rig),
+            ),
+            (
+                "metadata/monsters/baron/phase2/baronwolfform".to_string(),
+                utf16_file(rig),
+            ),
+            (
+                "metadata/monsters/baron/phase2/baronphase2wolf".to_string(),
+                utf16_file(rig),
+            ),
+        ];
+        let varieties = table(&[
+            &[
+                "Metadata/Monsters/Baron/Phase2/BaronHumanForm",
+                "Count Geonor",
+                "",
+            ],
+            &[
+                "Metadata/Monsters/Baron/Phase2/BaronWolfForm",
+                "Geonor, the Putrid Wolf",
+                "",
+            ],
+        ]);
+
+        let rows = monster_effect_catalog_from_parts(&monster_files, Some(&varieties), &[]);
+
+        // Two named rows in the family keep the phase row ambiguous — it
+        // stays its own row instead of merging.
+        let fallback = rows
+            .iter()
+            .find(|row| {
+                row.monster_keys
+                    .iter()
+                    .any(|key| key.ends_with("baronphase2wolf"))
+            })
+            .unwrap();
+        assert!(!fallback.named);
+        assert_eq!(fallback.display, "baronphase 2 wolf");
+        assert!(fallback.search_aliases.is_empty());
+        assert_eq!(
+            fallback.derived_context,
+            vec![
+                "Count Geonor".to_string(),
+                "Geonor, the Putrid Wolf".to_string()
+            ]
+        );
+        // Named rows get no derived context.
+        let named = rows
+            .iter()
+            .find(|row| row.display == "Count Geonor")
+            .unwrap();
+        assert!(named.search_aliases.is_empty());
+        assert!(named.derived_context.is_empty());
+    }
+
+    #[test]
+    fn humanize_key_splits_digit_boundaries_and_underscores() {
+        assert_eq!(
+            humanize_key("metadata/monsters/baron/phase2/baronphase2wolf"),
+            "baronphase 2 wolf"
+        );
+        assert_eq!(
+            humanize_key("metadata/monsters/atziri/atziriphase2_fleshclone"),
+            "atziriphase 2 fleshclone"
+        );
+        assert_eq!(humanize_key("metadata/monsters/boghulk/boghulk"), "boghulk");
     }
 
     #[test]
@@ -1147,8 +1647,10 @@ epk = "Metadata\Effects\Utility\epks\pack.epk"
         ];
         let edges = collect_edges(&monster_files, None, &[]);
         let reaching: BTreeSet<String> = [reaching_pack.to_string()].into();
+        let known_keys: BTreeSet<String> =
+            monster_files.iter().map(|(key, _)| key.clone()).collect();
 
-        let rows = catalog_rows(&edges, None, &reaching);
+        let rows = catalog_rows(&edges, None, &reaching, &known_keys);
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].monster_keys, vec!["metadata/monsters/boghulk/boghulk".to_string()]);
@@ -1182,6 +1684,494 @@ epk = "Metadata\Effects\Utility\epks\pack.epk"
         assert_eq!(rows[1].family, "leaguedelirium");
         assert_eq!(rows[0].monster_keys.len(), 1);
         assert_eq!(rows[1].monster_keys.len(), 1);
+    }
+
+    #[test]
+    fn catalog_does_not_group_fallbacks_with_colliding_named_displays() {
+        let named = "metadata/monsters/a/named";
+        let fallback = "metadata/monsters/a/named_helper";
+        let rig = r#"rig = "Metadata/Effects/Spells/monsters_effects/x/fx.ao""#;
+        let monster_files = vec![
+            (named.to_string(), utf16_file(rig)),
+            (fallback.to_string(), utf16_file(rig)),
+        ];
+        let varieties = table(&[&["Metadata/Monsters/A/Named", "Named Helper"]]);
+
+        let rows = monster_effect_catalog_from_parts(&monster_files, Some(&varieties), &[]);
+
+        assert_eq!(rows.len(), 2);
+        assert!(rows
+            .iter()
+            .any(|row| { row.named && row.monster_keys == vec![named.to_string()] }));
+        assert!(rows
+            .iter()
+            .any(|row| { !row.named && row.monster_keys == vec![fallback.to_string()] }));
+    }
+
+    #[test]
+    fn merge_does_not_use_filtered_catalog_as_ownership_evidence() {
+        let rig = r#"rig = "Metadata/Effects/Spells/monsters_effects/x/fx.ao""#;
+        let visible = "metadata/monsters/a/visible";
+        let hidden_named = "metadata/monsters/a/hidden";
+        let hidden_variant = "metadata/monsters/a/hiddenvariant";
+        let monster_files = vec![
+            (visible.to_string(), utf16_file(rig)),
+            // Named in the table, but filtered from catalog rows because it has
+            // no relevant effect edge.
+            (hidden_named.to_string(), utf16_file("version 3")),
+            (hidden_variant.to_string(), utf16_file(rig)),
+        ];
+        let varieties = table(&[
+            &["Metadata/Monsters/A/Visible", "Visible Monster"],
+            &["Metadata/Monsters/A/Hidden", "Hidden Monster"],
+        ]);
+
+        let rows = monster_effect_catalog_from_parts(&monster_files, Some(&varieties), &[]);
+
+        let visible_row = rows
+            .iter()
+            .find(|row| row.display == "Visible Monster")
+            .unwrap();
+        assert!(!visible_row
+            .monster_keys
+            .iter()
+            .any(|key| key == hidden_variant));
+        assert!(rows
+            .iter()
+            .any(|row| { !row.named && row.monster_keys.iter().any(|key| key == hidden_variant) }));
+    }
+
+    #[test]
+    fn merge_does_not_climb_past_filtered_named_branch() {
+        let rig = r#"rig = "Metadata/Effects/Spells/monsters_effects/x/fx.ao""#;
+        let visible = "metadata/monsters/a/branch/visible";
+        let hidden_named = "metadata/monsters/a/branch/hidden/identity";
+        let hidden_variant = "metadata/monsters/a/branch/hidden/variant";
+        let monster_files = vec![
+            (visible.to_string(), utf16_file(rig)),
+            (hidden_named.to_string(), utf16_file("version 3")),
+            (hidden_variant.to_string(), utf16_file(rig)),
+        ];
+        let varieties = table(&[
+            &["Metadata/Monsters/A/Branch/Visible", "Visible Monster"],
+            &[
+                "Metadata/Monsters/A/Branch/Hidden/Identity",
+                "Hidden Monster",
+            ],
+        ]);
+
+        let rows = monster_effect_catalog_from_parts(&monster_files, Some(&varieties), &[]);
+
+        assert!(rows
+            .iter()
+            .any(|row| { !row.named && row.monster_keys.iter().any(|key| key == hidden_variant) }));
+        assert!(rows
+            .iter()
+            .find(|row| row.display == "Visible Monster")
+            .is_some_and(|row| !row.monster_keys.iter().any(|key| key == hidden_variant)));
+    }
+
+    /// Merge-test shorthand; family derives from the first key like the
+    /// real grouping does.
+    fn merge_entry(display: &str, keys: &[&str], named: bool) -> MonsterEffectCatalogEntry {
+        MonsterEffectCatalogEntry {
+            display: display.to_string(),
+            monster_keys: keys.iter().map(|key| key.to_string()).collect(),
+            family: family_of(keys[0]),
+            search_aliases: Vec::new(),
+            derived_context: Vec::new(),
+            named,
+        }
+    }
+
+    fn merge_with_names(
+        rows: Vec<MonsterEffectCatalogEntry>,
+        names: &[(&str, &str)],
+    ) -> Vec<MonsterEffectCatalogEntry> {
+        let displays = names
+            .iter()
+            .map(|(key, display)| (key.to_string(), display.to_string()))
+            .collect();
+        let identities = NamedIdentityIndex::new(&rows, &displays);
+        merge_unnamed_helper_rows(rows, &identities)
+    }
+
+    fn with_derived_context(
+        mut rows: Vec<MonsterEffectCatalogEntry>,
+        names: &[(&str, &str)],
+    ) -> Vec<MonsterEffectCatalogEntry> {
+        let displays = names
+            .iter()
+            .map(|(key, display)| (key.to_string(), display.to_string()))
+            .collect();
+        let identities = NamedIdentityIndex::new(&rows, &displays);
+        for row in &mut rows {
+            row.derived_context = derived_context_for(row, &identities, &displays);
+        }
+        rows
+    }
+
+    #[test]
+    fn context_uses_nearest_named_ancestry_not_sibling_family_names() {
+        let alpha = "metadata/monsters/family/alpha/alpha";
+        let beta = "metadata/monsters/family/beta/beta";
+        let helper = "metadata/monsters/family/beta/helper";
+        let rows = with_derived_context(
+            vec![
+                merge_entry("Alpha Monster", &[alpha], true),
+                merge_entry("Beta Monster", &[beta], true),
+                merge_entry("helper", &[helper], false),
+            ],
+            &[(alpha, "Alpha Monster"), (beta, "Beta Monster")],
+        );
+
+        assert_eq!(rows[2].derived_context, vec!["Beta Monster".to_string()]);
+        assert!(!rows[2]
+            .derived_context
+            .iter()
+            .any(|name| name == "Alpha Monster"));
+        assert!(rows[..2].iter().all(|row| row.derived_context.is_empty()));
+    }
+
+    #[test]
+    fn context_keeps_sorted_deduplicated_local_ambiguity() {
+        let alpha = "metadata/monsters/family/beta/alpha";
+        let alpha_variant = "metadata/monsters/family/beta/alpha_variant";
+        let zulu = "metadata/monsters/family/beta/zulu";
+        let helper = "metadata/monsters/family/beta/helper";
+        let rows = with_derived_context(
+            vec![
+                merge_entry("Alpha Monster", &[alpha, alpha_variant], true),
+                merge_entry("Zulu Monster", &[zulu], true),
+                merge_entry("helper", &[helper], false),
+            ],
+            &[
+                (zulu, "Zulu Monster"),
+                (alpha_variant, "Alpha Monster"),
+                (alpha, "Alpha Monster"),
+            ],
+        );
+
+        assert_eq!(
+            rows[2].derived_context,
+            vec!["Alpha Monster".to_string(), "Zulu Monster".to_string()]
+        );
+    }
+
+    #[test]
+    fn context_falls_back_to_family_for_missing_or_conflicting_candidates() {
+        let alpha = "metadata/monsters/family/alpha/alpha";
+        let beta = "metadata/monsters/family/beta/beta";
+        let rows = with_derived_context(
+            vec![
+                merge_entry("Alpha Monster", &[alpha], true),
+                merge_entry("Beta Monster", &[beta], true),
+                merge_entry(
+                    "conflict",
+                    &[
+                        "metadata/monsters/family/alpha/helper",
+                        "metadata/monsters/family/beta/helper",
+                    ],
+                    false,
+                ),
+                merge_entry("orphan", &["metadata/monsters/family/gamma/helper"], false),
+            ],
+            &[(alpha, "Alpha Monster"), (beta, "Beta Monster")],
+        );
+
+        assert_eq!(rows[2].derived_context, vec!["family".to_string()]);
+        assert_eq!(rows[3].derived_context, vec!["family".to_string()]);
+    }
+
+    #[test]
+    fn context_derivation_preserves_hand_verified_aliases() {
+        let beta = "metadata/monsters/family/beta/beta";
+        let mut helper = merge_entry("helper", &["metadata/monsters/family/beta/helper"], false);
+        helper.search_aliases = vec!["amanamu".to_string(), "ulaman".to_string()];
+        let rows = with_derived_context(
+            vec![merge_entry("Beta Monster", &[beta], true), helper],
+            &[(beta, "Beta Monster")],
+        );
+
+        assert_eq!(rows[1].search_aliases, ["amanamu", "ulaman"]);
+        assert_eq!(rows[1].derived_context, ["Beta Monster"]);
+    }
+
+    #[test]
+    fn merge_folds_uniquely_attributable_unnamed_row_into_named_row() {
+        let named = "metadata/monsters/a/b/x";
+        let rows = merge_with_names(
+            vec![
+                merge_entry("X", &[named], true),
+                merge_entry("base x", &["metadata/monsters/a/b/base_x"], false),
+            ],
+            &[(named, "X")],
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].display, "X");
+        assert_eq!(
+            rows[0].monster_keys,
+            vec![
+                "metadata/monsters/a/b/x".to_string(),
+                "metadata/monsters/a/b/base_x".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_leaves_ambiguous_unnamed_rows_untouched() {
+        let x = "metadata/monsters/a/branch/x";
+        let y = "metadata/monsters/a/branch/y";
+        let unnamed = merge_entry("p", &["metadata/monsters/a/branch/p"], false);
+        let rows = merge_with_names(
+            vec![
+                merge_entry("X", &[x], true),
+                merge_entry("Y", &[y], true),
+                unnamed.clone(),
+            ],
+            &[(x, "X"), (y, "Y")],
+        );
+
+        assert_eq!(rows.len(), 3);
+        assert!(rows.contains(&unnamed));
+        assert!(rows
+            .iter()
+            .filter(|row| row.named)
+            .all(|row| row.monster_keys.len() == 1));
+    }
+
+    #[test]
+    fn merge_leaves_orphan_unnamed_rows_untouched() {
+        let unnamed = merge_entry("statue", &["metadata/monsters/c/statue"], false);
+        let rows = merge_with_names(vec![unnamed.clone()], &[]);
+
+        assert_eq!(rows, vec![unnamed]);
+    }
+
+    #[test]
+    fn merge_never_crosses_family_folders() {
+        let named = "metadata/monsters/b/branch/foo";
+        let unnamed = merge_entry("foo", &["metadata/monsters/a/branch/foo"], false);
+        let rows = merge_with_names(
+            vec![merge_entry("Foo", &[named], true), unnamed.clone()],
+            &[(named, "Foo")],
+        );
+
+        assert_eq!(rows.len(), 2);
+        assert!(rows.contains(&unnamed));
+    }
+
+    #[test]
+    fn merge_rejects_family_wide_uniqueness() {
+        let named = "metadata/monsters/a/x";
+        let unnamed = merge_entry("helper", &["metadata/monsters/a/helper"], false);
+        let rows = merge_with_names(
+            vec![merge_entry("X", &[named], true), unnamed.clone()],
+            &[(named, "X")],
+        );
+
+        assert_eq!(rows.len(), 2);
+        assert!(rows.contains(&unnamed));
+    }
+
+    #[test]
+    fn merge_stops_at_targetless_nearest_identity() {
+        let visible = "metadata/monsters/a/branch/visible";
+        let hidden = "metadata/monsters/a/branch/hidden/identity";
+        let unnamed = merge_entry(
+            "helper",
+            &["metadata/monsters/a/branch/hidden/helper"],
+            false,
+        );
+        let rows = merge_with_names(
+            vec![merge_entry("Visible", &[visible], true), unnamed.clone()],
+            &[(visible, "Visible"), (hidden, "Hidden")],
+        );
+
+        assert_eq!(rows.len(), 2);
+        assert!(rows.contains(&unnamed));
+    }
+
+    #[test]
+    fn merge_rejects_targetless_identity_beside_surviving_target() {
+        let visible = "metadata/monsters/a/branch/a_visible";
+        let hidden = "metadata/monsters/a/branch/z_hidden";
+        let helper = "metadata/monsters/a/branch/helper";
+        let unnamed = merge_entry("helper", &[helper], false);
+        let rows = merge_with_names(
+            vec![merge_entry("Visible", &[visible], true), unnamed.clone()],
+            &[(visible, "Visible"), (hidden, "Hidden")],
+        );
+
+        assert_eq!(rows.len(), 2);
+        assert!(rows.contains(&unnamed));
+        assert_eq!(
+            rows.iter()
+                .flat_map(|row| &row.monster_keys)
+                .filter(|key| key.as_str() == helper)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn merge_allows_multiple_named_keys_already_grouped_in_one_row() {
+        let x = "metadata/monsters/a/branch/x";
+        let x_variant = "metadata/monsters/a/branch/xvariant";
+        let rows = merge_with_names(
+            vec![
+                merge_entry("X", &[x, x_variant], true),
+                merge_entry("helper", &["metadata/monsters/a/branch/helper"], false),
+            ],
+            &[(x, "X"), (x_variant, "X")],
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].monster_keys.len(), 3);
+    }
+
+    #[test]
+    fn merge_leaves_multi_key_rows_with_conflicting_targets_untouched() {
+        let alpha = "metadata/monsters/a/alpha/alpha";
+        let beta = "metadata/monsters/a/beta/beta";
+        let unnamed = merge_entry(
+            "helper",
+            &[
+                "metadata/monsters/a/alpha/helper",
+                "metadata/monsters/a/beta/helper",
+            ],
+            false,
+        );
+        let rows = merge_with_names(
+            vec![
+                merge_entry("Alpha", &[alpha], true),
+                merge_entry("Beta", &[beta], true),
+                unnamed.clone(),
+            ],
+            &[(alpha, "Alpha"), (beta, "Beta")],
+        );
+
+        assert_eq!(rows.len(), 3);
+        assert!(rows.contains(&unnamed));
+    }
+
+    #[test]
+    fn merge_preserves_each_catalog_key_exactly_once() {
+        let named = "metadata/monsters/a/branch/named";
+        let rows = vec![
+            merge_entry("Named", &[named], true),
+            merge_entry("helper", &["metadata/monsters/a/branch/helper"], false),
+            merge_entry("orphan", &["metadata/monsters/b/orphan"], false),
+        ];
+        let expected: BTreeSet<String> = rows
+            .iter()
+            .flat_map(|row| row.monster_keys.iter().cloned())
+            .collect();
+
+        let rows = merge_with_names(rows, &[(named, "Named")]);
+        let mut actual = BTreeSet::new();
+        for key in rows.iter().flat_map(|row| &row.monster_keys) {
+            assert!(actual.insert(key.clone()), "duplicate catalog key {key}");
+        }
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn merge_prefers_the_deepest_named_subtree_over_family_wide_ambiguity() {
+        let x = "metadata/monsters/a/b/c/x";
+        let y = "metadata/monsters/a/b/y";
+        let rows = merge_with_names(
+            vec![
+                merge_entry("X", &[x], true),
+                merge_entry("Y", &[y], true),
+                merge_entry("helper", &["metadata/monsters/a/b/c/helper"], false),
+            ],
+            &[(x, "X"), (y, "Y")],
+        );
+
+        assert_eq!(rows.len(), 2);
+        let x = rows.iter().find(|row| row.display == "X").unwrap();
+        assert!(x
+            .monster_keys
+            .contains(&"metadata/monsters/a/b/c/helper".to_string()));
+        let y = rows.iter().find(|row| row.display == "Y").unwrap();
+        assert_eq!(y.monster_keys, vec!["metadata/monsters/a/b/y".to_string()]);
+    }
+
+    #[test]
+    fn base_prefix_stripped_from_fallback_rows_unless_colliding() {
+        let mut rows = vec![
+            merge_entry("basewolf", &["metadata/monsters/a/basewolf"], false),
+            merge_entry("wolf", &["metadata/monsters/a/wolf"], false),
+            merge_entry("basebear", &["metadata/monsters/a/basebear"], false),
+            merge_entry("base 2 wolf", &["metadata/monsters/a/base2wolf"], false),
+            merge_entry("basegoat", &["metadata/monsters/b/basegoat"], true),
+        ];
+
+        strip_base_prefix_from_fallback_rows(&mut rows);
+
+        // "wolf" is taken by another row in the family; digit remainders
+        // ("base 2 wolf") and table-named rows keep their text.
+        assert_eq!(rows[0].display, "basewolf");
+        assert_eq!(rows[1].display, "wolf");
+        assert_eq!(rows[2].display, "bear");
+        assert_eq!(rows[3].display, "base 2 wolf");
+        assert_eq!(rows[4].display, "basegoat");
+    }
+
+    #[test]
+    fn catalog_merges_unnamed_helpers_and_recomputes_aliases() {
+        // kulemakboss has no varieties name here, so it folds into the named
+        // "Vessel of Kulemak" row next to it — which must then pick up the
+        // hand-verified aliases keyed to the folded-in key. The orphan family
+        // has no named relative and stays a fallback row.
+        let lich = "metadata/monsters/leagueabyss/lichboss/lich";
+        let helper = "metadata/monsters/leagueabyss/lichboss/kulemakboss";
+        let orphan = "metadata/monsters/orphanfam/orphan";
+        let rig = |name: &str| {
+            utf16_file(&format!(
+                r#"rig = "Metadata/Effects/Spells/monsters_effects/x/{name}.ao""#
+            ))
+        };
+        let monster_files: Vec<(String, Vec<u8>)> = vec![
+            (lich.to_string(), rig("lich")),
+            (helper.to_string(), rig("kulemak")),
+            (orphan.to_string(), rig("orphan")),
+        ];
+        let varieties = table(&[&[
+            "Metadata/Monsters/LeagueAbyss/LichBoss/Lich",
+            "Vessel of Kulemak",
+        ]]);
+
+        let rows = monster_effect_catalog_from_parts(&monster_files, Some(&varieties), &[]);
+
+        assert_eq!(rows.len(), 2);
+        let vessel = rows.iter().find(|row| row.named).unwrap();
+        assert_eq!(vessel.display, "Vessel of Kulemak");
+        assert_eq!(
+            vessel.monster_keys,
+            vec![helper.to_string(), lich.to_string()]
+        );
+        assert!(vessel.search_aliases.iter().any(|alias| alias == "amanamu"));
+        assert!(vessel.derived_context.is_empty());
+        let fallback = rows.iter().find(|row| !row.named).unwrap();
+        assert_eq!(fallback.display, "orphan");
+        assert_eq!(fallback.monster_keys, vec![orphan.to_string()]);
+        assert_eq!(fallback.derived_context, vec!["orphanfam".to_string()]);
+    }
+
+    #[test]
+    fn ancestor_folders_exclude_the_family_folder() {
+        assert_eq!(
+            ancestor_folders("metadata/monsters/family/a/b/helper"),
+            vec!["metadata/monsters/family/a/b", "metadata/monsters/family/a",]
+        );
+        assert_eq!(
+            ancestor_folders("metadata/monsters/family/helper"),
+            Vec::<&str>::new()
+        );
     }
 
     #[test]

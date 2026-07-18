@@ -870,6 +870,36 @@ fn draw_effects_monsters_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
             .margin(egui::Margin::symmetric(10, 8)),
     );
     ui.add_space(6.0);
+    let unnamed_rows = app.unnamed_monster_row_count();
+    if unnamed_rows > 0 {
+        // Distinct ID space: the Skills tab renders widgets at the same
+        // position and egui would otherwise share state across tabs.
+        ui.push_id("effects_monsters_show_unnamed", |ui| {
+            ui.checkbox(
+                &mut app.show_unnamed_monsters,
+                egui::RichText::new(format!("Show unnamed entities ({unnamed_rows})")).size(11.5),
+            )
+            .on_hover_text(
+                "Internal rows with no in-game name. While hidden, rows keeping \
+                 original visuals are flagged below — never dropped silently.",
+            );
+        });
+        if !app.show_unnamed_monsters {
+            let overridden = app.overridden_unnamed_monster_row_count();
+            if overridden > 0 {
+                ui.horizontal(|ui| {
+                    ui.label(theme::caption_text(&format!(
+                        "{} keeping original visuals hidden",
+                        count_label(overridden, "unnamed row")
+                    )));
+                    if small_action(ui, "Show") {
+                        app.show_unnamed_monsters = true;
+                    }
+                });
+            }
+        }
+        ui.add_space(6.0);
+    }
     if app.monster_catalog_task.is_some() {
         ui.horizontal(|ui| {
             ui.add(egui::Spinner::new().color(palette::ACCENT));
@@ -936,6 +966,7 @@ fn draw_monster_row(app: &mut GuiApp, ui: &mut egui::Ui, idx: usize) {
     let row = &catalog[idx];
     let keys = row.monster_keys.clone();
     let display = row.display.clone();
+    let context = row.context.clone();
     let level = app.monster_level_for_keys(&keys);
     let mixed = level.is_none();
     let mut reduced = level == Some(EffectLevel::Reduced);
@@ -972,9 +1003,26 @@ fn draw_monster_row(app: &mut GuiApp, ui: &mut egui::Ui, idx: usize) {
                 .truncate(),
             )
             .on_hover_text(&hover);
+            // Fallback rows carry a muted "where does this belong" suffix;
+            // truncation keeps the row single-line, the name has priority.
+            if let Some(context) = &context {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(monster_context_label(context))
+                            .size(11.5)
+                            .color(palette::TEXT_MUTED),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(&hover);
+            }
             toggle.on_hover_text(hover);
         },
     );
+}
+
+fn monster_context_label(context: &str) -> String {
+    format!("· {context}")
 }
 
 /// Variant keys for a row hover, truncated so huge groups stay readable.
@@ -1065,6 +1113,14 @@ mod tests {
         assert_eq!(count_label(2, "monster"), "2 monsters");
     }
 
+    #[test]
+    fn monster_context_label_formats_the_rendered_suffix() {
+        assert_eq!(
+            monster_context_label("Viper Legionnaire"),
+            "· Viper Legionnaire"
+        );
+    }
+
     /// Both tab search fields sit at the same auto-widget position in the
     /// modal, so without distinct salts egui persists one shared
     /// `TextEditState` (cursor, selection, undo history) across tabs.
@@ -1085,5 +1141,49 @@ mod tests {
         // A second state entry proves the two fields have distinct widget
         // IDs; a shared ID would overwrite the first entry in place.
         assert_eq!(ctx.data(|d| d.count::<TextEditState>()), 2);
+    }
+
+    fn monster_row(display: &str, keys: &[&str], named: bool) -> crate::MonsterCatalogRow {
+        let monster_keys: Vec<String> = keys.iter().map(|key| key.to_string()).collect();
+        crate::MonsterCatalogRow {
+            display_lower: display.to_lowercase(),
+            search_lower: format!("{} {}", display.to_lowercase(), monster_keys.join(" ")),
+            display: display.to_string(),
+            monster_keys,
+            context: None,
+            named,
+        }
+    }
+
+    /// The rendered monsters tab default-hides fallback rows; ticking
+    /// "Show unnamed entities" (state flip, as the checkbox does) reveals
+    /// them, and an overridden hidden row is flagged by the hint count
+    /// rather than silently dropped.
+    #[test]
+    fn monsters_tab_hides_unnamed_rows_until_checkbox_enabled() {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let mut app = GuiApp::default();
+        let wolf = "metadata/monsters/baron/phase2/baronphase2wolf";
+        let mut fallback = monster_row("baronphase 2 wolf", &[wolf], false);
+        fallback.context = Some("Count Geonor / Geonor, the Putrid Wolf".to_string());
+        app.monster_catalog = Some(vec![
+            monster_row("Bog Hulk", &["metadata/monsters/boghulk/boghulk"], true),
+            fallback,
+        ]);
+        app.monster_overrides
+            .insert(wolf.to_string(), EffectLevel::Full);
+
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_effects_monsters_tab(&mut app, ui);
+        });
+        assert_eq!(app.monsters_filter_rows, vec![0]);
+        assert_eq!(app.overridden_unnamed_monster_row_count(), 1);
+
+        app.show_unnamed_monsters = true;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_effects_monsters_tab(&mut app, ui);
+        });
+        assert_eq!(app.monsters_filter_rows, vec![0, 1]);
     }
 }
