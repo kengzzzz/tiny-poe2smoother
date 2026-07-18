@@ -235,8 +235,15 @@ fn read_entries(path: &Path) -> Result<Vec<BackupEntry>> {
         bail!("unsupported backup version {version} in {}", path.display());
     }
     if version >= 2 {
-        let manifest_len = cursor.read_u32::<LittleEndian>()? as usize;
-        let _ = cursor.seek(std::io::SeekFrom::Current(manifest_len as i64));
+        let manifest_len = cursor.read_u32::<LittleEndian>()?;
+        let remaining = (bytes.len() as u64).saturating_sub(cursor.position());
+        if u64::from(manifest_len) > remaining {
+            bail!(
+                "corrupt backup {}: manifest length {manifest_len} exceeds {remaining} remaining bytes",
+                path.display()
+            );
+        }
+        cursor.seek(std::io::SeekFrom::Current(i64::from(manifest_len)))?;
     }
     let mut entries = Vec::new();
     // A crash while appending can leave a truncated trailing entry; treat
@@ -309,6 +316,71 @@ mod tests {
         );
         assert!(game.join("Bundles2/LibGGPK3").exists());
         assert!(!game.join("Bundles2/TinyPoe2Smoother").exists());
+    }
+
+    #[test]
+    fn version_one_backup_still_parses() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("poe2.bak");
+        let rel_path = b"Bundles2/_.index.bin";
+        let data = b"original";
+        let mut backup = Vec::new();
+        backup.write_u32::<LittleEndian>(MAGIC).unwrap();
+        backup.write_u32::<LittleEndian>(1).unwrap();
+        backup
+            .write_u32::<LittleEndian>(rel_path.len() as u32)
+            .unwrap();
+        backup.extend_from_slice(rel_path);
+        backup.write_u64::<LittleEndian>(data.len() as u64).unwrap();
+        backup.extend_from_slice(data);
+        fs::write(&path, backup).unwrap();
+
+        let entries = read_entries(&path).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].rel_path, PathBuf::from("Bundles2/_.index.bin"));
+        assert_eq!(entries[0].bytes, data);
+    }
+
+    #[test]
+    fn rejects_manifest_length_beyond_remaining_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("poe2.bak");
+        let mut backup = Vec::new();
+        backup.write_u32::<LittleEndian>(MAGIC).unwrap();
+        backup.write_u32::<LittleEndian>(VERSION).unwrap();
+        backup.write_u32::<LittleEndian>(u32::MAX).unwrap();
+        fs::write(&path, backup).unwrap();
+
+        let error = read_entries(&path).unwrap_err().to_string();
+
+        assert!(error.contains("corrupt backup"));
+        assert!(error.contains(&path.display().to_string()));
+    }
+
+    #[test]
+    fn ensure_original_bytes_propagates_corrupt_manifest_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BackupStore {
+            path: temp.path().join("poe2.bak"),
+        };
+        let mut backup = Vec::new();
+        backup.write_u32::<LittleEndian>(MAGIC).unwrap();
+        backup.write_u32::<LittleEndian>(VERSION).unwrap();
+        backup.write_u32::<LittleEndian>(u32::MAX).unwrap();
+        fs::write(&store.path, &backup).unwrap();
+
+        let error = store
+            .ensure_original_bytes(
+                temp.path(),
+                &[(PathBuf::from("Bundles2/_.index.bin"), b"original".to_vec())],
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("corrupt backup"));
+        assert!(error.contains(&store.path.display().to_string()));
+        assert_eq!(fs::read(&store.path).unwrap(), backup);
     }
 
     #[test]
