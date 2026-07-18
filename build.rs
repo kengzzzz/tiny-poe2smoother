@@ -48,7 +48,9 @@ fn build_ooz() {
     // streams hit it). -fno-slp-vectorize fixes plain -O2 builds, but under
     // (Thin)LTO the linker's backend reruns SLP, so that flag alone is NOT
     // sufficient for OOZ_LTO builds. Verify any clang-built binary against a
-    // g++ baseline (`ooz-bench digest`) before trusting it.
+    // g++ baseline using the same real game data before trusting it:
+    // `cargo run --release --bin ooz-bench -- digest --game-dir <game-dir>`.
+    // A synthetic round trip is insufficient to expose this Leviathan failure.
     match std::env::var("OOZ_LTO").as_deref() {
         Ok("thin") => {
             assert_clang_for_lto(&build);

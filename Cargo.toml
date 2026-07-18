@@ -1,6 +1,6 @@
 [package]
 name = "tiny-poe2smoother"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 default-run = "tiny-poe2smoother"
 
@@ -40,6 +40,12 @@ rfd = "0.17"
 
 [build-dependencies]
 cc = { version = "1", features = ["parallel"] }
+
+# Backports upstream commits ec2d932 (quick-xml API) and d07c4f9 (security).
+# The crates.io release still depends on vulnerable quick-xml 0.39.
+# Remove this patch after wayland-scanner publishes the quick-xml 0.41 update.
+[patch.crates-io]
+wayland-scanner = { path = "vendor/wayland-scanner" }
 
 [profile.release]
 opt-level = 3
@@ -83,4 +89,3 @@ opt-level = 3
 
 [profile.release.package.memchr]
 opt-level = 3
-

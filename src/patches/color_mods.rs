@@ -4,7 +4,7 @@
 //! A `.csd` file is UTF-16LE text made of `description` blocks: a header line
 //! listing stat ids, then per-language sections of quoted display-text
 //! variants. Wrapping a variant in `"<rgb(r,g,b)>{{text}}"` makes the game
-//! render it in that color. Approach and the default mod->color table are
+//! render it in that color.
 
 use super::text::{decode_utf16, encode_utf16_bom};
 use aho_corasick::AhoCorasick;

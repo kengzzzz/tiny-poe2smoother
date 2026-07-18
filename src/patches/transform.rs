@@ -1,5 +1,6 @@
 use super::catalog::PatchId;
 use super::color_mods::ColorMatcher;
+use super::effect_skills::{EffectLevel, EffectsFilter};
 use super::targeting::{
     ends_with_path_ci, is_startup_scene_protected, normalize_path, patch_applies_path,
     patch_targets_path, EFFECT_PROTECTED_PREFIXES, PARTICLE_PROTECTED_PREFIXES,
@@ -41,7 +42,7 @@ static EFFECT_KEEP_BLOCKS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
 // (`SoundEvents { ... }` -> `SoundEvents {}`), leaving every other byte intact.
 // Derived by diffing captured output: across 170 changed `.ao`/`.ot`
 // files these were the only blocks ever emptied, and emptying them reproduces
-// the captured bytes exactly. See docs/capture-findings.md.
+// the captured bytes exactly.
 static SOUND_EMPTY_BLOCKS: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| ["SoundEvents", "SoundParams"].into_iter().collect());
 
@@ -51,6 +52,8 @@ static SOUND_EMPTY_BLOCKS: LazyLock<HashSet<&'static str>> =
 pub(super) struct TransformCtx<'a> {
     pub zoom: f64,
     pub color: Option<&'a ColorMatcher>,
+    /// Per-skill effect levels; `None` = every skill folder at `Reduced`.
+    pub effects: Option<&'a EffectsFilter>,
 }
 
 impl Default for TransformCtx<'_> {
@@ -58,6 +61,7 @@ impl Default for TransformCtx<'_> {
         Self {
             zoom: 2.4,
             color: None,
+            effects: None,
         }
     }
 }
@@ -107,7 +111,7 @@ pub(super) fn transform(
         ),
         PatchId::Delirium => delirium(bytes),
         PatchId::Particles => particles(path, bytes),
-        PatchId::Effects => effects(path, bytes),
+        PatchId::Effects => effects(path, bytes, ctx.effects),
         PatchId::DisableSounds => strip_sounds(path, bytes),
         PatchId::SkillSounds => strip_sounds(path, bytes),
         PatchId::MonsterSounds => strip_sounds(path, bytes),
@@ -232,6 +236,20 @@ fn delirium(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(encode_utf16_bom(&out))
 }
 
+/// Captured blanking rule: `.epk` MUST become
+/// empty (a bare "0" makes the parser throw "Unexpected token 0"); `.pet`/`.trl`
+/// become BOM+"0" (a value the engine tolerates). Returns None for any other
+/// extension (notably `.ao`/`.aoc`, which are never blanked).
+fn blank_effect_data(path: &str) -> Option<Vec<u8>> {
+    if ends_with_path_ci(path, ".epk") {
+        return Some(encode_utf16_bom(""));
+    }
+    if ends_with_path_ci(path, ".pet") || ends_with_path_ci(path, ".trl") {
+        return Some(encode_utf16_bom("0"));
+    }
+    None
+}
+
 fn particles(path: &str, bytes: &[u8]) -> Result<Vec<u8>> {
     let normalized = normalize_path(path);
     if PARTICLE_PROTECTED_PREFIXES
@@ -243,7 +261,13 @@ fn particles(path: &str, bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(encode_utf16_bom("0"))
 }
 
-fn effects(path: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+fn effects(path: &str, bytes: &[u8], filter: Option<&EffectsFilter>) -> Result<Vec<u8>> {
+    // Full wins first: candidates collected by other patches (SkillSounds
+    // shares `.ao`/`.aoc` under spells) must pass through untouched too.
+    let level = filter.map_or(EffectLevel::Reduced, |filter| filter.level_for(path));
+    if level == EffectLevel::Full {
+        return Ok(bytes.to_vec());
+    }
     let normalized = normalize_path(path);
     if is_startup_scene_protected(path) {
         return Ok(bytes.to_vec());
@@ -252,6 +276,9 @@ fn effects(path: &str, bytes: &[u8]) -> Result<Vec<u8>> {
         .iter()
         .any(|prefix| normalized.starts_with(prefix))
     {
+        return Ok(bytes.to_vec());
+    }
+    if !(ends_with_path_ci(path, ".ao") || ends_with_path_ci(path, ".aoc")) {
         return Ok(bytes.to_vec());
     }
     let text = decode_utf16(bytes)?;
@@ -289,17 +316,10 @@ fn mtx_soft(path: &str, bytes: &[u8]) -> Result<Vec<u8>> {
     if is_startup_scene_protected(path) {
         return Ok(bytes.to_vec());
     }
-    // Ground-truth rule (see docs/capture-findings.md): empty microtransaction
-    // effect/particle data files. `.epk` MUST become empty
-    // (a bare "0" makes the parser throw "Unexpected token 0"); `.pet`/`.trl`
-    // become BOM+"0" (a value the engine tolerates). Animation files
-    // (`.ao`/`.aoc`) are left untouched; the capture shows they are never
-    // rewritten for the soft-mtx option.
-    if ends_with_path_ci(path, ".epk") {
-        return Ok(encode_utf16_bom(""));
-    }
-    if ends_with_path_ci(path, ".pet") || ends_with_path_ci(path, ".trl") {
-        return Ok(encode_utf16_bom("0"));
+    // Animation files (`.ao`/`.aoc`) are left untouched; the capture shows
+    // they are never rewritten for the soft-mtx option.
+    if let Some(blanked) = blank_effect_data(path) {
+        return Ok(blanked);
     }
     Ok(bytes.to_vec())
 }
@@ -463,9 +483,67 @@ mod tests {
         let effect = effects(
             "metadata/effects/spells/monsters_effects/atlasofworldsbosses/foo.aoc",
             &effect_input,
+            None,
         )
         .unwrap();
         assert_eq!(effect, effect_input);
+    }
+
+    #[test]
+    fn effect_skill_levels_control_strip_behavior() {
+        use super::super::effect_skills::EffectSkillOverride;
+
+        let filter = EffectsFilter::new(
+            &[EffectSkillOverride {
+                folder: "fireball".to_string(),
+                level: EffectLevel::Full,
+            }],
+            Default::default(),
+        )
+        .unwrap();
+        let filter = Some(&filter);
+
+        // Unlisted folders strip .ao/.aoc exactly like the default Reduced level.
+        let anim = encode_utf16_bom(
+            "client\r\n{\r\n\tParticleEffects\r\n\t{\r\n\t}\r\n\tSoundEvents\r\n\t{\r\n\t}\r\n}",
+        );
+        let herald_ao = "metadata/effects/spells/cold_herald_of_ice/ao/ice_explosion.ao";
+        let reduced_ao = effects(herald_ao, &anim, filter).unwrap();
+        assert_eq!(reduced_ao, effects(herald_ao, &anim, None).unwrap());
+        assert_ne!(reduced_ao, anim);
+
+        // Full passes everything through — including .ao candidates that
+        // reach the transform via another patch's collection (SkillSounds).
+        assert_eq!(
+            effects(
+                "metadata/effects/spells/fireball/fireball.ao",
+                &anim,
+                filter
+            )
+            .unwrap(),
+            anim
+        );
+
+        // Without a filter (or at Reduced) non-anim files are never touched.
+        let data = encode_utf16_bom("some effect data");
+        assert_eq!(
+            effects(
+                "metadata/effects/spells/fireball/fx/impact.pet",
+                &data,
+                None
+            )
+            .unwrap(),
+            data
+        );
+        assert_eq!(
+            effects(
+                "metadata/effects/spells/monsters_effects/league_ultimatum/mechanics/fx/arena_limit.pet",
+                &data,
+                filter
+            )
+            .unwrap(),
+            data
+        );
     }
 
     #[test]

@@ -1,12 +1,16 @@
-//! Dev-only benchmark for the vendored ooz codec paths.
+//! Dev-only benchmark and correctness checker for the vendored ooz codec paths.
 //!
 //! Usage:
 //!   cargo run --release --bin ooz-bench -- synth [--iters N] [--mib M]
 //!   cargo run --release --bin ooz-bench -- real --game-dir <dir> \
 //!       [--iters N] [--budget-mib B] [--stride S]
+//!   cargo run --release --bin ooz-bench -- digest --game-dir <dir> \
+//!       [--budget-mib B] [--stride S]
 //!
 //! Prints one machine-readable `key=value` line per metric. Digest lines let a
-//! runner assert byte-identical output across differently-built binaries.
+//! runner assert byte-identical output across differently-built binaries. Use
+//! the same real game data for both compiler variants: a synthetic round trip
+//! does not exercise the known Leviathan miscompile.
 
 use anyhow::{bail, ensure, Context, Result};
 use std::path::{Path, PathBuf};

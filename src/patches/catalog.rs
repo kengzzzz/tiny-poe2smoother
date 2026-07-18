@@ -1,4 +1,6 @@
 use super::color_mods::{default_color_mods, ColorModEntry};
+use super::effect_skills::EffectSkillOverride;
+use super::monster_effects::MonsterEffectOverride;
 use crate::bundle::BundleFile;
 use std::collections::HashMap;
 
@@ -54,11 +56,18 @@ pub struct PatchSet {
 }
 
 /// Per-request knobs for parameterized patches (camera zoom level, color-mod
-/// assignments). Everything else is fully determined by the patch id.
+/// assignments, per-skill effect levels). Everything else is fully determined
+/// by the patch id.
 #[derive(Debug, Clone)]
 pub struct PatchParams {
     pub zoom: f64,
     pub color_mods: Vec<ColorModEntry>,
+    /// Non-default per-skill overrides for `Effects`; empty = every skill
+    /// folder at `Reduced` (the patch's long-standing behavior).
+    pub effect_skills: Vec<EffectSkillOverride>,
+    /// Non-default per-monster overrides for `Effects`; empty = every
+    /// monster at `Reduced`.
+    pub monster_effects: Vec<MonsterEffectOverride>,
 }
 
 impl Default for PatchParams {
@@ -66,6 +75,8 @@ impl Default for PatchParams {
         Self {
             zoom: 2.4,
             color_mods: default_color_mods(),
+            effect_skills: Vec::new(),
+            monster_effects: Vec::new(),
         }
     }
 }

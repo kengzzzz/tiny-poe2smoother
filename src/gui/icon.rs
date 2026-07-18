@@ -50,13 +50,11 @@ mod tests {
         assert_eq!(icon.height, 64);
         assert_eq!(icon.rgba.len(), 64 * 64 * 4);
 
-        // Corners are outside the rounded rect: fully transparent.
         for (x, y) in [(0u32, 0u32), (63, 0), (0, 63), (63, 63)] {
             let alpha = icon.rgba[((y * 64 + x) * 4 + 3) as usize];
             assert_eq!(alpha, 0, "corner ({x},{y}) should be transparent");
         }
 
-        // Center is fully opaque.
         let center_alpha = icon.rgba[((32 * 64 + 32) * 4 + 3) as usize];
         assert_eq!(center_alpha, 255);
     }
