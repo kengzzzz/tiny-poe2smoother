@@ -3,7 +3,7 @@ use super::ggpk::{
     ggpk_file_record, ggpk_find_file, ggpk_find_pdir, ggpk_name_hash, ggpk_pdir_record,
     GgpkArchive, GgpkFileSpan, GgpkPatchPlan, GgpkPdirEntry,
 };
-use super::hashing::{fnv1a_bundle_hash, HashMode};
+use super::hashing::{hash_fnv1a, HashMode};
 use super::index::{BundleFile, BundleIndex, BundleInfo, DirectoryRecord};
 use crate::backup::GgpkBackupMeta;
 use crate::install::{detect_install_layout, InstallLayout};
@@ -26,6 +26,8 @@ pub struct BundleStore {
     pub layout: InstallLayout,
     pub(super) content_path: PathBuf,
     ggpk: Option<Arc<GgpkArchive>>,
+    cache_source: String,
+    cache_dir: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +38,106 @@ struct CacheKey {
 }
 
 const CACHE_MAGIC: &[u8; 4] = b"2SI3";
+const CACHE_MIGRATION_MARKER: &str = "index-cache-v2.migrated";
+
+fn default_cache_dir() -> PathBuf {
+    dirs::data_local_dir()
+        .or_else(dirs::data_dir)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("tiny-poe2smoother")
+}
+
+fn normalized_cache_game_dir(game_dir: &std::path::Path) -> PathBuf {
+    // Keep this cache-only: Windows canonical paths may use a `\\?\` prefix,
+    // which should not leak into the user-visible/persisted game directory.
+    fs::canonicalize(game_dir)
+        .or_else(|_| std::path::absolute(game_dir))
+        .unwrap_or_else(|_| game_dir.to_path_buf())
+}
+
+fn cache_source(game_dir: &std::path::Path, layout: InstallLayout) -> String {
+    let game_dir = normalized_cache_game_dir(game_dir);
+    match layout {
+        InstallLayout::LooseBundles => game_dir
+            .join("Bundles2")
+            .join("_.index.bin")
+            .to_string_lossy()
+            .into_owned(),
+        InstallLayout::ContentGgpk => format!(
+            "{}::Bundles2/_.index.bin",
+            game_dir.join("Content.ggpk").display()
+        ),
+    }
+}
+
+fn is_legacy_cache_name(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    if name == "index-cache.bin" {
+        return true;
+    }
+    let Some(tag) = name
+        .strip_prefix("index-cache-")
+        .and_then(|name| name.strip_suffix(".bin"))
+    else {
+        return false;
+    };
+    tag.len() == 16
+        && tag
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn retire_legacy_caches(cache_dir: &std::path::Path) {
+    retire_legacy_caches_with(cache_dir, |path| fs::remove_file(path));
+}
+
+fn retire_legacy_caches_with(
+    cache_dir: &std::path::Path,
+    remove: impl Fn(&std::path::Path) -> std::io::Result<()>,
+) {
+    // The marker makes this a one-time, app-wide sweep. Exact legacy matching
+    // deliberately excludes v2, temporary, and unrelated files.
+    let marker = cache_dir.join(CACHE_MIGRATION_MARKER);
+    if marker.exists() || fs::create_dir_all(cache_dir).is_err() {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(cache_dir) else {
+        return;
+    };
+    let mut complete = true;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                complete = false;
+                continue;
+            }
+        };
+        if !is_legacy_cache_name(&entry.file_name()) {
+            continue;
+        }
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => {
+                complete = false;
+                continue;
+            }
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        match remove(&entry.path()) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => complete = false,
+        }
+    }
+    if complete {
+        let _ = fs::write(marker, b"");
+    }
+}
 
 /// Validate a length/count read from the cache against the bytes actually
 /// remaining, so a truncated or corrupt file is rejected instead of aborting
@@ -176,11 +278,15 @@ fn write_cache_file(
 
 impl BundleStore {
     pub fn new(game_dir: impl Into<PathBuf>) -> Self {
-        let game_dir = game_dir.into();
+        Self::new_with_cache_dir(game_dir.into(), default_cache_dir())
+    }
+
+    fn new_with_cache_dir(game_dir: PathBuf, cache_dir: PathBuf) -> Self {
         let bundles_dir = game_dir.join("Bundles2");
         let index_path = bundles_dir.join("_.index.bin");
         let content_path = game_dir.join("Content.ggpk");
         let layout = detect_install_layout(&game_dir).unwrap_or(InstallLayout::LooseBundles);
+        let cache_source = cache_source(&game_dir, layout);
         let ggpk = if matches!(layout, InstallLayout::ContentGgpk) {
             GgpkArchive::from_file(&content_path).ok().map(Arc::new)
         } else {
@@ -193,55 +299,51 @@ impl BundleStore {
             layout,
             content_path,
             ggpk,
+            cache_source,
+            cache_dir,
         }
     }
 
     fn cache_key(&self) -> Result<Option<CacheKey>> {
-        let (source_path, source_label) = if matches!(self.layout, InstallLayout::ContentGgpk) {
-            (
-                self.content_path.clone(),
-                format!("{}::Bundles2/_.index.bin", self.content_path.display()),
-            )
+        let source_path = if matches!(self.layout, InstallLayout::ContentGgpk) {
+            &self.content_path
         } else if self.index_path.exists() {
-            (
-                self.index_path.clone(),
-                self.index_path.to_string_lossy().into_owned(),
-            )
+            &self.index_path
         } else {
             return Ok(None);
         };
-        let meta = fs::metadata(&source_path)?;
+        let meta = fs::metadata(source_path)?;
         let size = meta.len();
         Ok(meta
             .modified()
             .ok()
             .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
             .map(|d| CacheKey {
-                source: source_label,
+                source: self.cache_source.clone(),
                 size,
                 mtime: d.as_nanos(),
             }))
     }
 
     fn cache_path(&self) -> PathBuf {
-        let base = dirs::data_local_dir()
-            .or_else(dirs::data_dir)
-            .unwrap_or_else(|| PathBuf::from("/tmp"));
         // Scoped per install: a shared file would let a second install (or a
         // test suite's temp store) clobber or clear the real install's cache.
-        let tag = fnv1a_bundle_hash(&self.index_path.to_string_lossy());
-        base.join("tiny-poe2smoother")
-            .join(format!("index-cache-{tag:016x}.bin"))
+        // Unlike bundle-path hashing, cache identity must preserve path case.
+        let tag = hash_fnv1a(self.cache_source.as_bytes());
+        self.cache_dir
+            .join(format!("index-cache-v2-{tag:016x}.bin"))
     }
 
     fn read_cache(&self) -> Option<BundleIndex> {
         crate::timing!("cache_read");
+        retire_legacy_caches(&self.cache_dir);
         let key = self.cache_key().ok()??;
         let data = fs::read(self.cache_path()).ok()?;
         parse_index_cache(&data, &key)
     }
 
     fn write_cache(&self, index: &BundleIndex) {
+        retire_legacy_caches(&self.cache_dir);
         let key = match self.cache_key() {
             Ok(Some(k)) => k,
             _ => return,
@@ -308,12 +410,10 @@ impl BundleStore {
         // cache file (a failed parse silently forces a full index rebuild).
         let tmp = path.with_extension(format!("tmp{}", std::process::id()));
         write_cache_file(&path, &tmp, &data, |tmp, data| fs::write(tmp, data));
-        // Pre-scoping releases used one shared file; drop it so upgrades
-        // don't leave a large orphan behind.
-        let _ = fs::remove_file(path.with_file_name("index-cache.bin"));
     }
 
     pub fn clear_cache(&self) {
+        retire_legacy_caches(&self.cache_dir);
         let p = self.cache_path();
         if p.exists() {
             let _ = fs::remove_file(&p);
@@ -665,6 +765,19 @@ mod tests {
 
     use std::path::Path;
 
+    fn write_test_install(game: &Path, layout: InstallLayout) {
+        fs::create_dir_all(game).unwrap();
+        match layout {
+            InstallLayout::LooseBundles => {
+                fs::create_dir_all(game.join("Bundles2")).unwrap();
+                fs::write(game.join("Bundles2/_.index.bin"), b"index").unwrap();
+            }
+            InstallLayout::ContentGgpk => {
+                fs::write(game.join("Content.ggpk"), b"ggpk").unwrap();
+            }
+        }
+    }
+
     #[test]
     fn corrupt_index_cache_is_rejected_without_huge_allocations() {
         let key = CacheKey {
@@ -699,6 +812,247 @@ mod tests {
             .write_u64::<LittleEndian>(u64::MAX / 4)
             .unwrap(); // file count
         assert!(parse_index_cache(&absurd_count, &key).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn aliases_share_cache_identity_for_both_install_layouts() {
+        for layout in [InstallLayout::LooseBundles, InstallLayout::ContentGgpk] {
+            let temp = tempfile::tempdir().unwrap();
+            let game = temp.path().join("game");
+            write_test_install(&game, layout);
+            let alias = temp.path().join("game-alias");
+            std::os::unix::fs::symlink(&game, &alias).unwrap();
+            let cache_dir = temp.path().join("cache");
+
+            let direct = BundleStore::new_with_cache_dir(game.clone(), cache_dir.clone());
+            let aliased = BundleStore::new_with_cache_dir(alias.clone(), cache_dir);
+
+            assert_eq!(direct.layout, layout);
+            assert_eq!(aliased.layout, layout);
+            assert_eq!(direct.game_dir, game);
+            assert_eq!(aliased.game_dir, alias);
+            if matches!(layout, InstallLayout::ContentGgpk) {
+                assert!(!direct.index_path.exists());
+            }
+            assert_eq!(direct.cache_path(), aliased.cache_path());
+            assert_eq!(
+                direct.cache_key().unwrap().unwrap().source,
+                aliased.cache_key().unwrap().unwrap().source
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn case_distinct_installs_have_distinct_cache_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let upper = temp.path().join("Game");
+        let lower = temp.path().join("game");
+        for game in [&upper, &lower] {
+            write_test_install(game, InstallLayout::LooseBundles);
+        }
+        assert_ne!(
+            fs::canonicalize(&upper).unwrap(),
+            fs::canonicalize(&lower).unwrap()
+        );
+        let cache_dir = temp.path().join("cache");
+
+        assert_ne!(
+            BundleStore::new_with_cache_dir(upper, cache_dir.clone()).cache_path(),
+            BundleStore::new_with_cache_dir(lower, cache_dir).cache_path()
+        );
+    }
+
+    #[test]
+    fn distinct_installs_have_distinct_cache_identities() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_game = temp.path().join("install-a");
+        let second_game = temp.path().join("install-b");
+        write_test_install(&first_game, InstallLayout::LooseBundles);
+        write_test_install(&second_game, InstallLayout::LooseBundles);
+        let cache_dir = temp.path().join("cache");
+
+        let first = BundleStore::new_with_cache_dir(first_game, cache_dir.clone());
+        let second = BundleStore::new_with_cache_dir(second_game, cache_dir);
+
+        assert_ne!(first.cache_source, second.cache_source);
+        assert_ne!(first.cache_path(), second.cache_path());
+    }
+
+    #[test]
+    fn missing_game_dir_uses_deterministic_cache_identity_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing-game");
+        let cache_dir = temp.path().join("cache");
+        assert!(!missing.exists());
+
+        let first = BundleStore::new_with_cache_dir(missing.clone(), cache_dir.clone());
+        let second = BundleStore::new_with_cache_dir(missing.clone(), cache_dir);
+        let expected_source = std::path::absolute(&missing)
+            .unwrap()
+            .join("Bundles2")
+            .join("_.index.bin")
+            .to_string_lossy()
+            .into_owned();
+
+        assert_eq!(first.game_dir, missing);
+        assert_eq!(first.cache_source, expected_source);
+        assert_eq!(first.cache_source, second.cache_source);
+        assert_eq!(first.cache_path(), second.cache_path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_write_read_and_clear_agree_across_aliases() {
+        for layout in [InstallLayout::LooseBundles, InstallLayout::ContentGgpk] {
+            let temp = tempfile::tempdir().unwrap();
+            let game = temp.path().join("game");
+            write_test_install(&game, layout);
+            let alias = temp.path().join("game-alias");
+            std::os::unix::fs::symlink(&game, &alias).unwrap();
+            let cache_dir = temp.path().join("cache");
+            fs::create_dir_all(&cache_dir).unwrap();
+            fs::write(cache_dir.join("index-cache.bin"), b"legacy").unwrap();
+            let direct = BundleStore::new_with_cache_dir(game, cache_dir.clone());
+            let aliased = BundleStore::new_with_cache_dir(alias, cache_dir.clone());
+            let index = BundleIndex::for_test_paths(&[("Metadata/Test.dat", "test", 3)]);
+
+            direct.write_cache(&index);
+            assert!(!cache_dir.join("index-cache.bin").exists());
+            assert!(cache_dir.join(CACHE_MIGRATION_MARKER).exists());
+            assert!(direct.cache_path().exists());
+
+            let cached = aliased
+                .read_cache()
+                .expect("alias should read direct cache");
+            assert_eq!(cached.paths.unwrap(), vec!["Metadata/Test.dat".to_string()]);
+
+            aliased.clear_cache();
+            assert!(!direct.cache_path().exists());
+            assert!(direct.read_cache().is_none());
+        }
+    }
+
+    #[test]
+    fn legacy_cache_migration_is_exact_and_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path().join("cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        let legacy = ["index-cache.bin", "index-cache-0123456789abcdef.bin"];
+        let preserved = [
+            "index-cache-v2-0123456789abcdef.bin",
+            "index-cache-0123456789abcdef.tmp42",
+            "index-cache-0123456789ABCDEf.bin",
+            "index-cache-0123.bin",
+            "unrelated.bin",
+        ];
+        for name in legacy.into_iter().chain(preserved) {
+            fs::write(cache_dir.join(name), b"keep-or-remove").unwrap();
+        }
+        let cache_like_dir = cache_dir.join("index-cache-fedcba9876543210.bin");
+        fs::create_dir(&cache_like_dir).unwrap();
+
+        retire_legacy_caches(&cache_dir);
+
+        for name in legacy {
+            assert!(!cache_dir.join(name).exists());
+        }
+        for name in preserved {
+            assert_eq!(fs::read(cache_dir.join(name)).unwrap(), b"keep-or-remove");
+        }
+        assert!(cache_dir.join(CACHE_MIGRATION_MARKER).exists());
+        assert!(cache_like_dir.is_dir());
+
+        let post_migration_legacy = cache_dir.join("index-cache-ffffffffffffffff.bin");
+        fs::write(&post_migration_legacy, b"created by an older version").unwrap();
+        retire_legacy_caches(&cache_dir);
+        for name in preserved {
+            assert_eq!(fs::read(cache_dir.join(name)).unwrap(), b"keep-or-remove");
+        }
+        assert_eq!(
+            fs::read(post_migration_legacy).unwrap(),
+            b"created by an older version"
+        );
+    }
+
+    #[test]
+    fn failed_legacy_cache_removal_retries_without_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path().join("cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        let legacy = cache_dir.join("index-cache-0123456789abcdef.bin");
+        fs::write(&legacy, b"legacy").unwrap();
+
+        retire_legacy_caches_with(&cache_dir, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected removal failure",
+            ))
+        });
+
+        assert!(legacy.exists());
+        assert!(!cache_dir.join(CACHE_MIGRATION_MARKER).exists());
+
+        retire_legacy_caches(&cache_dir);
+        assert!(!legacy.exists());
+        assert!(cache_dir.join(CACHE_MIGRATION_MARKER).exists());
+    }
+
+    #[test]
+    fn concurrent_legacy_cache_migration_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path().join("cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        let legacy = cache_dir.join("index-cache-0123456789abcdef.bin");
+        let current = cache_dir.join("index-cache-v2-0123456789abcdef.bin");
+        fs::write(&legacy, b"legacy").unwrap();
+        fs::write(&current, b"current").unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let cache_dir = cache_dir.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    retire_legacy_caches(&cache_dir);
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert!(!legacy.exists());
+        assert_eq!(fs::read(current).unwrap(), b"current");
+        assert!(cache_dir.join(CACHE_MIGRATION_MARKER).exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_variants_share_cache_identity_without_changing_public_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("Game");
+        write_test_install(&game, InstallLayout::LooseBundles);
+        let canonical = fs::canonicalize(&game).unwrap();
+        let alternate = PathBuf::from(
+            game.to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_uppercase(),
+        );
+        let cache_dir = temp.path().join("cache");
+
+        let direct = BundleStore::new_with_cache_dir(game.clone(), cache_dir.clone());
+        let verbatim = BundleStore::new_with_cache_dir(canonical.clone(), cache_dir.clone());
+        let alternate_store = BundleStore::new_with_cache_dir(alternate.clone(), cache_dir.clone());
+
+        assert_eq!(direct.game_dir, game);
+        assert_eq!(verbatim.game_dir, canonical);
+        assert_eq!(alternate_store.game_dir, alternate);
+        assert_eq!(direct.cache_source, verbatim.cache_source);
+        assert_eq!(direct.cache_source, alternate_store.cache_source);
+        assert_eq!(direct.cache_path(), verbatim.cache_path());
+        assert_eq!(direct.cache_path(), alternate_store.cache_path());
     }
 
     #[test]
