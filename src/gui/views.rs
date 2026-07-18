@@ -691,6 +691,12 @@ fn color_row_ui(ui: &mut egui::Ui, entry: &mut ColorModEntry, text: Option<&str>
     changed
 }
 
+const EFFECTS_SKILLS_DESCRIPTION: &str =
+    "Toggled on strips heavy client effects (default) · off keeps original visuals.";
+const EFFECTS_MONSTERS_DESCRIPTION: &str =
+    "Toggled on strips heavy client effects (default) · off keeps original visuals. \
+     Shared effects stay original for all monsters using them · unlisted monsters stay reduced.";
+
 /// The effects editor: one modal, a tab per exception list (skills and
 /// monsters). Each tab is a search box over its catalog with one on/off
 /// smoothing toggle per row, same layout as the color-mods editor. Tab
@@ -729,9 +735,7 @@ fn draw_effects_editor(app: &mut GuiApp, ctx: &egui::Context) {
 }
 
 fn draw_effects_skills_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
-    ui.label(theme::caption_text(
-        "Toggled on strips heavy client effects (default) · off keeps original visuals.",
-    ));
+    draw_effects_tab_description(ui, EFFECTS_SKILLS_DESCRIPTION);
     ui.add_space(8.0);
     ui.add(
         egui::TextEdit::singleline(&mut app.effects_search)
@@ -764,9 +768,13 @@ fn draw_effects_skills_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
 
     app.refresh_effects_filter();
     let row_count = app.effects_filter_rows.len();
-    ui.horizontal(|ui| {
-        ui.label(theme::caption_text(&format!("{row_count} shown")));
-    });
+    draw_effects_list_header(
+        ui,
+        |ui| {
+            ui.label(theme::caption_text(&format!("{row_count} shown")));
+        },
+        |_| {},
+    );
     ui.add_space(4.0);
     // Distinct salt per tab: both lists sit at the same spot in the modal,
     // so without it they would share one persisted scroll offset.
@@ -857,10 +865,7 @@ fn draw_effect_skill_row(app: &mut GuiApp, ui: &mut egui::Ui, idx: usize) {
 /// files, one row per monster name with an on/off smoothing toggle. Same
 /// layout as the skills tab.
 fn draw_effects_monsters_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
-    ui.label(theme::caption_text(
-        "Toggled on strips heavy client effects (default) · off keeps original visuals. \
-         Shared effects stay original for all monsters using them · unlisted monsters stay reduced.",
-    ));
+    draw_effects_tab_description(ui, EFFECTS_MONSTERS_DESCRIPTION);
     ui.add_space(8.0);
     ui.add(
         egui::TextEdit::singleline(&mut app.monsters_search)
@@ -870,36 +875,6 @@ fn draw_effects_monsters_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
             .margin(egui::Margin::symmetric(10, 8)),
     );
     ui.add_space(6.0);
-    let unnamed_rows = app.unnamed_monster_row_count();
-    if unnamed_rows > 0 {
-        // Distinct ID space: the Skills tab renders widgets at the same
-        // position and egui would otherwise share state across tabs.
-        ui.push_id("effects_monsters_show_unnamed", |ui| {
-            ui.checkbox(
-                &mut app.show_unnamed_monsters,
-                egui::RichText::new(format!("Show unnamed entities ({unnamed_rows})")).size(11.5),
-            )
-            .on_hover_text(
-                "Internal rows with no in-game name. While hidden, rows keeping \
-                 original visuals are flagged below — never dropped silently.",
-            );
-        });
-        if !app.show_unnamed_monsters {
-            let overridden = app.overridden_unnamed_monster_row_count();
-            if overridden > 0 {
-                ui.horizontal(|ui| {
-                    ui.label(theme::caption_text(&format!(
-                        "{} keeping original visuals hidden",
-                        count_label(overridden, "unnamed row")
-                    )));
-                    if small_action(ui, "Show") {
-                        app.show_unnamed_monsters = true;
-                    }
-                });
-            }
-        }
-        ui.add_space(6.0);
-    }
     if app.monster_catalog_task.is_some() {
         ui.horizontal(|ui| {
             ui.add(egui::Spinner::new().color(palette::ACCENT));
@@ -923,11 +898,51 @@ fn draw_effects_monsters_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
         ui.add_space(4.0);
     }
 
-    app.refresh_monsters_filter();
-    let row_count = app.monsters_filter_rows.len();
-    ui.horizontal(|ui| {
-        ui.label(theme::caption_text(&format!("{row_count} shown")));
-    });
+    let unnamed_rows = app.unnamed_monster_row_count();
+    let overridden = app.overridden_unnamed_monster_row_count();
+    let show_unnamed = std::cell::Cell::new(app.show_unnamed_monsters);
+    let (row_count, ()) = draw_effects_list_header(
+        ui,
+        |ui| {
+            // The right side is rendered first, so filter and count both see
+            // a checkbox change during this frame.
+            app.show_unnamed_monsters = show_unnamed.get();
+            app.refresh_monsters_filter();
+            let row_count = app.monsters_filter_rows.len();
+            ui.label(theme::caption_text(&format!("{row_count} shown")));
+            row_count
+        },
+        |ui| {
+            if unnamed_rows > 0 {
+                // Distinct ID space: the Skills tab renders widgets at the
+                // same position and egui would otherwise share state.
+                let mut show = show_unnamed.get();
+                ui.push_id("effects_monsters_show_unnamed", |ui| {
+                    ui.checkbox(
+                        &mut show,
+                        egui::RichText::new(format!("Show unnamed entities ({unnamed_rows})"))
+                            .size(11.5),
+                    )
+                    .on_hover_text(
+                        "Internal rows with no in-game name. While hidden, rows keeping \
+                         original visuals are flagged here — never dropped silently.",
+                    );
+                });
+                if !show {
+                    if overridden > 0 {
+                        if small_action(ui, "Show") {
+                            show = true;
+                        }
+                        ui.label(theme::caption_text(&format!(
+                            "{} keeping original visuals hidden",
+                            count_label(overridden, "unnamed row")
+                        )));
+                    }
+                }
+                show_unnamed.set(show);
+            }
+        },
+    );
     ui.add_space(4.0);
     egui::ScrollArea::vertical()
         .id_salt("effects_monsters_list")
@@ -954,6 +969,38 @@ fn draw_effects_monsters_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
             }
         });
     });
+}
+
+fn draw_effects_tab_description(ui: &mut egui::Ui, text: &str) {
+    // The monster copy wraps to two lines; reserve that height for both tabs
+    // so the search field stays anchored while switching between them.
+    let height = 2.0 * ui.text_style_height(&egui::TextStyle::Small);
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), height),
+        egui::Sense::hover(),
+    );
+    ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    )
+    .add(egui::Label::new(theme::caption_text(text)).wrap());
+}
+
+fn draw_effects_list_header<L, R>(
+    ui: &mut egui::Ui,
+    add_left: impl FnOnce(&mut egui::Ui) -> L,
+    add_right: impl FnOnce(&mut egui::Ui) -> R,
+) -> (L, R) {
+    // Monster-only controls share this row with the result count. Keeping the
+    // row fixed-height also anchors the list and footer across both tabs.
+    const HEIGHT: f32 = 32.0;
+    // Render right first so a monster-control change can update the left-side
+    // count in the same frame, while both sides keep independent anchors.
+    egui::Sides::new()
+        .height(HEIGHT)
+        .shrink_left()
+        .show(ui, add_left, add_right)
 }
 
 /// One monster row: smoothing toggle plus the monster name. A row controls
@@ -1143,6 +1190,61 @@ mod tests {
         assert_eq!(ctx.data(|d| d.count::<TextEditState>()), 2);
     }
 
+    #[test]
+    fn effects_tab_descriptions_reserve_the_same_height() {
+        fn description_bottom(text: &str) -> f32 {
+            let ctx = egui::Context::default();
+            theme::install_fonts(&ctx);
+            let mut bottom = 0.0;
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.set_width(640.0);
+                draw_effects_tab_description(ui, text);
+                bottom = ui.cursor().top();
+            });
+            bottom
+        }
+
+        assert_eq!(
+            description_bottom(EFFECTS_SKILLS_DESCRIPTION),
+            description_bottom(EFFECTS_MONSTERS_DESCRIPTION)
+        );
+    }
+
+    #[test]
+    fn effects_list_header_keeps_count_at_the_left_anchor() {
+        fn count_left(with_monster_control: bool) -> f32 {
+            let ctx = egui::Context::default();
+            theme::install_fonts(&ctx);
+            theme::install_style(&ctx);
+            let mut left = 0.0;
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.set_width(640.0);
+                let mut show_unnamed = false;
+                let response = if with_monster_control {
+                    let (count, ()) = draw_effects_list_header(
+                        ui,
+                        |ui| ui.label(theme::caption_text("539 shown")),
+                        |ui| {
+                            ui.checkbox(&mut show_unnamed, "Show unnamed entities (427)");
+                        },
+                    );
+                    count
+                } else {
+                    let (count, ()) = draw_effects_list_header(
+                        ui,
+                        |ui| ui.label(theme::caption_text("287 shown")),
+                        |_| {},
+                    );
+                    count
+                };
+                left = response.rect.left();
+            });
+            left
+        }
+
+        assert_eq!(count_left(false), count_left(true));
+    }
+
     fn monster_row(display: &str, keys: &[&str], named: bool) -> crate::MonsterCatalogRow {
         let monster_keys: Vec<String> = keys.iter().map(|key| key.to_string()).collect();
         crate::MonsterCatalogRow {
@@ -1153,6 +1255,36 @@ mod tests {
             context: None,
             named,
         }
+    }
+
+    #[test]
+    fn effects_tabs_keep_the_same_vertical_extent_with_monster_controls() {
+        fn tab_height(app: &mut GuiApp, draw_tab: fn(&mut GuiApp, &mut egui::Ui)) -> f32 {
+            let ctx = egui::Context::default();
+            theme::install_fonts(&ctx);
+            theme::install_style(&ctx);
+            let mut height = 0.0;
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.set_width(640.0);
+                let top = ui.cursor().top();
+                draw_tab(app, ui);
+                height = ui.cursor().top() - top;
+            });
+            height
+        }
+
+        let mut skills = GuiApp::default();
+        let mut monsters = GuiApp::default();
+        monsters.monster_catalog = Some(vec![monster_row(
+            "internal helper",
+            &["metadata/monsters/internal/helper"],
+            false,
+        )]);
+
+        assert_eq!(
+            tab_height(&mut skills, draw_effects_skills_tab),
+            tab_height(&mut monsters, draw_effects_monsters_tab)
+        );
     }
 
     /// The rendered monsters tab default-hides fallback rows; ticking
