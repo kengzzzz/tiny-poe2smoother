@@ -129,7 +129,12 @@ fn collect_patch_targets(
     for &patch in &patches {
         let patch_targets = targets.remove(&patch).unwrap_or_default();
         if patch_targets.is_empty() {
-            if patch == PatchId::Effects && effects.is_some_and(|f| f.has_full()) {
+            let full_filter_removed_all_effects = patch == PatchId::Effects
+                && effects.is_some_and(|f| f.has_full())
+                && index.paths().iter().any(|path| {
+                    effects_targets_path(path, None) && index.file_by_path(path).is_some()
+                });
+            if full_filter_removed_all_effects {
                 bail!(
                     "patch 'effects' matches no files;\n\
                      some skills or monsters keep original visuals in Edit skills… / Edit monsters… — change some levels or deselect effects"
@@ -583,6 +588,29 @@ mod tests {
         assert!(msg.contains("keep original visuals"));
         assert!(msg.contains("Edit skills"));
         assert!(msg.contains("Edit monsters"));
+    }
+
+    #[test]
+    fn full_effect_selection_without_base_targets_reports_game_version_error() {
+        use super::super::effect_skills::{EffectLevel, EffectSkillOverride};
+
+        let mut index =
+            BundleIndex::for_test_paths(&[("metadata/unrelated/file.ao", "unrelated", 12)]);
+        let filter = EffectsFilter::new(
+            &[EffectSkillOverride {
+                folder: "fireball".to_string(),
+                level: EffectLevel::Full,
+            }],
+            BTreeSet::new(),
+        )
+        .unwrap();
+
+        let err =
+            collect_patch_targets(&mut index, &[PatchId::Effects], Some(&filter)).unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("no matching files in this game version"));
+        assert!(!msg.contains("keep original visuals"));
     }
 
     #[test]
