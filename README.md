@@ -49,6 +49,16 @@ Download the latest Windows executable or Linux archive from the [releases page]
 
 If the executable permission was not preserved, run `chmod +x poe2smoother` first.
 
+### Arch Linux
+
+Install the prebuilt [`tiny-poe2smoother-bin`](https://aur.archlinux.org/packages/tiny-poe2smoother-bin) package from the AUR:
+
+```sh
+paru -S tiny-poe2smoother-bin
+```
+
+Then run `poe2smoother`.
+
 ## Usage
 
 1. Close Path of Exile 2.
