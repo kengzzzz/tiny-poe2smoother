@@ -1,0 +1,112 @@
+name: Bug report
+description: Report a problem with tiny-poe2smoother
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Before filing, please close Path of Exile 2 and try restoring your backup. If the game still has problems after restoring, verify its files through Steam or the standalone launcher.
+
+  - type: input
+    id: app-version
+    attributes:
+      label: tiny-poe2smoother version
+      description: Use the release tag (for example, v0.6.0) or commit hash.
+      placeholder: v0.6.0
+    validations:
+      required: true
+
+  - type: input
+    id: game-version
+    attributes:
+      label: Path of Exile 2 version
+      description: Include the game version or patch number if known.
+      placeholder: Game version or patch number
+
+  - type: dropdown
+    id: operating-system
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - Linux
+    validations:
+      required: true
+
+  - type: dropdown
+    id: app-install
+    attributes:
+      label: How did you install tiny-poe2smoother?
+      options:
+        - GitHub release
+        - AUR package
+        - Built from source
+    validations:
+      required: true
+
+  - type: dropdown
+    id: game-install
+    attributes:
+      label: Path of Exile 2 installation
+      options:
+        - Steam
+        - Standalone client
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the problem and what you expected to happen instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Include the preset or individual patches selected and whether you clicked Apply or Restore.
+      placeholder: |
+        1. Select ...
+        2. Click ...
+        3. See ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: backup-state
+    attributes:
+      label: Backup state
+      description: What does the app report about the backup, if anything?
+      options:
+        - Backup created successfully
+        - No backup exists
+        - Backup is stale
+        - Backup is missing while the game is patched
+        - Not sure or not applicable
+    validations:
+      required: true
+
+  - type: textarea
+    id: errors
+    attributes:
+      label: Error messages or logs
+      description: Paste the complete error text. Remove usernames or other sensitive information from file paths.
+      render: text
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Add screenshots or any other details that may help diagnose the problem.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Final checks
+      options:
+        - label: I closed Path of Exile 2 before using Apply or Restore.
+          required: true
+        - label: I searched existing issues for the same problem.
+          required: true
