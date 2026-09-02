@@ -2919,7 +2919,7 @@ dependencies = [
 
 [[package]]
 name = "tiny-poe2smoother"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "aho-corasick",
  "anyhow",
