@@ -1178,13 +1178,15 @@ mod tests {
         let ctx = egui::Context::default();
         theme::install_fonts(&ctx);
         let mut app = GuiApp::default();
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             draw_effects_skills_tab(&mut app, ui);
-        });
+        })
+        .drop_without_applying_deltas();
         assert_eq!(ctx.data(|d| d.count::<TextEditState>()), 1);
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             draw_effects_monsters_tab(&mut app, ui);
-        });
+        })
+        .drop_without_applying_deltas();
         // A second state entry proves the two fields have distinct widget
         // IDs; a shared ID would overwrite the first entry in place.
         assert_eq!(ctx.data(|d| d.count::<TextEditState>()), 2);
@@ -1196,11 +1198,12 @@ mod tests {
             let ctx = egui::Context::default();
             theme::install_fonts(&ctx);
             let mut bottom = 0.0;
-            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ctx.run_ui(egui::RawInput::default(), |ui| {
                 ui.set_width(640.0);
                 draw_effects_tab_description(ui, text);
                 bottom = ui.cursor().top();
-            });
+            })
+            .drop_without_applying_deltas();
             bottom
         }
 
@@ -1217,7 +1220,7 @@ mod tests {
             theme::install_fonts(&ctx);
             theme::install_style(&ctx);
             let mut left = 0.0;
-            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ctx.run_ui(egui::RawInput::default(), |ui| {
                 ui.set_width(640.0);
                 let mut show_unnamed = false;
                 let response = if with_monster_control {
@@ -1238,7 +1241,8 @@ mod tests {
                     count
                 };
                 left = response.rect.left();
-            });
+            })
+            .drop_without_applying_deltas();
             left
         }
 
@@ -1264,12 +1268,13 @@ mod tests {
             theme::install_fonts(&ctx);
             theme::install_style(&ctx);
             let mut height = 0.0;
-            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ctx.run_ui(egui::RawInput::default(), |ui| {
                 ui.set_width(640.0);
                 let top = ui.cursor().top();
                 draw_tab(app, ui);
                 height = ui.cursor().top() - top;
-            });
+            })
+            .drop_without_applying_deltas();
             height
         }
 
@@ -1306,16 +1311,18 @@ mod tests {
         app.monster_overrides
             .insert(wolf.to_string(), EffectLevel::Full);
 
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             draw_effects_monsters_tab(&mut app, ui);
-        });
+        })
+        .drop_without_applying_deltas();
         assert_eq!(app.monsters_filter_rows, vec![0]);
         assert_eq!(app.overridden_unnamed_monster_row_count(), 1);
 
         app.show_unnamed_monsters = true;
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             draw_effects_monsters_tab(&mut app, ui);
-        });
+        })
+        .drop_without_applying_deltas();
         assert_eq!(app.monsters_filter_rows, vec![0, 1]);
     }
 }
