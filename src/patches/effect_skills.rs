@@ -10,7 +10,7 @@ use std::fmt;
 const SPELLS_PREFIX: &str = "metadata/effects/spells/";
 const MIN_LABEL_ALIAS_LEN: usize = 4;
 
-/// How the `Effects` patch treats one top-level skill folder under
+/// How the `Effects` patch treats one skill effect directory under
 /// `metadata/effects/spells/`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -55,9 +55,11 @@ impl<'de> Visitor<'de> for EffectLevelVisitor {
 
 const OLD_EFFECT_LEVEL: &str = concat!("hid", "den");
 
-/// One persisted non-default per-skill setting. `folder` is the lowercase
-/// top-level segment after `metadata/effects/spells/`, e.g.
-/// "cold_herald_of_ice". Folders without an override are `Reduced`.
+/// One persisted non-default per-skill setting. `folder` is a lowercase
+/// relative directory under `metadata/effects/spells/`, usually its top-level
+/// segment (e.g. "cold_herald_of_ice"). Shared support containers retain the
+/// skill-specific suffix (e.g. "supports/runicsupports/bitterdead"). Folders
+/// without an override are `Reduced`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EffectSkillOverride {
     pub folder: String,
@@ -100,18 +102,20 @@ impl EffectsFilter {
     }
 
     pub(super) fn level_for(&self, path: &str) -> EffectLevel {
-        if let Some(folder) = spells_folder(path) {
-            if self.full_folders.contains(&folder.to_ascii_lowercase()) {
+        let normalized = super::targeting::normalize_path(path);
+        if let Some(relative) = normalized.strip_prefix(SPELLS_PREFIX) {
+            // Check every directory ancestor so old persisted top-level keys
+            // such as `supports` still keep the whole subtree original.
+            if relative
+                .match_indices('/')
+                .any(|(end, _)| self.full_folders.contains(&relative[..end]))
+            {
                 return EffectLevel::Full;
             }
         }
-        // Only allocates for paths already under `metadata/effects/spells/`
-        // (all callers pre-filter) and only when monster overrides exist.
-        if !self.full_paths.is_empty()
-            && self
-                .full_paths
-                .contains(&super::targeting::normalize_path(path))
-        {
+        // Monster exclusions are exact paths and compose with the skill
+        // directory-prefix checks above.
+        if !self.full_paths.is_empty() && self.full_paths.contains(&normalized) {
             return EffectLevel::Full;
         }
         EffectLevel::Reduced
@@ -135,14 +139,37 @@ pub(super) fn spells_folder(path: &str) -> Option<&str> {
     (end > 0).then(|| &rest[..end])
 }
 
-/// Distinct sorted lowercase top-level spell folders that contain at least
+/// The independently overridable effect directory for a skill path. Most
+/// skills own one top-level directory. `supports/` is a shared container, so
+/// use its child directory; Runic supports share one more container level.
+fn effect_skill_folder(path: &str) -> Option<String> {
+    if !starts_with_path_ci(path, SPELLS_PREFIX) {
+        return None;
+    }
+    let top = spells_folder(path)?;
+    let segments: Vec<_> = path[SPELLS_PREFIX.len()..].split(['/', '\\']).collect();
+    if !top.eq_ignore_ascii_case("supports") || segments.len() < 3 {
+        return Some(top.to_ascii_lowercase());
+    }
+
+    let child = segments[1];
+    if child.eq_ignore_ascii_case("runicsupports") && segments.len() >= 4 {
+        Some(format!(
+            "supports/runicsupports/{}",
+            segments[2].to_ascii_lowercase()
+        ))
+    } else {
+        Some(format!("supports/{}", child.to_ascii_lowercase()))
+    }
+}
+
+/// Distinct sorted lowercase skill effect directories that contain at least
 /// one effect data file — the catalog behind the per-skill editor.
 pub fn effect_skill_folders(paths: &[String]) -> Vec<String> {
     let mut folders: Vec<String> = paths
         .iter()
         .filter(|path| is_metadata_effect_ext(path))
-        .filter_map(|path| spells_folder(path))
-        .map(str::to_ascii_lowercase)
+        .filter_map(|path| effect_skill_folder(path))
         .collect();
     folders.sort_unstable();
     folders.dedup();
@@ -705,7 +732,7 @@ fn effect_label_action_name(label: &str) -> Option<&str> {
 }
 
 fn effect_folder_from_metadata_path(path: &str) -> Option<String> {
-    spells_folder(path).map(str::to_ascii_lowercase)
+    effect_skill_folder(path)
 }
 
 fn normalize_label_key(s: &str) -> String {
@@ -843,6 +870,43 @@ mod tests {
             filter.level_for("metadata/effects/spells/loose_file.ao"),
             EffectLevel::Reduced
         );
+
+        let filter = EffectsFilter::new(
+            &[EffectSkillOverride {
+                folder: "supports/runicsupports/bitterdead".to_string(),
+                level: EffectLevel::Full,
+            }],
+            BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            filter.level_for(
+                "Metadata/Effects/Spells/Supports/RunicSupports/BitterDead/explosion.ao"
+            ),
+            EffectLevel::Full
+        );
+        assert_eq!(
+            filter
+                .level_for("metadata/effects/spells/supports/runicsupports/falselife/explosion.ao"),
+            EffectLevel::Reduced
+        );
+
+        // Compatibility with v0.6 preferences, where every support effect
+        // was represented by one top-level `supports` override.
+        let legacy = EffectsFilter::new(
+            &[EffectSkillOverride {
+                folder: "supports".to_string(),
+                level: EffectLevel::Full,
+            }],
+            BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            legacy.level_for(
+                "metadata/effects/spells/supports/runicsupports/bitterdead/explosion.ao"
+            ),
+            EffectLevel::Full
+        );
     }
 
     #[test]
@@ -898,13 +962,23 @@ mod tests {
             "metadata/effects/spells/fireball/fx/impact.pet",
             "Metadata/Effects/Spells/Arc_02/beam.trl",
             "metadata/effects/spells/readme/notes.txt",
+            "metadata/effects/spells/supports/aftershock/physical_aftershock.ao",
+            "metadata/effects/spells/supports/runicsupports/bitterdead/explosion.ao",
             "metadata/effects/spells/loose_file.ao",
             "metadata/particles/enviro/foo.pet",
         ]
         .into_iter()
         .map(String::from)
         .collect();
-        assert_eq!(effect_skill_folders(&paths), vec!["arc_02", "fireball"]);
+        assert_eq!(
+            effect_skill_folders(&paths),
+            vec![
+                "arc_02",
+                "fireball",
+                "supports/aftershock",
+                "supports/runicsupports/bitterdead",
+            ]
+        );
     }
 
     fn build_activeskills_with_actions(rows: &[(&str, &str, u32)]) -> Vec<u8> {
@@ -1094,6 +1168,54 @@ mod tests {
         assert_eq!(rows[0].display, "Ice Shot");
         assert_eq!(rows[0].action_type, "IceShot");
         assert_eq!(rows[0].folders, vec!["bow_ice_shot".to_string()]);
+    }
+
+    #[test]
+    fn effect_catalog_keeps_runic_support_skills_separate() {
+        let activeskills = build_activeskills_with_actions(&[
+            ("bitter_dead", "Bitter Dead", 0),
+            (
+                "triggered_lightning_detonate_dead",
+                "Voltaic Fulmination",
+                1,
+            ),
+        ]);
+        // Bitter Dead really reuses Volatile Dead's action type in the live
+        // table, so its animation label has to resolve through its skill ID.
+        let actiontypes =
+            build_actiontypes_bytes(&["VolatileDead", "TriggeredLightningDetonateDead"]);
+        let miscanimated = build_miscanimated_bytes(&[
+            (
+                "BitterDeadExplode",
+                "Metadata/Effects/Spells/supports/RunicSupports/BitterDead/explosion.ao",
+            ),
+            (
+                "TriggeredLightningDetonateDeadExplosion",
+                "Metadata/Effects/Spells/supports/RunicSupports/VoltaicFulmination/explosion.ao",
+            ),
+        ]);
+        let paths = effect_paths(&[
+            "metadata/effects/spells/supports/runicsupports/bitterdead/explosion.ao",
+            "metadata/effects/spells/supports/runicsupports/voltaicfulmination/explosion.ao",
+        ]);
+
+        let rows = build_effect_skill_catalog(
+            &activeskills,
+            &actiontypes,
+            None,
+            Some(&miscanimated),
+            &paths,
+        )
+        .unwrap();
+
+        assert_eq!(
+            row(&rows, "bitter_dead").folders,
+            vec!["supports/runicsupports/bitterdead".to_string()]
+        );
+        assert_eq!(
+            row(&rows, "triggered_lightning_detonate_dead").folders,
+            vec!["supports/runicsupports/voltaicfulmination".to_string()]
+        );
     }
 
     #[test]

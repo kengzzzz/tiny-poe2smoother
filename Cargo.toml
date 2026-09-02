@@ -1,34 +1,34 @@
 [package]
 name = "tiny-poe2smoother"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 default-run = "tiny-poe2smoother"
 
 [dependencies]
-aho-corasick = "1.1"
-anyhow = "1.0"
-byteorder = "1.5"
-dirs = "6.0"
-memmap2 = "0.9"
-regex = "1.11"
-rayon = "1.10"
-serde = { version = "1.0", features = ["derive"] }
-sysinfo = { version = "0.37", default-features = false, features = ["system"] }
-tempfile = "3.23"
-thiserror = "2.0"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+aho-corasick = "1.1.5"
+anyhow = "1.0.104"
+byteorder = "1.5.0"
+dirs = "6.0.0"
+memmap2 = "0.9.11"
+regex = "1.13.1"
+rayon = "1.12"
+serde = { version = "1.0.229", features = ["derive"] }
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+tempfile = "3.27"
+thiserror = "2.0.20"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt"] }
 
 [target.'cfg(windows)'.dependencies]
-eframe = { version = "0.35", default-features = false, features = [
+eframe = { version = "0.36.1", default-features = false, features = [
     "default_fonts",
     "glow",
     "persistence",
 ] }
-rfd = { version = "0.17", default-features = false }
+rfd = { version = "0.17.2", default-features = false }
 
 [target.'cfg(not(windows))'.dependencies]
-eframe = { version = "0.35", default-features = false, features = [
+eframe = { version = "0.36.1", default-features = false, features = [
     "accesskit",
     "default_fonts",
     "glow",
@@ -36,16 +36,10 @@ eframe = { version = "0.35", default-features = false, features = [
     "wayland",
     "x11",
 ] }
-rfd = "0.17"
+rfd = "0.17.2"
 
 [build-dependencies]
-cc = { version = "1", features = ["parallel"] }
-
-# Backports upstream commits ec2d932 (quick-xml API) and d07c4f9 (security).
-# The crates.io release still depends on vulnerable quick-xml 0.39.
-# Remove this patch after wayland-scanner publishes the quick-xml 0.41 update.
-[patch.crates-io]
-wayland-scanner = { path = "vendor/wayland-scanner" }
+cc = { version = "1.4.4", features = ["parallel"] }
 
 [profile.release]
 opt-level = 3

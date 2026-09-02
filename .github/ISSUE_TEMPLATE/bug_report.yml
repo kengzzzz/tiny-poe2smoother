@@ -11,8 +11,8 @@ body:
     id: app-version
     attributes:
       label: tiny-poe2smoother version
-      description: Use the release tag (for example, v0.6.0) or commit hash.
-      placeholder: v0.6.0
+      description: Use the release tag (for example, v0.6.1) or commit hash.
+      placeholder: v0.6.1
     validations:
       required: true
 

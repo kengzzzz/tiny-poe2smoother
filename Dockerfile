@@ -25,7 +25,6 @@ RUN /docker-build.sh setup
 
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY src/ src/
-COPY vendor/wayland-scanner/ vendor/wayland-scanner/
 
 RUN /docker-build.sh fetch
 
