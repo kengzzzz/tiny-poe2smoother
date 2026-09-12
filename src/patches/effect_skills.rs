@@ -258,7 +258,7 @@ struct ActiveSkillEffectRow {
 impl ActiveSkillEffectRow {
     fn label_aliases(&self) -> Vec<(String, AliasRank)> {
         let mut aliases = Vec::new();
-        push_unique_alias(&mut aliases, self.action_key.clone(), AliasRank::Action);
+        push_min_len_alias(&mut aliases, self.action_key.clone(), AliasRank::Action);
         push_min_len_alias(
             &mut aliases,
             normalize_label_key(&self.display),
@@ -1654,6 +1654,58 @@ mod tests {
         .unwrap();
 
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn effect_catalog_ignores_short_action_prefix_of_longer_word() {
+        let activeskills = build_activeskills_with_actions(&[
+            ("arc", "Arc", 0),
+            ("vaal_arc", "Vaal Arc", 0),
+            ("lightless_stalker_arc_beam", "Haunting Chain", 0),
+            ("new_new_arctic_armour", "Arctic Armour", 1),
+            ("oil_grenade", "Oil Grenade", 2),
+        ]);
+        let actiontypes = build_actiontypes_bytes(&["Arc", "NewNewArcticArmour", "Grenade"]);
+        let miscanimated = build_miscanimated_bytes(&[
+            (
+                "ArcticArmourStages",
+                "Metadata/Effects/Spells/cold_arcticarmour/arcticArmor.ao",
+            ),
+            (
+                "ArcChainImpact",
+                "Metadata/Effects/Spells/arc/chain.ao",
+            ),
+            (
+                "OilGrenadeExplosion",
+                "Metadata/Effects/Spells/crossbow_oilgrenade/oil_Burst.ao",
+            ),
+        ]);
+        let paths = effect_paths(&[
+            "metadata/effects/spells/cold_arcticarmour/arcticArmor.ao",
+            "metadata/effects/spells/arc/chain.ao",
+            "metadata/effects/spells/lightning_arc/beam.ao",
+            "metadata/effects/spells/crossbow_oilgrenade/oil_Burst.ao",
+        ]);
+        let rows = build_effect_skill_catalog(
+            &activeskills,
+            &actiontypes,
+            None,
+            Some(&miscanimated),
+            &paths,
+        )
+        .unwrap();
+        assert_eq!(
+            row(&rows, "new_new_arctic_armour").folders,
+            vec!["cold_arcticarmour".to_string()]
+        );
+        assert_eq!(
+            row(&rows, "oil_grenade").folders,
+            vec!["crossbow_oilgrenade".to_string()]
+        );
+        assert_eq!(
+            row(&rows, "arc").folders,
+            vec!["arc".to_string(), "lightning_arc".to_string()]
+        );
     }
 
     #[test]
