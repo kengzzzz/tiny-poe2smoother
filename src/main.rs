@@ -89,6 +89,7 @@ struct GuiApp {
     monsters_filter_rows: Vec<usize>,
     show_unnamed_monsters: bool,
     status: Option<AppStatus>,
+    status_loader: fn(Option<PathBuf>) -> anyhow::Result<AppStatus>,
     message: String,
     message_kind: MessageKind,
     task: Option<Receiver<TaskResult>>,
@@ -210,6 +211,7 @@ impl Default for GuiApp {
             monsters_filter_rows: Vec::new(),
             show_unnamed_monsters: false,
             status: None,
+            status_loader: load_status,
             message: "Ready.".to_string(),
             message_kind: MessageKind::Info,
             task: None,
@@ -398,8 +400,23 @@ impl GuiApp {
 
     fn spawn_status(&mut self) {
         let game_dir = self.game_dir();
+        let loader = self.status_loader;
+        self.status = None;
         self.spawn("Detecting install...", move || {
-            TaskResult::Status(load_status(game_dir).map_err(|err| err.to_string()))
+            TaskResult::Status(loader(game_dir).map_err(|err| err.to_string()))
+        });
+    }
+
+    fn select_game_dir(&mut self, path: PathBuf) {
+        self.game_dir_input = display_path(&path);
+        self.spawn_status();
+    }
+
+    fn spawn_autodetect(&mut self) {
+        let loader = self.status_loader;
+        self.status = None;
+        self.spawn("Detecting install...", move || {
+            TaskResult::Status(loader(None).map_err(|err| err.to_string()))
         });
     }
 
@@ -1054,6 +1071,114 @@ fn effect_skill_catalog_rows(entries: Vec<EffectSkillCatalogEntry>) -> Vec<Effec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn patched_status(game_dir: PathBuf) -> AppStatus {
+        AppStatus {
+            index_path: game_dir.join("Bundles2/_.index.bin"),
+            index_display_path: "Bundles2/_.index.bin".to_string(),
+            game_dir,
+            install_layout: tiny_poe2smoother::install::InstallLayout::LooseBundles,
+            indexed_paths: 1,
+            backup_path: PathBuf::from("test-backup.bak"),
+            has_backup: true,
+            patch_state: tiny_poe2smoother::app::PatchState::Patched,
+        }
+    }
+
+    fn finish_status_task(app: &mut GuiApp) {
+        // Wait for the real worker, then feed its result through normal UI polling.
+        let result = app
+            .task
+            .take()
+            .expect("status task should have started")
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("status task should finish");
+        let (tx, rx) = mpsc::channel();
+        tx.send(result).unwrap();
+        app.task = Some(rx);
+        app.poll_task(&egui::Context::default());
+        assert!(!app.is_busy());
+    }
+
+    #[test]
+    fn autodetect_ignores_stale_textbox_and_replaces_it_on_success() {
+        let mut app = GuiApp {
+            game_dir_input: "deleted-install".to_string(),
+            status_loader: |path| {
+                assert_eq!(path, None);
+                Ok(patched_status(PathBuf::from("detected-steam-install")))
+            },
+            ..GuiApp::default()
+        };
+
+        app.spawn_autodetect();
+        finish_status_task(&mut app);
+
+        assert_eq!(app.game_dir_input, "detected-steam-install");
+        assert_eq!(
+            app.status.unwrap().game_dir,
+            PathBuf::from("detected-steam-install")
+        );
+    }
+
+    #[test]
+    fn failed_autodetect_clears_stale_status_and_preserves_textbox() {
+        let mut app = GuiApp {
+            game_dir_input: "deleted-install".to_string(),
+            status: Some(patched_status(PathBuf::from("deleted-install"))),
+            status_loader: |path| {
+                assert_eq!(path, None);
+                anyhow::bail!("could not autodetect install")
+            },
+            ..GuiApp::default()
+        };
+
+        app.spawn_autodetect();
+        assert!(app.status.is_none());
+        finish_status_task(&mut app);
+
+        assert!(app.status.is_none());
+        assert_eq!(app.message, "could not autodetect install");
+        assert_eq!(app.game_dir_input, "deleted-install");
+    }
+
+    #[test]
+    fn browse_loads_custom_install_status_needed_for_restore() {
+        let mut app = GuiApp {
+            status_loader: |path| {
+                assert_eq!(path, Some(PathBuf::from("custom-install")));
+                Ok(patched_status(path.unwrap()))
+            },
+            ..GuiApp::default()
+        };
+
+        app.select_game_dir(PathBuf::from("custom-install"));
+        finish_status_task(&mut app);
+
+        assert_eq!(app.game_dir_input, "custom-install");
+        assert!(app.status.as_ref().unwrap().patch_state.can_restore());
+    }
+
+    #[test]
+    fn validation_uses_typed_path_and_clears_stale_status_on_failure() {
+        let mut app = GuiApp {
+            game_dir_input: "  invalid-custom-install  ".to_string(),
+            status: Some(patched_status(PathBuf::from("previous-install"))),
+            status_loader: |path| {
+                assert_eq!(path, Some(PathBuf::from("invalid-custom-install")));
+                anyhow::bail!("invalid install")
+            },
+            ..GuiApp::default()
+        };
+
+        app.spawn_status();
+        assert!(app.status.is_none());
+        finish_status_task(&mut app);
+
+        assert!(app.status.is_none());
+        assert_eq!(app.message, "invalid install");
+        assert_eq!(app.game_dir_input, "  invalid-custom-install  ");
+    }
 
     #[test]
     fn prefs_restore_valid_patch_names_and_ignore_unknown_entries() {

@@ -129,12 +129,14 @@ fn draw_directory_card(app: &mut GuiApp, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if ui.button("Browse…").clicked() {
                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                    app.game_dir_input = display_path(&path);
-                    app.status = None;
+                    app.select_game_dir(path);
                 }
             }
-            if ui.button("Detect").clicked() {
+            if ui.button("Validate").clicked() {
                 app.spawn_status();
+            }
+            if ui.button("Detect").clicked() {
+                app.spawn_autodetect();
             }
         });
         if let Some(status) = &app.status {
