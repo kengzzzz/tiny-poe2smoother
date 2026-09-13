@@ -5,10 +5,10 @@ use crate::install::{
 };
 use crate::patches::{
     all_patches, all_presets, build_effect_skill_catalog, build_monster_effect_catalog,
-    compute_patch_set, parse_patch, parse_preset, parse_stat_catalog, unique_patches,
-    EffectSkillCatalogEntry, MonsterEffectCatalogEntry, PatchChange, PatchId, PatchParams,
-    StatCatalogEntry, ACTIONTYPES_DATC64_PATH, ACTIVESKILLS_DATC64_PATH,
-    ITEM_VISUAL_EFFECT_DATC64_PATH,
+    build_other_effect_catalog, compute_patch_set, parse_patch, parse_preset, parse_stat_catalog,
+    unique_patches, EffectSkillCatalogEntry, MonsterEffectCatalogEntry, OtherEffectCatalogEntry,
+    PatchChange, PatchId, PatchParams, StatCatalogEntry, ACTIONTYPES_DATC64_PATH,
+    ACTIVESKILLS_DATC64_PATH, ITEM_VISUAL_EFFECT_DATC64_PATH,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use rayon::prelude::*;
@@ -467,15 +467,35 @@ pub fn load_effect_skill_catalog(
     let mut store = BundleStore::new(&game_dir);
     let mut index = store.open_index()?;
     index.ensure_paths_built()?;
+    skill_catalog_from_index(&store, &index)
+}
+
+/// Shared and unmapped spell effects use the same live skill ownership
+/// calculation as the Skills tab, so a folder cannot appear in both tabs.
+pub fn load_other_effect_catalog(
+    game_dir: Option<PathBuf>,
+) -> Result<Vec<OtherEffectCatalogEntry>> {
+    let game_dir = resolve_game_dir(game_dir)?;
+    let mut store = BundleStore::new(&game_dir);
+    let mut index = store.open_index()?;
+    index.ensure_paths_built()?;
+    let skills = skill_catalog_from_index(&store, &index)?;
+    Ok(build_other_effect_catalog(index.paths(), &skills))
+}
+
+fn skill_catalog_from_index(
+    store: &BundleStore,
+    index: &BundleIndex,
+) -> Result<Vec<EffectSkillCatalogEntry>> {
     let activeskills = store
-        .read_file(&index, ACTIVESKILLS_DATC64_PATH)
+        .read_file(index, ACTIVESKILLS_DATC64_PATH)
         .context("read activeskills.datc64")?;
     let actiontypes = store
-        .read_file(&index, ACTIONTYPES_DATC64_PATH)
+        .read_file(index, ACTIONTYPES_DATC64_PATH)
         .context("read actiontypes.datc64")?;
-    let item_visual_effects = store.read_file(&index, ITEM_VISUAL_EFFECT_DATC64_PATH).ok();
+    let item_visual_effects = store.read_file(index, ITEM_VISUAL_EFFECT_DATC64_PATH).ok();
     let miscanimated = store
-        .read_file(&index, "data/balance/miscanimated.datc64")
+        .read_file(index, "data/balance/miscanimated.datc64")
         .ok();
 
     build_effect_skill_catalog(

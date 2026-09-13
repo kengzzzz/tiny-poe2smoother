@@ -18,7 +18,7 @@ Start with a ready-made preset or choose individual patches.
 
 Additional controls:
 
-- **Effects editor:** Search for individual skills and monsters whose original visuals you want to keep. Other supported effects remain reduced.
+- **Effects editor:** Use Skills, Monsters, and Others tabs to keep selected visuals original. Others includes shared ground effects and unmapped effect folders. Keeping an effect Full also preserves its referenced particles, even with the Particles patch enabled; shared dependencies stay original for all their users. Checked rows are reduced, unchecked rows stay original, and bulk actions affect only the active tab's search results. Restore your backup before applying changed settings.
 - **Color mods editor:** Choose which modifier text to color on waystones, items, and tablets. Search supports alternatives such as `fire|cold`, quoted phrases, and exclusions such as `!monster`; each modifier can use a preset or custom color.
 - **Presets:** Quickly select combinations for map visibility, balanced performance, daylight, high performance, or black-screen play.
 - **Black screen:** Hides world rendering while keeping the UI, item labels, health bars, and minimap visible.

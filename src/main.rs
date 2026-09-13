@@ -9,14 +9,16 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use tiny_poe2smoother::app::{
-    apply_patches, load_effect_skill_catalog, load_monster_effect_catalog, load_stat_catalog,
-    load_status, restore_backup, AppStatus, ApplyReport, PatchRequest, RestoreReport,
+    apply_patches, load_effect_skill_catalog, load_monster_effect_catalog,
+    load_other_effect_catalog, load_stat_catalog, load_status, restore_backup, AppStatus,
+    ApplyReport, PatchRequest, RestoreReport,
 };
 use tiny_poe2smoother::install::display_path;
 use tiny_poe2smoother::patches::{
     all_patches, default_color_mods, display_stat_text, merge_with_defaults, parse_patch,
     ColorModEntry, EffectLevel, EffectSkillCatalogEntry, EffectSkillOverride,
-    MonsterEffectCatalogEntry, MonsterEffectOverride, PatchId, PatchParams,
+    MonsterEffectCatalogEntry, MonsterEffectOverride, OtherEffectCatalogEntry, PatchId,
+    PatchParams,
 };
 
 const PREFS_KEY: &str = "tiny-poe2smoother.gui.v1";
@@ -54,6 +56,7 @@ enum MessageKind {
 enum EffectsEditorTab {
     Skills,
     Monsters,
+    Others,
 }
 
 struct GuiApp {
@@ -79,6 +82,13 @@ struct GuiApp {
     effect_catalog_dir: Option<PathBuf>,
     effects_filter_key: Option<(String, usize)>,
     effects_filter_rows: Vec<usize>,
+    others_search: String,
+    other_catalog: Option<Vec<OtherEffectRow>>,
+    other_catalog_task: Option<Receiver<Result<Vec<OtherEffectRow>, String>>>,
+    other_catalog_error: Option<String>,
+    other_catalog_dir: Option<PathBuf>,
+    others_filter_key: Option<(String, usize)>,
+    others_filter_rows: Vec<usize>,
     monster_overrides: HashMap<String, EffectLevel>,
     monsters_search: String,
     monster_catalog: Option<Vec<MonsterCatalogRow>>,
@@ -151,6 +161,15 @@ struct MonsterCatalogRow {
     named: bool,
 }
 
+/// One Others-tab row: a single shared/unmapped folder under
+/// `metadata/effects/spells/` (a directory, or an exact `.ao`/`.aoc` file).
+struct OtherEffectRow {
+    folder: String,
+    display: String,
+    display_lower: String,
+    search_lower: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GuiPrefs {
     game_dir_input: String,
@@ -201,6 +220,13 @@ impl Default for GuiApp {
             effect_catalog_dir: None,
             effects_filter_key: None,
             effects_filter_rows: Vec::new(),
+            others_search: String::new(),
+            other_catalog: None,
+            other_catalog_task: None,
+            other_catalog_error: None,
+            other_catalog_dir: None,
+            others_filter_key: None,
+            others_filter_rows: Vec::new(),
             monster_overrides: HashMap::new(),
             monsters_search: String::new(),
             monster_catalog: None,
@@ -238,6 +264,7 @@ impl eframe::App for GuiApp {
         self.poll_task(ctx);
         self.poll_catalog(ctx);
         self.poll_effect_catalog(ctx);
+        self.poll_other_effect_catalog(ctx);
         self.poll_monster_catalog(ctx);
     }
 
@@ -735,7 +762,7 @@ impl GuiApp {
         }
     }
 
-    fn apply_effect_level_to_filtered_rows(&mut self, level: EffectLevel) {
+    fn apply_effect_level_to_filtered_rows(&mut self, level: EffectLevel) -> bool {
         self.refresh_effects_filter();
         let catalog = self.effect_catalog.as_deref().unwrap_or_default();
         let folders: Vec<String> = self
@@ -743,24 +770,105 @@ impl GuiApp {
             .iter()
             .flat_map(|&idx| catalog[idx].folders.iter().cloned())
             .collect();
-        for folder in folders {
-            if level == EffectLevel::Reduced {
-                self.effect_overrides.remove(&folder);
-            } else {
-                self.effect_overrides.insert(folder, level);
+        self.set_skill_folders_level(&folders, level)
+    }
+
+    fn set_skill_folders_level(&mut self, folders: &[String], level: EffectLevel) -> bool {
+        if level == EffectLevel::Full {
+            for folder in folders {
+                self.effect_overrides
+                    .insert(folder.to_ascii_lowercase(), level);
             }
+            return true;
         }
+        let removal: Vec<String> = folders
+            .iter()
+            .map(|folder| folder.to_ascii_lowercase())
+            .collect();
+        if !self.expand_effect_ancestors_for_removal(&removal) {
+            return false;
+        }
+        for folder in removal {
+            self.effect_overrides.remove(&folder);
+        }
+        true
     }
 
     fn effect_level_for_folders(&self, folders: &[String]) -> Option<EffectLevel> {
-        let mut levels = folders.iter().map(|folder| {
-            self.effect_overrides
-                .get(folder)
-                .copied()
-                .unwrap_or_default()
-        });
+        let mut levels = folders
+            .iter()
+            .map(|folder| self.effective_effect_level(folder));
         let first = levels.next()?;
         levels.all(|level| level == first).then_some(first)
+    }
+
+    fn effective_effect_level(&self, folder: &str) -> EffectLevel {
+        let folder = folder.to_ascii_lowercase();
+        if self.effect_overrides.get(&folder).copied() == Some(EffectLevel::Full) {
+            return EffectLevel::Full;
+        }
+        let bytes = folder.as_bytes();
+        for (idx, byte) in bytes.iter().enumerate() {
+            if *byte == b'/'
+                && self.effect_overrides.get(&folder[..idx]).copied() == Some(EffectLevel::Full)
+            {
+                return EffectLevel::Full;
+            }
+        }
+        EffectLevel::Reduced
+    }
+
+    /// The Skills/Others editor stays reachable for Particles-only selections,
+    /// whose referenced particles are still protected by Full scopes.
+    fn effects_editor_accessible(&self) -> bool {
+        use tiny_poe2smoother::patches::PatchId;
+        self.selected_patches.contains(&PatchId::Effects)
+            || self.selected_patches.contains(&PatchId::Particles)
+    }
+
+    /// Stored broad Full parents covering any folder in `removal`.
+    fn effect_ancestors_for_removal(&self, removal: &[String]) -> Vec<String> {
+        self.effect_overrides
+            .iter()
+            .filter(|(_, level)| **level == EffectLevel::Full)
+            .map(|(key, _)| key.clone())
+            .filter(|key| {
+                let key_lower = key.to_ascii_lowercase();
+                removal
+                    .iter()
+                    .any(|folder| is_folder_ancestor(&key_lower, &folder.to_ascii_lowercase()))
+            })
+            .collect()
+    }
+
+    /// True when reducing `removal` is safe with the loaded catalogs.
+    /// Only broad-Ancestor migration needs catalogs: both tabs, except
+    /// ground-only ancestors which need just Others.
+    fn can_reduce_effect_folders(&mut self, removal: &[String]) -> bool {
+        if removal.is_empty() {
+            return true;
+        }
+        let game_dir = self.game_dir();
+        self.invalidate_effect_catalog_if_stale(&game_dir);
+        self.invalidate_other_effect_catalog_if_stale(&game_dir);
+        let removal: Vec<String> = removal
+            .iter()
+            .map(|folder| folder.to_ascii_lowercase())
+            .collect();
+        let ancestors = self.effect_ancestors_for_removal(&removal);
+        if ancestors.is_empty() {
+            return true;
+        }
+        for ancestor in &ancestors {
+            if is_ground_effects_scope(ancestor) {
+                if self.other_catalog.is_none() {
+                    return false;
+                }
+            } else if self.effect_catalog.is_none() || self.other_catalog.is_none() {
+                return false;
+            }
+        }
+        true
     }
 
     /// Runs on every repaint of the main view, so it stays linear in
@@ -775,12 +883,21 @@ impl GuiApp {
             .filter(|row| {
                 row.folders
                     .iter()
-                    .any(|folder| self.effect_overrides.contains_key(folder))
+                    .any(|folder| self.effective_effect_level(folder) == EffectLevel::Full)
             })
             .count();
         let cataloged: HashSet<&str> = catalog
             .iter()
             .flat_map(|row| row.folders.iter().map(String::as_str))
+            .collect();
+        // Others folders share this map; once the Others catalog is known they
+        // (and broad parents covering them) count under Others, not Skills.
+        let other_folders: Vec<&str> = self
+            .other_catalog
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|row| row.folder.as_str())
             .collect();
         // Stale folders absent from the catalog count once each: their
         // grouping is unknowable, and dropping them would hide skills the
@@ -789,10 +906,235 @@ impl GuiApp {
             .effect_overrides
             .iter()
             .filter(|(folder, level)| {
-                **level == EffectLevel::Full && !cataloged.contains(folder.as_str())
+                **level == EffectLevel::Full
+                    && !cataloged.contains(folder.as_str())
+                    && !is_other_related_override(folder, &other_folders)
+                    && !cataloged
+                        .iter()
+                        .any(|known| is_folder_ancestor(folder.as_str(), known))
             })
             .count();
         catalog_kept + uncataloged_full
+    }
+
+    /// Drop a stale Others catalog + filter cache on game-dir change.
+    /// `effect_overrides` survive; stale folders simply match no path.
+    fn invalidate_other_effect_catalog_if_stale(&mut self, game_dir: &Option<PathBuf>) {
+        if self.other_catalog_dir.as_deref() != game_dir.as_deref() {
+            self.other_catalog = None;
+            self.other_catalog_task = None;
+            self.other_catalog_error = None;
+            self.others_filter_key = None;
+            self.others_filter_rows.clear();
+        }
+    }
+
+    /// Start the background Others-catalog load if needed; the editor stays
+    /// usable while it loads, like `ensure_effect_catalog_loading`.
+    fn ensure_other_effect_catalog_loading(&mut self) {
+        let game_dir = self.game_dir();
+        self.invalidate_other_effect_catalog_if_stale(&game_dir);
+        if self.other_catalog.is_some() || self.other_catalog_task.is_some() {
+            return;
+        }
+        self.other_catalog_error = None;
+        let (tx, rx) = mpsc::channel();
+        self.other_catalog_task = Some(rx);
+        self.other_catalog_dir = game_dir.clone();
+        thread::spawn(move || {
+            let result = load_other_effect_catalog(game_dir)
+                .map(other_effect_catalog_rows)
+                .map_err(|err| err.to_string());
+            let _ = tx.send(result);
+        });
+    }
+
+    fn poll_other_effect_catalog(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.other_catalog_task else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(rows)) => {
+                self.other_catalog_task = None;
+                self.other_catalog = Some(rows);
+            }
+            Ok(Err(err)) => {
+                self.other_catalog_task = None;
+                self.other_catalog_error = Some(err);
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                if self.show_effects_editor {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(33));
+                }
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.other_catalog_task = None;
+                self.other_catalog_error = Some("shared effect catalog task failed".to_string());
+            }
+        }
+    }
+
+    /// Rebuild cached Others-filter rows if the query or catalog changed.
+    fn refresh_others_filter(&mut self) {
+        let catalog_len = self.other_catalog.as_ref().map_or(0, Vec::len);
+        let fresh = self
+            .others_filter_key
+            .as_ref()
+            .is_some_and(|(query, catalog)| {
+                *query == self.others_search && *catalog == catalog_len
+            });
+        if !fresh {
+            let query = gui::search::SearchQuery::parse(&self.others_search);
+            self.others_filter_rows = self
+                .other_catalog
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| query.matches(&row.search_lower, &row.display_lower))
+                .map(|(idx, _)| idx)
+                .collect();
+            self.others_filter_key = Some((self.others_search.clone(), catalog_len));
+        }
+    }
+
+    /// Effective level for one Others folder: Full via an exact entry or any
+    /// covering broad parent; missing entries are Reduced.
+    fn other_effect_level(&self, folder: &str) -> EffectLevel {
+        self.effective_effect_level(folder)
+    }
+
+    /// Set one Others folder. Reducing under an inherited Full parent first
+    /// expands it into explicit Full siblings (both catalogs); with a required
+    /// catalog missing nothing changes.
+    fn set_other_effect_level(&mut self, folder: &str, level: EffectLevel) -> bool {
+        let folder = folder.to_ascii_lowercase();
+        if level == EffectLevel::Full {
+            self.effect_overrides.insert(folder, EffectLevel::Full);
+            return true;
+        }
+        if !self.expand_effect_ancestors_for_removal(std::slice::from_ref(&folder)) {
+            return false;
+        }
+        self.effect_overrides.remove(&folder);
+        true
+    }
+
+    /// Bulk `set_other_effect_level` over the tab's filtered rows. Reduced
+    /// returns false unchanged when a required catalog is missing.
+    fn apply_other_effect_level_to_filtered_rows(&mut self, level: EffectLevel) -> bool {
+        self.refresh_others_filter();
+        let catalog = self.other_catalog.as_deref().unwrap_or_default();
+        let folders: Vec<String> = self
+            .others_filter_rows
+            .iter()
+            .map(|&idx| catalog[idx].folder.clone())
+            .collect();
+        if level == EffectLevel::Full {
+            for folder in folders {
+                self.effect_overrides.insert(folder, level);
+            }
+            true
+        } else {
+            if !self.expand_effect_ancestors_for_removal(&folders) {
+                return false;
+            }
+            for folder in folders {
+                self.effect_overrides.remove(&folder);
+            }
+            true
+        }
+    }
+
+    /// Expand covering broad Full parents into explicit Full entries for
+    /// catalog descendants outside `removal`, then drop them. Spans the union
+    /// of Skills + Others folders (`supports` can cover both); ground-only
+    /// ancestors need just Others. False + unchanged if a catalog is missing.
+    fn expand_effect_ancestors_for_removal(&mut self, removal: &[String]) -> bool {
+        if removal.is_empty() {
+            return true;
+        }
+        let game_dir = self.game_dir();
+        self.invalidate_effect_catalog_if_stale(&game_dir);
+        self.invalidate_other_effect_catalog_if_stale(&game_dir);
+        let removal: Vec<String> = removal
+            .iter()
+            .map(|folder| folder.to_ascii_lowercase())
+            .collect();
+        let ancestors = self.effect_ancestors_for_removal(&removal);
+        if ancestors.is_empty() {
+            return true;
+        }
+        for ancestor in &ancestors {
+            if is_ground_effects_scope(ancestor) {
+                if self.other_catalog.is_none() {
+                    return false;
+                }
+            } else if self.effect_catalog.is_none() || self.other_catalog.is_none() {
+                return false;
+            }
+        }
+        let skill_folders: Vec<String> = self
+            .effect_catalog
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|row| row.folders.iter().cloned())
+            .collect();
+        let other_folders: Vec<String> = self
+            .other_catalog
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|row| row.folder.clone())
+            .collect();
+        for ancestor in ancestors {
+            if !is_ground_effects_scope(&ancestor) {
+                for folder in &skill_folders {
+                    if !is_folder_equal_or_descendant(folder, &ancestor) {
+                        continue;
+                    }
+                    if removal
+                        .iter()
+                        .any(|target| is_folder_equal_or_descendant(folder, target))
+                    {
+                        continue;
+                    }
+                    self.effect_overrides
+                        .entry(folder.clone())
+                        .or_insert(EffectLevel::Full);
+                }
+            }
+            for folder in &other_folders {
+                if !is_folder_equal_or_descendant(folder, &ancestor) {
+                    continue;
+                }
+                if removal
+                    .iter()
+                    .any(|target| is_folder_equal_or_descendant(folder, target))
+                {
+                    continue;
+                }
+                self.effect_overrides
+                    .entry(folder.clone())
+                    .or_insert(EffectLevel::Full);
+            }
+            self.effect_overrides.remove(&ancestor);
+        }
+        true
+    }
+
+    /// Count Others rows at effective Full. Broad parents count through their
+    /// rows, not extra; folders unknown to both catalogs count under Skills.
+    fn kept_original_other_effect_count(&self) -> usize {
+        let catalog = self.other_catalog.as_deref().unwrap_or(&[]);
+        if catalog.is_empty() {
+            return 0;
+        }
+        catalog
+            .iter()
+            .filter(|row| self.other_effect_level(&row.folder) == EffectLevel::Full)
+            .count()
     }
 
     /// Discard a stale monster catalog (and its in-flight load / filter
@@ -814,7 +1156,10 @@ impl GuiApp {
     /// a catalog loaded for a different game dir.
     fn ensure_active_effects_tab_loading(&mut self) {
         match self.effects_editor_tab {
-            EffectsEditorTab::Skills => self.ensure_effect_catalog_loading(),
+            EffectsEditorTab::Skills | EffectsEditorTab::Others => {
+                self.ensure_effect_catalog_loading();
+                self.ensure_other_effect_catalog_loading();
+            }
             EffectsEditorTab::Monsters => self.ensure_monster_catalog_loading(),
         }
     }
@@ -877,14 +1222,14 @@ impl GuiApp {
     /// is off; overridden hidden rows are surfaced by a hint, not the list).
     fn refresh_monsters_filter(&mut self) {
         let catalog_len = self.monster_catalog.as_ref().map_or(0, Vec::len);
-        let fresh = self
-            .monsters_filter_key
-            .as_ref()
-            .is_some_and(|(query, catalog, show_unnamed)| {
-                *query == self.monsters_search
-                    && *catalog == catalog_len
-                    && *show_unnamed == self.show_unnamed_monsters
-            });
+        let fresh =
+            self.monsters_filter_key
+                .as_ref()
+                .is_some_and(|(query, catalog, show_unnamed)| {
+                    *query == self.monsters_search
+                        && *catalog == catalog_len
+                        && *show_unnamed == self.show_unnamed_monsters
+                });
         if !fresh {
             let query = gui::search::SearchQuery::parse(&self.monsters_search);
             self.monsters_filter_rows = self
@@ -954,12 +1299,9 @@ impl GuiApp {
     }
 
     fn monster_level_for_keys(&self, keys: &[String]) -> Option<EffectLevel> {
-        let mut levels = keys.iter().map(|key| {
-            self.monster_overrides
-                .get(key)
-                .copied()
-                .unwrap_or_default()
-        });
+        let mut levels = keys
+            .iter()
+            .map(|key| self.monster_overrides.get(key).copied().unwrap_or_default());
         let first = levels.next()?;
         levels.all(|level| level == first).then_some(first)
     }
@@ -999,7 +1341,9 @@ fn monster_effect_catalog_rows(entries: Vec<MonsterEffectCatalogEntry>) -> Vec<M
     // apart in the list.
     let mut display_counts: HashMap<String, usize> = HashMap::new();
     for entry in &entries {
-        *display_counts.entry(entry.display.to_lowercase()).or_default() += 1;
+        *display_counts
+            .entry(entry.display.to_lowercase())
+            .or_default() += 1;
     }
     entries
         .into_iter()
@@ -1063,6 +1407,60 @@ fn effect_skill_catalog_rows(entries: Vec<EffectSkillCatalogEntry>) -> Vec<Effec
                 display_lower: entry.display.to_lowercase(),
                 display: entry.display,
                 search_lower,
+            }
+        })
+        .collect()
+}
+
+/// True when `ancestor` is a strict `/`-separated prefix of `path`
+/// (`ground_effects` vs `ground_effects/fire`). Folders are lowercase
+/// relative paths, so a plain byte comparison is enough.
+fn is_folder_ancestor(ancestor: &str, path: &str) -> bool {
+    path.len() > ancestor.len()
+        && path.starts_with(ancestor)
+        && path.as_bytes().get(ancestor.len()) == Some(&b'/')
+}
+
+fn is_folder_equal_or_descendant(path: &str, ancestor: &str) -> bool {
+    path == ancestor || is_folder_ancestor(ancestor, path)
+}
+
+/// True for ground-effect scopes whose containers backend never assigns to
+/// skills, so cross-tab expansion for them needs only the Others catalog.
+fn is_ground_effects_scope(folder: &str) -> bool {
+    matches!(
+        folder
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str(),
+        "ground_effects" | "ground_effects_v2" | "ground_effects_v3"
+    )
+}
+
+/// True when an override belongs to Others: equal to, above, or below an
+/// Others folder. Empty lists claim nothing, preserving the skill fallback.
+fn is_other_related_override(folder: &str, other_folders: &[&str]) -> bool {
+    !other_folders.is_empty()
+        && other_folders.iter().any(|other| {
+            *other == folder
+                || is_folder_ancestor(other, folder)
+                || is_folder_ancestor(folder, other)
+        })
+}
+
+fn other_effect_catalog_rows(entries: Vec<OtherEffectCatalogEntry>) -> Vec<OtherEffectRow> {
+    entries
+        .into_iter()
+        .map(|entry| {
+            let folder = entry.folder.to_ascii_lowercase();
+            let search_lower = format!("{} {folder}", entry.display).to_lowercase();
+            OtherEffectRow {
+                display_lower: entry.display.to_lowercase(),
+                display: entry.display,
+                search_lower,
+                folder,
             }
         })
         .collect()
@@ -1485,7 +1883,10 @@ mod tests {
 
         // With the catalog the two variants collapse into one row; a stale
         // key absent from the catalog still counts.
-        app.monster_catalog = Some(vec![monster_row("Filthy First-born", &[mother, runemarked])]);
+        app.monster_catalog = Some(vec![monster_row(
+            "Filthy First-born",
+            &[mother, runemarked],
+        )]);
         assert_eq!(app.kept_original_monster_count(), 1);
         app.monster_overrides.insert(
             "metadata/monsters/removed/removed".to_string(),
@@ -2022,6 +2423,549 @@ mod tests {
         assert!(herald.search_lower.contains("heraldofash"));
         assert!(herald.search_lower.contains("fire_heraldofash"));
         assert!(herald.search_lower.contains("herald_of_fire"));
+    }
+
+    fn other_catalog_entries() -> Vec<OtherEffectCatalogEntry> {
+        vec![
+            OtherEffectCatalogEntry {
+                folder: "ground_effects/fire".to_string(),
+                display: "Ground Fire".to_string(),
+            },
+            OtherEffectCatalogEntry {
+                folder: "ground_effects/cold".to_string(),
+                display: "Ground Cold".to_string(),
+            },
+            OtherEffectCatalogEntry {
+                folder: "ambient_sparkles.ao".to_string(),
+                display: "Ambient Sparkles".to_string(),
+            },
+        ]
+    }
+
+    #[test]
+    fn other_effect_catalog_rows_lowercase_folders_and_index_search_text() {
+        let rows = other_effect_catalog_rows(other_catalog_entries());
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].folder, "ground_effects/fire");
+        assert_eq!(rows[0].display, "Ground Fire");
+        assert_eq!(rows[0].display_lower, "ground fire");
+        assert!(rows[0].search_lower.contains("ground fire"));
+        assert!(rows[0].search_lower.contains("ground_effects/fire"));
+        assert_eq!(rows[2].folder, "ambient_sparkles.ao");
+    }
+
+    #[test]
+    fn other_effect_level_reports_inherited_legacy_full_parents() {
+        let mut app = GuiApp {
+            other_catalog: Some(other_effect_catalog_rows(other_catalog_entries())),
+            ..GuiApp::default()
+        };
+        assert_eq!(
+            app.other_effect_level("ground_effects/fire"),
+            EffectLevel::Reduced
+        );
+
+        app.effect_overrides
+            .insert("ground_effects".to_string(), EffectLevel::Full);
+        assert_eq!(
+            app.other_effect_level("ground_effects/fire"),
+            EffectLevel::Full
+        );
+        assert_eq!(
+            app.other_effect_level("ground_effects/cold"),
+            EffectLevel::Full
+        );
+        assert_eq!(
+            app.other_effect_level("ambient_sparkles.ao"),
+            EffectLevel::Reduced
+        );
+    }
+
+    #[test]
+    fn other_toggle_to_reduced_expands_legacy_parent_preserving_siblings() {
+        let mut app = GuiApp {
+            other_catalog: Some(other_effect_catalog_rows(other_catalog_entries())),
+            ..GuiApp::default()
+        };
+        app.effect_overrides
+            .insert("ground_effects".to_string(), EffectLevel::Full);
+
+        app.set_other_effect_level("ground_effects/fire", EffectLevel::Reduced);
+
+        assert!(!app.effect_overrides.contains_key("ground_effects"));
+        assert!(!app.effect_overrides.contains_key("ground_effects/fire"));
+        assert_eq!(
+            app.effect_overrides.get("ground_effects/cold"),
+            Some(&EffectLevel::Full)
+        );
+        assert_eq!(
+            app.other_effect_level("ground_effects/fire"),
+            EffectLevel::Reduced
+        );
+        assert_eq!(
+            app.other_effect_level("ground_effects/cold"),
+            EffectLevel::Full
+        );
+        assert!(!app.effect_overrides.contains_key("ambient_sparkles.ao"));
+    }
+
+    #[test]
+    fn other_toggle_without_catalog_never_loses_legacy_parent() {
+        let mut app = GuiApp::default();
+        app.effect_overrides
+            .insert("ground_effects".to_string(), EffectLevel::Full);
+
+        // Without a catalog the broad parent cannot be expanded, so it stays.
+        app.set_other_effect_level("ground_effects/fire", EffectLevel::Reduced);
+
+        assert_eq!(
+            app.effect_overrides.get("ground_effects"),
+            Some(&EffectLevel::Full)
+        );
+    }
+
+    #[test]
+    fn other_bulk_level_applies_to_filtered_rows_only_and_keeps_skills() {
+        let mut app = GuiApp {
+            other_catalog: Some(other_effect_catalog_rows(other_catalog_entries())),
+            effect_catalog: Some(vec![EffectFolderRow {
+                folders: vec!["fireball".to_string()],
+                active_skill_id: "fireball".to_string(),
+                action_type: "GreaterFireball".to_string(),
+                display: "Fireball".to_string(),
+                display_lower: "fireball".to_string(),
+                search_lower: "fireball greaterfireball".to_string(),
+            }]),
+            ..GuiApp::default()
+        };
+        app.effect_overrides
+            .insert("fireball".to_string(), EffectLevel::Full);
+
+        app.others_search = "ground fire".to_string();
+        app.apply_other_effect_level_to_filtered_rows(EffectLevel::Full);
+        assert_eq!(
+            app.effect_overrides.get("ground_effects/fire"),
+            Some(&EffectLevel::Full)
+        );
+        assert!(!app.effect_overrides.contains_key("ground_effects/cold"));
+        assert_eq!(
+            app.effect_overrides.get("fireball"),
+            Some(&EffectLevel::Full)
+        );
+
+        app.apply_other_effect_level_to_filtered_rows(EffectLevel::Reduced);
+        assert!(!app.effect_overrides.contains_key("ground_effects/fire"));
+        assert_eq!(
+            app.effect_overrides.get("fireball"),
+            Some(&EffectLevel::Full)
+        );
+
+        app.effects_search = "fireball".to_string();
+        app.apply_effect_level_to_filtered_rows(EffectLevel::Reduced);
+        assert!(!app.effect_overrides.contains_key("fireball"));
+        assert!(!app.effect_overrides.contains_key("ground_effects/fire"));
+    }
+
+    #[test]
+    fn other_bulk_reduced_under_legacy_parent_preserves_off_filter_siblings() {
+        let mut app = GuiApp {
+            other_catalog: Some(other_effect_catalog_rows(other_catalog_entries())),
+            ..GuiApp::default()
+        };
+        app.effect_overrides
+            .insert("ground_effects".to_string(), EffectLevel::Full);
+
+        app.others_search = "ground fire".to_string();
+        app.apply_other_effect_level_to_filtered_rows(EffectLevel::Reduced);
+
+        assert!(!app.effect_overrides.contains_key("ground_effects"));
+        assert!(!app.effect_overrides.contains_key("ground_effects/fire"));
+        assert_eq!(
+            app.effect_overrides.get("ground_effects/cold"),
+            Some(&EffectLevel::Full)
+        );
+    }
+
+    #[test]
+    fn others_filter_matches_display_and_folder_text() {
+        let mut app = GuiApp {
+            other_catalog: Some(other_effect_catalog_rows(other_catalog_entries())),
+            ..GuiApp::default()
+        };
+
+        app.others_search = "ground fire".to_string();
+        app.refresh_others_filter();
+        assert_eq!(app.others_filter_rows, vec![0]);
+
+        app.others_search = "ambient_sparkles".to_string();
+        app.refresh_others_filter();
+        assert_eq!(app.others_filter_rows, vec![2]);
+
+        app.others_search.clear();
+        app.refresh_others_filter();
+        assert_eq!(app.others_filter_rows, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn skill_count_excludes_others_folders_once_others_catalog_loads() {
+        let mut app = GuiApp::default();
+        app.effect_overrides
+            .insert("fireball".to_string(), EffectLevel::Full);
+        app.effect_overrides
+            .insert("ground_effects/fire".to_string(), EffectLevel::Full);
+        app.effect_overrides
+            .insert("ground_effects".to_string(), EffectLevel::Full);
+
+        app.effect_catalog = Some(vec![EffectFolderRow {
+            folders: vec!["fireball".to_string()],
+            active_skill_id: "fireball".to_string(),
+            action_type: "GreaterFireball".to_string(),
+            display: "Fireball".to_string(),
+            display_lower: "fireball".to_string(),
+            search_lower: "fireball greaterfireball".to_string(),
+        }]);
+        assert_eq!(app.kept_original_effect_skill_count(), 3);
+        assert_eq!(app.kept_original_other_effect_count(), 0);
+
+        // Once loaded, Others folders and their broad parent move counts.
+        app.other_catalog = Some(other_effect_catalog_rows(other_catalog_entries()));
+        assert_eq!(app.kept_original_effect_skill_count(), 1);
+        assert_eq!(app.kept_original_other_effect_count(), 2);
+
+        app.set_other_effect_level("ground_effects/fire", EffectLevel::Reduced);
+        assert_eq!(app.kept_original_other_effect_count(), 1);
+        assert_eq!(app.kept_original_effect_skill_count(), 1);
+    }
+
+    fn supports_skill_row() -> EffectFolderRow {
+        EffectFolderRow {
+            folders: vec!["supports/runicsupports/bitterdead".to_string()],
+            active_skill_id: "bitterdead".to_string(),
+            action_type: "RunicSupport".to_string(),
+            display: "Bitterdead".to_string(),
+            display_lower: "bitterdead".to_string(),
+            search_lower: "bitterdead supports/runicsupports/bitterdead".to_string(),
+        }
+    }
+
+    fn supports_other_entries() -> Vec<OtherEffectCatalogEntry> {
+        vec![
+            OtherEffectCatalogEntry {
+                folder: "supports/runicsupports/unknown".to_string(),
+                display: "Unknown".to_string(),
+            },
+            OtherEffectCatalogEntry {
+                folder: "supports/sibling".to_string(),
+                display: "Sibling".to_string(),
+            },
+        ]
+    }
+
+    fn supports_app() -> GuiApp {
+        GuiApp {
+            effect_catalog: Some(vec![supports_skill_row()]),
+            other_catalog: Some(other_effect_catalog_rows(supports_other_entries())),
+            ..GuiApp::default()
+        }
+    }
+
+    #[test]
+    fn supports_parent_reducing_others_preserves_skill_sibling() {
+        let mut app = supports_app();
+        app.effect_overrides
+            .insert("supports".to_string(), EffectLevel::Full);
+
+        assert_eq!(
+            app.other_effect_level("supports/runicsupports/unknown"),
+            EffectLevel::Full
+        );
+        assert_eq!(
+            app.effect_level_for_folders(&["supports/runicsupports/bitterdead".to_string()]),
+            Some(EffectLevel::Full)
+        );
+        assert_eq!(app.kept_original_effect_skill_count(), 1);
+        assert_eq!(app.kept_original_other_effect_count(), 2);
+
+        assert!(app.set_other_effect_level("supports/runicsupports/unknown", EffectLevel::Reduced));
+
+        assert!(!app.effect_overrides.contains_key("supports"));
+        assert!(!app
+            .effect_overrides
+            .contains_key("supports/runicsupports/unknown"));
+        assert_eq!(
+            app.effect_overrides
+                .get("supports/runicsupports/bitterdead"),
+            Some(&EffectLevel::Full)
+        );
+        assert_eq!(
+            app.effect_overrides.get("supports/sibling"),
+            Some(&EffectLevel::Full)
+        );
+        assert_eq!(
+            app.other_effect_level("supports/runicsupports/unknown"),
+            EffectLevel::Reduced
+        );
+        assert_eq!(
+            app.other_effect_level("supports/sibling"),
+            EffectLevel::Full
+        );
+        assert_eq!(
+            app.effect_level_for_folders(&["supports/runicsupports/bitterdead".to_string()]),
+            Some(EffectLevel::Full)
+        );
+        assert_eq!(app.kept_original_effect_skill_count(), 1);
+        assert_eq!(app.kept_original_other_effect_count(), 1);
+    }
+
+    #[test]
+    fn supports_parent_reducing_skill_preserves_others_siblings() {
+        let mut app = supports_app();
+        app.effect_overrides
+            .insert("supports".to_string(), EffectLevel::Full);
+
+        assert!(app.set_skill_folders_level(
+            &["supports/runicsupports/bitterdead".to_string()],
+            EffectLevel::Reduced
+        ));
+
+        assert!(!app.effect_overrides.contains_key("supports"));
+        assert!(!app
+            .effect_overrides
+            .contains_key("supports/runicsupports/bitterdead"));
+        assert_eq!(
+            app.effect_overrides.get("supports/runicsupports/unknown"),
+            Some(&EffectLevel::Full)
+        );
+        assert_eq!(
+            app.effect_overrides.get("supports/sibling"),
+            Some(&EffectLevel::Full)
+        );
+        assert_eq!(
+            app.effect_level_for_folders(&["supports/runicsupports/bitterdead".to_string()]),
+            Some(EffectLevel::Reduced)
+        );
+        assert_eq!(
+            app.other_effect_level("supports/runicsupports/unknown"),
+            EffectLevel::Full
+        );
+        assert_eq!(app.kept_original_effect_skill_count(), 0);
+        assert_eq!(app.kept_original_other_effect_count(), 2);
+    }
+
+    #[test]
+    fn supports_migration_without_skill_catalog_leaves_everything_intact() {
+        let mut app = GuiApp {
+            other_catalog: Some(other_effect_catalog_rows(supports_other_entries())),
+            ..GuiApp::default()
+        };
+        app.effect_overrides
+            .insert("supports".to_string(), EffectLevel::Full);
+        app.effect_overrides
+            .insert("supports/sibling".to_string(), EffectLevel::Full);
+        app.effect_overrides.insert(
+            "supports/runicsupports/unknown".to_string(),
+            EffectLevel::Full,
+        );
+
+        // The skill sibling is unknowable without its catalog: all intact.
+        assert!(!app.set_other_effect_level("supports/runicsupports/unknown", EffectLevel::Reduced));
+        assert_eq!(
+            app.effect_overrides.get("supports"),
+            Some(&EffectLevel::Full)
+        );
+        assert_eq!(
+            app.effect_overrides.get("supports/sibling"),
+            Some(&EffectLevel::Full)
+        );
+        assert_eq!(
+            app.effect_overrides.get("supports/runicsupports/unknown"),
+            Some(&EffectLevel::Full)
+        );
+
+        app.others_search = "unknown".to_string();
+        assert!(!app.apply_other_effect_level_to_filtered_rows(EffectLevel::Reduced));
+        assert_eq!(
+            app.effect_overrides.get("supports"),
+            Some(&EffectLevel::Full)
+        );
+        assert_eq!(
+            app.effect_overrides.get("supports/runicsupports/unknown"),
+            Some(&EffectLevel::Full)
+        );
+
+        // Exact removals without a covering parent still work while incomplete.
+        let mut exact = GuiApp {
+            other_catalog: Some(other_effect_catalog_rows(supports_other_entries())),
+            ..GuiApp::default()
+        };
+        exact
+            .effect_overrides
+            .insert("supports/sibling".to_string(), EffectLevel::Full);
+        assert!(exact.set_other_effect_level("supports/sibling", EffectLevel::Reduced));
+        assert!(!exact.effect_overrides.contains_key("supports/sibling"));
+    }
+
+    #[test]
+    fn ground_migration_does_not_need_skill_catalog() {
+        let mut app = GuiApp {
+            other_catalog: Some(other_effect_catalog_rows(other_catalog_entries())),
+            ..GuiApp::default()
+        };
+        app.effect_overrides
+            .insert("ground_effects".to_string(), EffectLevel::Full);
+
+        assert!(app.set_other_effect_level("ground_effects/fire", EffectLevel::Reduced));
+        assert!(!app.effect_overrides.contains_key("ground_effects"));
+        assert_eq!(
+            app.effect_overrides.get("ground_effects/cold"),
+            Some(&EffectLevel::Full)
+        );
+    }
+
+    #[test]
+    fn skill_effect_level_and_counts_follow_inherited_parents() {
+        let mut app = supports_app();
+        app.effect_overrides
+            .insert("supports".to_string(), EffectLevel::Full);
+
+        assert_eq!(
+            app.effect_level_for_folders(&["supports/runicsupports/bitterdead".to_string()]),
+            Some(EffectLevel::Full)
+        );
+        assert_eq!(app.kept_original_effect_skill_count(), 1);
+
+        app.effect_catalog = Some(vec![EffectFolderRow {
+            folders: vec![
+                "supports/runicsupports/bitterdead".to_string(),
+                "fireball".to_string(),
+            ],
+            active_skill_id: "mixed".to_string(),
+            action_type: "Mixed".to_string(),
+            display: "Mixed".to_string(),
+            display_lower: "mixed".to_string(),
+            search_lower: "mixed".to_string(),
+        }]);
+        assert_eq!(
+            app.effect_level_for_folders(&[
+                "supports/runicsupports/bitterdead".to_string(),
+                "fireball".to_string()
+            ]),
+            None
+        );
+        assert_eq!(app.kept_original_effect_skill_count(), 1);
+    }
+
+    #[test]
+    fn active_tab_loading_invalidates_stale_skill_and_other_catalogs() {
+        let mut app = GuiApp {
+            effect_catalog: Some(vec![supports_skill_row()]),
+            effect_catalog_dir: Some(PathBuf::from("/install/A")),
+            other_catalog: Some(other_effect_catalog_rows(supports_other_entries())),
+            other_catalog_dir: Some(PathBuf::from("/install/A")),
+            game_dir_input: "/install/B".to_string(),
+            effects_editor_tab: EffectsEditorTab::Others,
+            ..GuiApp::default()
+        };
+
+        app.ensure_active_effects_tab_loading();
+
+        // Stale catalogs must not be trusted across game directories.
+        assert!(app.effect_catalog.is_none());
+        assert!(app.other_catalog.is_none());
+        assert!(app.effect_catalog_task.is_some());
+        assert!(app.other_catalog_task.is_some());
+    }
+
+    #[test]
+    fn effects_editor_accessible_for_effects_or_particles_only() {
+        let mut app = GuiApp::default();
+        app.selected_patches.clear();
+        assert!(!app.effects_editor_accessible());
+
+        app.selected_patches.insert(PatchId::Effects);
+        assert!(app.effects_editor_accessible());
+
+        app.selected_patches.clear();
+        app.selected_patches.insert(PatchId::Particles);
+        assert!(app.effects_editor_accessible());
+
+        app.selected_patches.insert(PatchId::Effects);
+        assert!(app.effects_editor_accessible());
+    }
+
+    #[test]
+    fn prefs_round_trip_others_folders_through_existing_effect_skills_field() {
+        let app = GuiApp::from_prefs(GuiPrefs {
+            game_dir_input: String::new(),
+            selected_patches: vec!["fog".to_string()],
+            zoom: 2.4,
+            color_mods: Vec::new(),
+            effect_skills: vec![
+                EffectSkillOverride {
+                    folder: "fireball".to_string(),
+                    level: EffectLevel::Full,
+                },
+                EffectSkillOverride {
+                    folder: "ground_effects/fire".to_string(),
+                    level: EffectLevel::Full,
+                },
+            ],
+            monster_effects: Vec::new(),
+        });
+
+        assert_eq!(
+            app.effect_overrides.get("ground_effects/fire"),
+            Some(&EffectLevel::Full)
+        );
+        assert_eq!(
+            app.prefs().effect_skills,
+            vec![
+                EffectSkillOverride {
+                    folder: "fireball".to_string(),
+                    level: EffectLevel::Full,
+                },
+                EffectSkillOverride {
+                    folder: "ground_effects/fire".to_string(),
+                    level: EffectLevel::Full,
+                },
+            ]
+        );
+        let request = app.patch_request().unwrap();
+        assert!(request.params.effect_skills.contains(&EffectSkillOverride {
+            folder: "ground_effects/fire".to_string(),
+            level: EffectLevel::Full,
+        }));
+    }
+
+    #[test]
+    fn other_catalog_invalidates_only_when_game_dir_changes() {
+        let mut app = GuiApp {
+            other_catalog: Some(other_effect_catalog_rows(other_catalog_entries())),
+            other_catalog_dir: Some(PathBuf::from("/install/A")),
+            others_filter_key: Some(("q".to_string(), 3)),
+            others_filter_rows: vec![0],
+            ..GuiApp::default()
+        };
+        app.effect_overrides
+            .insert("ground_effects/fire".to_string(), EffectLevel::Full);
+
+        app.invalidate_other_effect_catalog_if_stale(&Some(PathBuf::from("/install/A")));
+        assert!(app.other_catalog.is_some());
+        assert!(app.others_filter_key.is_some());
+        assert_eq!(app.others_filter_rows, vec![0]);
+
+        // Different dir resets catalog + cache, keeping overrides.
+        app.invalidate_other_effect_catalog_if_stale(&Some(PathBuf::from("/install/B")));
+        assert!(app.other_catalog.is_none());
+        assert!(app.other_catalog_task.is_none());
+        assert!(app.other_catalog_error.is_none());
+        assert!(app.others_filter_key.is_none());
+        assert!(app.others_filter_rows.is_empty());
+        assert_eq!(
+            app.effect_overrides.get("ground_effects/fire"),
+            Some(&EffectLevel::Full)
+        );
     }
 
     fn catalog_row(stat_id: &str, text: &str) -> CatalogRow {

@@ -1,5 +1,6 @@
 use super::catalog::{patch_label, PatchChange, PatchId, PatchParams, PatchSet};
 use super::color_mods::ColorMatcher;
+use super::effect_dependencies::resolve_full_effect_dependencies;
 use super::effect_skills::EffectsFilter;
 use super::monster_effects::resolve_full_monster_effect_paths;
 use super::targeting::{
@@ -22,14 +23,22 @@ pub fn compute_patch_set(
     let patches = unique_patches(patches);
     let color_matcher = ColorMatcher::new(&params.color_mods);
     // Per-monster exclusions are resolved against the live index, but only
-    // when Effects is selected and Full monster overrides exist — the
+    // when Effects or Particles is selected and Full monster overrides exist — the
     // default path stays free of extra reads and byte-identical.
-    let full_monster_paths = if patches.contains(&PatchId::Effects) {
+    let protects_visuals =
+        patches.contains(&PatchId::Effects) || patches.contains(&PatchId::Particles);
+    let full_monster_paths = if protects_visuals {
         resolve_full_monster_effect_paths(store, index, &params.monster_effects)?
     } else {
         BTreeSet::new()
     };
-    let effects_filter = EffectsFilter::new(&params.effect_skills, full_monster_paths);
+    let mut effects_filter = EffectsFilter::new(&params.effect_skills, full_monster_paths);
+    if protects_visuals {
+        if let Some(filter) = effects_filter.as_mut() {
+            let dependencies = resolve_full_effect_dependencies(store, index, filter)?;
+            filter.protect_paths(dependencies);
+        }
+    }
     let ctx = TransformCtx {
         zoom: params.zoom,
         color: color_matcher.as_ref(),
@@ -85,6 +94,12 @@ fn collect_patch_targets(
     // Effects is the one filter-aware patch: Full folders are never read.
     let targets_path = |patch: PatchId, path: &str| match patch {
         PatchId::Effects => effects_targets_path(path, effects),
+        PatchId::Particles => {
+            patch_targets_path(patch, path)
+                && effects.is_none_or(|filter| {
+                    filter.level_for(path) != super::effect_skills::EffectLevel::Full
+                })
+        }
         _ => patch_targets_path(patch, path),
     };
     let mut targets: HashMap<PatchId, Vec<(String, BundleFile)>> = patches
@@ -129,16 +144,14 @@ fn collect_patch_targets(
     for &patch in &patches {
         let patch_targets = targets.remove(&patch).unwrap_or_default();
         if patch_targets.is_empty() {
-            let full_filter_removed_all_effects = patch == PatchId::Effects
-                && effects.is_some_and(|f| f.has_full())
-                && index.paths().iter().any(|path| {
-                    effects_targets_path(path, None) && index.file_by_path(path).is_some()
-                });
+            let full_filter_removed_all_effects =
+                matches!(patch, PatchId::Effects | PatchId::Particles)
+                    && effects.is_some_and(|f| f.has_full())
+                    && index.paths().iter().any(|path| {
+                        patch_targets_path(patch, path) && index.file_by_path(path).is_some()
+                    });
             if full_filter_removed_all_effects {
-                bail!(
-                    "patch 'effects' matches no files;\n\
-                     some skills or monsters keep original visuals in Edit skills… / Edit monsters… — change some levels or deselect effects"
-                );
+                continue;
             }
             bail!(
                 "patch '{}' has no matching files in this game version;\n\
@@ -564,7 +577,7 @@ mod tests {
     }
 
     #[test]
-    fn all_full_effect_selection_reports_a_tailored_error() {
+    fn all_full_effect_selection_is_a_valid_noop() {
         use super::super::effect_skills::{EffectLevel, EffectSkillOverride};
 
         let mut index = BundleIndex::for_test_paths(&[(
@@ -581,13 +594,11 @@ mod tests {
         )
         .unwrap();
 
-        let err =
-            collect_patch_targets(&mut index, &[PatchId::Effects], Some(&filter)).unwrap_err();
-
-        let msg = err.to_string();
-        assert!(msg.contains("keep original visuals"));
-        assert!(msg.contains("Edit skills"));
-        assert!(msg.contains("Edit monsters"));
+        assert!(
+            collect_patch_targets(&mut index, &[PatchId::Effects], Some(&filter))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -631,5 +642,124 @@ mod tests {
 
         assert!(!paths.contains(&startup_scene.to_string()));
         assert!(paths.contains(&"metadata/terrain/trees/tree.ao".to_string()));
+    }
+    #[test]
+    fn kept_ground_preserves_transitive_particles_while_other_effects_are_reduced() {
+        use crate::bundle::pack_uncompressed_bundle;
+        use crate::patches::text::encode_utf16_bom;
+        use crate::patches::{EffectLevel, EffectSkillOverride};
+        let temp = tempfile::tempdir().unwrap();
+        let bundle_dir = temp.path().join("Bundles2");
+        std::fs::create_dir(&bundle_dir).unwrap();
+        let effect = |reference: &str| {
+            encode_utf16_bom(&format!(
+                "version 3\nclient\n{{\nParticleEffects\n{{\n filename = \"{reference}\"\n}}\n}}"
+            ))
+        };
+        let sources = [
+            (
+                "metadata/effects/spells/ground_effects_v3/burning/burning_grd.ao",
+                effect("Metadata/Effects/Spells/shared/burning.epk"),
+            ),
+            (
+                "metadata/effects/spells/shared/burning.epk",
+                b"Metadata/Effects/Spells/shared/child.ao".to_vec(),
+            ),
+            (
+                "metadata/effects/spells/shared/child.ao",
+                effect("Metadata/Particles/ground_effects_v3/burning/flames.pet"),
+            ),
+            (
+                "metadata/particles/ground_effects_v3/burning/flames.pet",
+                encode_utf16_bom("Metadata/Particles/shared/burning.trl"),
+            ),
+            (
+                "metadata/particles/shared/burning.trl",
+                encode_utf16_bom("Metadata/Effects/Spells/shared/burning.epk"),
+            ),
+            (
+                "metadata/particles/unrelated/flames.pet",
+                encode_utf16_bom("original particle"),
+            ),
+            (
+                "metadata/effects/spells/cold_arcticarmour/arcticarmor.ao",
+                effect("Metadata/Particles/ground_effects_v3/burning/flames.pet"),
+            ),
+            (
+                "metadata/effects/spells/ground_effects_v3/shocked/ground.ao",
+                effect("shock.pet"),
+            ),
+            (
+                "metadata/effects/spells/crossbow_oilgrenade/oil.ao",
+                effect("oil.pet"),
+            ),
+        ];
+        let names: Vec<_> = (0..sources.len()).map(|i| format!("fixture{i}")).collect();
+        for ((_, bytes), name) in sources.iter().zip(&names) {
+            std::fs::write(
+                bundle_dir.join(format!("{name}.bundle.bin")),
+                pack_uncompressed_bundle(bytes).unwrap(),
+            )
+            .unwrap();
+        }
+        let entries: Vec<_> = sources
+            .iter()
+            .zip(&names)
+            .map(|((path, bytes), name)| (*path, name.as_str(), bytes.len() as u32))
+            .collect();
+        let mut index = BundleIndex::for_test_paths(&entries);
+        let store = BundleStore::new(temp.path());
+        let params = PatchParams {
+            effect_skills: vec![
+                EffectSkillOverride {
+                    folder: "ground_effects_v3/burning".into(),
+                    level: EffectLevel::Full,
+                },
+                EffectSkillOverride {
+                    folder: "crossbow_oilgrenade".into(),
+                    level: EffectLevel::Full,
+                },
+            ],
+            ..Default::default()
+        };
+        for patches in [
+            vec![PatchId::Effects, PatchId::Particles],
+            vec![PatchId::Particles, PatchId::Effects],
+        ] {
+            let result = compute_patch_set(&store, &mut index, &patches, &params).unwrap();
+            let changed: BTreeSet<_> = result.changes.iter().map(|c| c.path.as_str()).collect();
+            assert_eq!(
+                changed,
+                BTreeSet::from([
+                    "metadata/particles/unrelated/flames.pet",
+                    "metadata/effects/spells/cold_arcticarmour/arcticarmor.ao",
+                    "metadata/effects/spells/ground_effects_v3/shocked/ground.ao",
+                ])
+            );
+        }
+        // Full protection also holds when Effects is deselected but Particles
+        // is enabled, and does not depend on which patch appears first.
+        let result = compute_patch_set(&store, &mut index, &[PatchId::Particles], &params).unwrap();
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(
+            result.changes[0].path,
+            "metadata/particles/unrelated/flames.pet"
+        );
+        // Removing the ground override restores reduction of both the ground
+        // effect and its particles; the unrelated Oil Grenade override stays.
+        let reduced = PatchParams {
+            effect_skills: vec![params.effect_skills[1].clone()],
+            ..Default::default()
+        };
+        let result = compute_patch_set(
+            &store,
+            &mut index,
+            &[PatchId::Effects, PatchId::Particles],
+            &reduced,
+        )
+        .unwrap();
+        for path in [sources[0].0, sources[2].0, sources[3].0, sources[4].0] {
+            assert!(result.changes.iter().any(|c| c.path == path), "{path}");
+        }
     }
 }
