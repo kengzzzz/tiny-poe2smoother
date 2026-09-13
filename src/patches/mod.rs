@@ -3,8 +3,10 @@ mod catalog;
 mod color_mods;
 #[doc(hidden)]
 pub mod datc64;
+mod effect_dependencies;
 mod effect_skills;
 mod monster_effects;
+mod other_effects;
 mod targeting;
 mod text;
 mod transform;
@@ -27,5 +29,6 @@ pub use effect_skills::{
 pub use monster_effects::{
     build_monster_effect_catalog, MonsterEffectCatalogEntry, MonsterEffectOverride,
 };
+pub use other_effects::{build_other_effect_catalog, OtherEffectCatalogEntry};
 pub(crate) use text::decode_utf16;
 pub use transform::audit_transform;

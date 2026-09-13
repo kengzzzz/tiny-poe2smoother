@@ -352,11 +352,7 @@ impl BundleStore {
         Ok(key_before)
     }
 
-    fn ensure_source_unchanged(
-        &self,
-        source_key: &Option<CacheKey>,
-        phase: &str,
-    ) -> Result<()> {
+    fn ensure_source_unchanged(&self, source_key: &Option<CacheKey>, phase: &str) -> Result<()> {
         if &self.cache_key()? != source_key {
             bail!(
                 "game data changed while {phase} the bundle index; \
@@ -1290,8 +1286,7 @@ mod tests {
         }
         raw.write_u32::<LittleEndian>(0).unwrap(); // file count
         raw.write_u32::<LittleEndian>(1).unwrap(); // directory count
-        raw.write_u64::<LittleEndian>(0x07E47507B4A92E53)
-            .unwrap();
+        raw.write_u64::<LittleEndian>(0x07E47507B4A92E53).unwrap();
         raw.extend_from_slice(&[0; 12]);
         raw.extend_from_slice(&crate::bundle::pack_uncompressed_bundle(&[]).unwrap());
         crate::bundle::pack_uncompressed_bundle(&raw).unwrap()

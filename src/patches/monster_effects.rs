@@ -72,7 +72,13 @@ pub struct MonsterEffectCatalogEntry {
 /// buff (`abyss_lightless_well` in `buffdefinitions`/`buffvisuals`).
 const MONSTER_SEARCH_ALIASES: &[(&str, &[&str])] = &[(
     "metadata/monsters/leagueabyss/lichboss/kulemakboss",
-    &["amanamu", "ulaman", "kurgal", "abyssal lich", "liege of the void"],
+    &[
+        "amanamu",
+        "ulaman",
+        "kurgal",
+        "abyssal lich",
+        "liege of the void",
+    ],
 )];
 
 fn search_aliases_for(monster_keys: &[String]) -> Vec<String> {
@@ -281,8 +287,8 @@ fn catalog_rows(
 
     let mut by_group: BTreeMap<(String, String, bool), MonsterEffectCatalogEntry> = BTreeMap::new();
     for (key, edge) in edges {
-        let listed = !edge.high.is_empty()
-            || edge.refs.iter().any(|path| reaching_refs.contains(path));
+        let listed =
+            !edge.high.is_empty() || edge.refs.iter().any(|path| reaching_refs.contains(path));
         if !listed {
             continue;
         }
@@ -560,7 +566,10 @@ fn collect_table_edges(bytes: &[u8], monster_keys: &BTreeSet<String>, edges: &mu
         }
         let mut target_paths: Vec<String> = Vec::new();
         let mut ref_paths: Vec<String> = Vec::new();
-        for path in strings.iter().filter_map(|value| normalized_metadata_path(value)) {
+        for path in strings
+            .iter()
+            .filter_map(|value| normalized_metadata_path(value))
+        {
             if is_effects_patch_target(&path) {
                 target_paths.push(path);
             } else if is_scannable_effect_file(&path) {
@@ -779,9 +788,9 @@ fn monster_display_names(bytes: &[u8], known_keys: &BTreeSet<String>) -> HashMap
         return displays;
     };
     for row in table.rows() {
-        let Some(display) = string_at_column(row, table.heap(), column).and_then(|value| {
-            monster_display(&value)
-        }) else {
+        let Some(display) =
+            string_at_column(row, table.heap(), column).and_then(|value| monster_display(&value))
+        else {
             continue;
         };
         let Some(key) = string_at_column(row, table.heap(), path_column)
@@ -943,7 +952,10 @@ fn normalized_metadata_path(value: &str) -> Option<String> {
     let normalized = normalize_path(value);
     let start = normalized.find("metadata/")?;
     let path = normalized[start..].trim_matches(|ch: char| {
-        matches!(ch, '"' | '\'' | ')' | '}' | ';' | ',' | '\r' | '\n' | ' ' | '\t')
+        matches!(
+            ch,
+            '"' | '\'' | ')' | '}' | ';' | ',' | '\r' | '\n' | ' ' | '\t'
+        )
     });
     (!path.is_empty()).then(|| path.to_string())
 }
@@ -1090,10 +1102,19 @@ mod tests {
             // attachment rigs, arena markers, standalone effect helpers).
             ("metadata/monsters/boghulk/attachments/arm.ao", None),
             ("metadata/monsters/boghulk/objects/rock.ot", None),
-            ("metadata/monsters/mastodonboss/effects/mastodonspikes.ao", None),
-            ("metadata/monsters/hyenamonster/effects/ao/footstep.ao", None),
+            (
+                "metadata/monsters/mastodonboss/effects/mastodonspikes.ao",
+                None,
+            ),
+            (
+                "metadata/monsters/hyenamonster/effects/ao/footstep.ao",
+                None,
+            ),
             ("metadata/monsters/balbala/arenaobjects/clone_rune.ot", None),
-            ("metadata/monsters/forsakenson/bossarenaobjects/flamewall.ot", None),
+            (
+                "metadata/monsters/forsakenson/bossarenaobjects/flamewall.ot",
+                None,
+            ),
             ("metadata/monsters/owlboss/boss_objects/snowball.ot", None),
             // A file merely *named* like a helper folder is still a monster.
             (
@@ -1121,9 +1142,17 @@ other = "Metadata/Effects/utility/epks/off.ao"
 "#;
         let mut edges = EdgeMap::new();
 
-        collect_metadata_ref_edges("metadata/monsters/boghulk/boghulk", &utf16_file(text), &mut edges);
+        collect_metadata_ref_edges(
+            "metadata/monsters/boghulk/boghulk",
+            &utf16_file(text),
+            &mut edges,
+        );
         // UTF-8 (no BOM) files scan the same way.
-        collect_metadata_ref_edges("metadata/monsters/boghulk/boghulk", text.as_bytes(), &mut edges);
+        collect_metadata_ref_edges(
+            "metadata/monsters/boghulk/boghulk",
+            text.as_bytes(),
+            &mut edges,
+        );
 
         let edge = &edges["metadata/monsters/boghulk/boghulk"];
         assert_eq!(
@@ -1147,8 +1176,7 @@ other = "Metadata/Effects/utility/epks/off.ao"
 
     #[test]
     fn table_edges_require_monster_and_effect_in_same_row() {
-        let keys: BTreeSet<String> =
-            [("metadata/monsters/boghulk/boghulk".to_string())].into();
+        let keys: BTreeSet<String> = [("metadata/monsters/boghulk/boghulk".to_string())].into();
         let bytes = table(&[
             &[
                 "Metadata/Monsters/BogHulk/BogHulk.ot",
@@ -1226,8 +1254,7 @@ other = "Metadata/Effects/utility/epks/off.ao"
         assert_eq!(
             edge.low.iter().cloned().collect::<Vec<_>>(),
             vec![
-                "metadata/effects/spells/monsters_effects/act4/anchormangreen/death.ao"
-                    .to_string()
+                "metadata/effects/spells/monsters_effects/act4/anchormangreen/death.ao".to_string()
             ]
         );
     }
@@ -1312,7 +1339,10 @@ other = "Metadata/Effects/utility/epks/off.ao"
         );
         // CamelCase internal ids, paths, markers, lowercase ids.
         assert_eq!(monster_display("SummonedSkeleton"), None);
-        assert_eq!(monster_display("Metadata/Monsters/BogHulk/BogHulk.ot"), None);
+        assert_eq!(
+            monster_display("Metadata/Monsters/BogHulk/BogHulk.ot"),
+            None
+        );
         assert_eq!(monster_display("art\\models\\thing"), None);
         assert_eq!(monster_display("DISCONTINUED Bog Hulk"), None);
         assert_eq!(monster_display("bog_hulk"), None);
@@ -1373,7 +1403,11 @@ other = "Metadata/Effects/utility/epks/off.ao"
         // monstervarieties spelling) must key the display map.
         let varieties = table(&[
             &["Metadata/Monsters/BogHulk/BogHulk", "Any", "Bog Hulk"],
-            &["Metadata/Monsters/SandSpitter/SandSpitter", "Any", "Sand Spitter"],
+            &[
+                "Metadata/Monsters/SandSpitter/SandSpitter",
+                "Any",
+                "Sand Spitter",
+            ],
             &["Metadata/Monsters/Unnamed/Unnamed", "Any", ""],
         ]);
         let known_keys: BTreeSet<String> = [
@@ -1742,7 +1776,10 @@ epk = "Metadata\Effects\Utility\epks\pack.epk"
         let rows = catalog_rows(&edges, None, &reaching, &known_keys);
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].monster_keys, vec!["metadata/monsters/boghulk/boghulk".to_string()]);
+        assert_eq!(
+            rows[0].monster_keys,
+            vec!["metadata/monsters/boghulk/boghulk".to_string()]
+        );
     }
 
     #[test]
@@ -1762,7 +1799,10 @@ epk = "Metadata\Effects\Utility\epks\pack.epk"
         ];
         let varieties = table(&[
             &["Metadata/Monsters/Daemon/BossDaemon", "Mob Daemon"],
-            &["Metadata/Monsters/LeagueDelirium/DaemonSpawner", "Mob Daemon"],
+            &[
+                "Metadata/Monsters/LeagueDelirium/DaemonSpawner",
+                "Mob Daemon",
+            ],
         ]);
 
         let rows = monster_effect_catalog_from_parts(&monster_files, Some(&varieties), &[]);
@@ -2266,10 +2306,8 @@ epk = "Metadata\Effects\Utility\epks\pack.epk"
     #[test]
     fn normalized_metadata_path_trims_embedded_noise() {
         assert_eq!(
-            normalized_metadata_path(
-                r#"AddEffectPack( "Metadata/Effects/Spells/x/y.ao" );"#
-            )
-            .as_deref(),
+            normalized_metadata_path(r#"AddEffectPack( "Metadata/Effects/Spells/x/y.ao" );"#)
+                .as_deref(),
             Some("metadata/effects/spells/x/y.ao")
         );
         assert_eq!(

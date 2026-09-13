@@ -110,7 +110,16 @@ pub(super) fn transform(
             ],
         ),
         PatchId::Delirium => delirium(bytes),
-        PatchId::Particles => particles(path, bytes),
+        PatchId::Particles => {
+            if ctx
+                .effects
+                .is_some_and(|filter| filter.level_for(path) == EffectLevel::Full)
+            {
+                Ok(bytes.to_vec())
+            } else {
+                particles(path, bytes)
+            }
+        }
         PatchId::Effects => effects(path, bytes, ctx.effects),
         PatchId::DisableSounds => strip_sounds(path, bytes),
         PatchId::SkillSounds => strip_sounds(path, bytes),

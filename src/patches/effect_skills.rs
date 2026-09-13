@@ -7,7 +7,7 @@ use serde::{
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
-const SPELLS_PREFIX: &str = "metadata/effects/spells/";
+pub(super) const SPELLS_PREFIX: &str = "metadata/effects/spells/";
 const MIN_LABEL_ALIAS_LEN: usize = 4;
 
 /// How the `Effects` patch treats one skill effect directory under
@@ -55,11 +55,12 @@ impl<'de> Visitor<'de> for EffectLevelVisitor {
 
 const OLD_EFFECT_LEVEL: &str = concat!("hid", "den");
 
-/// One persisted non-default per-skill setting. `folder` is a lowercase
-/// relative directory under `metadata/effects/spells/`, usually its top-level
+/// One persisted non-default skill or Others setting. `folder` is a lowercase
+/// relative scope under `metadata/effects/spells/`, usually its top-level
 /// segment (e.g. "cold_herald_of_ice"). Shared support containers retain the
 /// skill-specific suffix (e.g. "supports/runicsupports/bitterdead"). Folders
-/// without an override are `Reduced`.
+/// without an override are `Reduced`. Others also uses individual ground
+/// subdirectories and exact paths for loose effect files.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EffectSkillOverride {
     pub folder: String,
@@ -77,8 +78,8 @@ pub struct EffectSkillCatalogEntry {
 
 /// Per-request view over the overrides. `None` (no overrides at all) keeps
 /// target collection and transforms byte-identical to the unfiltered
-/// behavior. `full_paths` holds the per-monster exclusions: exact normalized
-/// lowercase patch-target paths kept original (see `monster_effects`).
+/// behavior. `full_paths` holds per-monster exclusions and the references of
+/// kept visuals, including particle files outside the selected folder.
 #[derive(Debug)]
 pub(super) struct EffectsFilter {
     full_folders: BTreeSet<String>,
@@ -93,7 +94,7 @@ impl EffectsFilter {
         let full_folders: BTreeSet<_> = overrides
             .iter()
             .filter(|entry| entry.level == EffectLevel::Full)
-            .map(|entry| entry.folder.to_ascii_lowercase())
+            .map(|entry| super::targeting::normalize_path(&entry.folder))
             .collect();
         (!full_folders.is_empty() || !full_paths.is_empty()).then_some(Self {
             full_folders,
@@ -106,15 +107,16 @@ impl EffectsFilter {
         if let Some(relative) = normalized.strip_prefix(SPELLS_PREFIX) {
             // Check every directory ancestor so old persisted top-level keys
             // such as `supports` still keep the whole subtree original.
-            if relative
-                .match_indices('/')
-                .any(|(end, _)| self.full_folders.contains(&relative[..end]))
+            if self.full_folders.contains(relative)
+                || relative
+                    .match_indices('/')
+                    .any(|(end, _)| self.full_folders.contains(&relative[..end]))
             {
                 return EffectLevel::Full;
             }
         }
-        // Monster exclusions are exact paths and compose with the skill
-        // directory-prefix checks above.
+        // Monster exclusions and visual dependencies are exact paths and
+        // compose with the directory-prefix checks above. Full always wins.
         if !self.full_paths.is_empty() && self.full_paths.contains(&normalized) {
             return EffectLevel::Full;
         }
@@ -123,6 +125,10 @@ impl EffectsFilter {
 
     pub(super) fn has_full(&self) -> bool {
         !self.full_folders.is_empty() || !self.full_paths.is_empty()
+    }
+
+    pub(super) fn protect_paths(&mut self, paths: BTreeSet<String>) {
+        self.full_paths.extend(paths);
     }
 }
 
@@ -140,14 +146,21 @@ pub(super) fn spells_folder(path: &str) -> Option<&str> {
 }
 
 /// The independently overridable effect directory for a skill path. Most
-/// skills own one top-level directory. `supports/` is a shared container, so
-/// use its child directory; Runic supports share one more container level.
-fn effect_skill_folder(path: &str) -> Option<String> {
+/// skills own one top-level directory. Ground effects and `supports/` use
+/// child directories; Runic supports share one more container level.
+pub(super) fn effect_skill_folder(path: &str) -> Option<String> {
     if !starts_with_path_ci(path, SPELLS_PREFIX) {
         return None;
     }
     let top = spells_folder(path)?;
     let segments: Vec<_> = path[SPELLS_PREFIX.len()..].split(['/', '\\']).collect();
+    if is_shared_effect_folder(top) && segments.len() >= 3 {
+        return Some(format!(
+            "{}/{}",
+            top.to_ascii_lowercase(),
+            segments[1].to_ascii_lowercase()
+        ));
+    }
     if !top.eq_ignore_ascii_case("supports") || segments.len() < 3 {
         return Some(top.to_ascii_lowercase());
     }
@@ -161,6 +174,20 @@ fn effect_skill_folder(path: &str) -> Option<String> {
     } else {
         Some(format!("supports/{}", child.to_ascii_lowercase()))
     }
+}
+
+/// Ground visuals are shared by many skills and monsters. A reference from
+/// one skill's table row is not evidence that the skill owns the container.
+pub(super) fn is_shared_effect_folder(folder: &str) -> bool {
+    matches!(
+        folder
+            .split(['/', '\\'])
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str(),
+        "ground_effects" | "ground_effects_v2" | "ground_effects_v3"
+    )
 }
 
 /// Distinct sorted lowercase skill effect directories that contain at least
@@ -187,7 +214,10 @@ pub fn build_effect_skill_catalog(
     paths: &[String],
 ) -> Option<Vec<EffectSkillCatalogEntry>> {
     let skills = active_skills_with_actions(activeskills_bytes, actiontypes_bytes)?;
-    let valid_folders: BTreeSet<String> = effect_skill_folders(paths).into_iter().collect();
+    let valid_folders: BTreeSet<String> = effect_skill_folders(paths)
+        .into_iter()
+        .filter(|folder| !is_shared_effect_folder(folder) && folder != "monsters_effects")
+        .collect();
     if valid_folders.is_empty() {
         return Some(Vec::new());
     }
@@ -258,7 +288,7 @@ struct ActiveSkillEffectRow {
 impl ActiveSkillEffectRow {
     fn label_aliases(&self) -> Vec<(String, AliasRank)> {
         let mut aliases = Vec::new();
-        push_unique_alias(&mut aliases, self.action_key.clone(), AliasRank::Action);
+        push_min_len_alias(&mut aliases, self.action_key.clone(), AliasRank::Action);
         push_min_len_alias(
             &mut aliases,
             normalize_label_key(&self.display),
@@ -911,10 +941,9 @@ mod tests {
 
     #[test]
     fn filter_resolves_monster_paths_exactly_and_composes_with_folders() {
-        let monster_paths: BTreeSet<String> = [
-            "metadata/effects/spells/monsters_effects/act3/anchoritemother/idle.ao".to_string(),
-        ]
-        .into();
+        let monster_paths: BTreeSet<String> =
+            ["metadata/effects/spells/monsters_effects/act3/anchoritemother/idle.ao".to_string()]
+                .into();
         // Monster paths alone are enough to construct a filter.
         let filter = EffectsFilter::new(&[], monster_paths.clone()).unwrap();
         assert!(filter.has_full());
@@ -926,7 +955,9 @@ mod tests {
         );
         // Sibling files of the same monster folder stay Reduced.
         assert_eq!(
-            filter.level_for("metadata/effects/spells/monsters_effects/act3/anchoritemother/death.ao"),
+            filter.level_for(
+                "metadata/effects/spells/monsters_effects/act3/anchoritemother/death.ao"
+            ),
             EffectLevel::Reduced
         );
 
@@ -944,9 +975,8 @@ mod tests {
             EffectLevel::Full
         );
         assert_eq!(
-            filter.level_for(
-                "metadata/effects/spells/monsters_effects/act3/anchoritemother/idle.ao"
-            ),
+            filter
+                .level_for("metadata/effects/spells/monsters_effects/act3/anchoritemother/idle.ao"),
             EffectLevel::Full
         );
         assert_eq!(
@@ -1657,6 +1687,55 @@ mod tests {
     }
 
     #[test]
+    fn effect_catalog_ignores_short_action_prefix_of_longer_word() {
+        let activeskills = build_activeskills_with_actions(&[
+            ("arc", "Arc", 0),
+            ("vaal_arc", "Vaal Arc", 0),
+            ("lightless_stalker_arc_beam", "Haunting Chain", 0),
+            ("new_new_arctic_armour", "Arctic Armour", 1),
+            ("oil_grenade", "Oil Grenade", 2),
+        ]);
+        let actiontypes = build_actiontypes_bytes(&["Arc", "NewNewArcticArmour", "Grenade"]);
+        let miscanimated = build_miscanimated_bytes(&[
+            (
+                "ArcticArmourStages",
+                "Metadata/Effects/Spells/cold_arcticarmour/arcticArmor.ao",
+            ),
+            ("ArcChainImpact", "Metadata/Effects/Spells/arc/chain.ao"),
+            (
+                "OilGrenadeExplosion",
+                "Metadata/Effects/Spells/crossbow_oilgrenade/oil_Burst.ao",
+            ),
+        ]);
+        let paths = effect_paths(&[
+            "metadata/effects/spells/cold_arcticarmour/arcticArmor.ao",
+            "metadata/effects/spells/arc/chain.ao",
+            "metadata/effects/spells/lightning_arc/beam.ao",
+            "metadata/effects/spells/crossbow_oilgrenade/oil_Burst.ao",
+        ]);
+        let rows = build_effect_skill_catalog(
+            &activeskills,
+            &actiontypes,
+            None,
+            Some(&miscanimated),
+            &paths,
+        )
+        .unwrap();
+        assert_eq!(
+            row(&rows, "new_new_arctic_armour").folders,
+            vec!["cold_arcticarmour".to_string()]
+        );
+        assert_eq!(
+            row(&rows, "oil_grenade").folders,
+            vec!["crossbow_oilgrenade".to_string()]
+        );
+        assert_eq!(
+            row(&rows, "arc").folders,
+            vec!["arc".to_string(), "lightning_arc".to_string()]
+        );
+    }
+
+    #[test]
     fn parse_table_skips_false_marker_inside_row_data() {
         // 3 rows x 16 bytes. Row 0's second field is the heap marker's own
         // bytes (0xBB x8) -- a decoy a naive first-match scan would mistake for
@@ -1697,5 +1776,58 @@ mod tests {
         assert_eq!(utf16le_string_at(&with_nul, 0).as_deref(), Some("Hi"));
         // The same bytes without a terminator run off the end of the heap.
         assert_eq!(utf16le_string_at(&terminated, 0), None);
+    }
+    #[test]
+    fn shared_ground_is_not_owned_by_a_skill_even_with_a_direct_table_reference() {
+        let active = build_activeskills_with_actions(&[("despair", "Despair", 0)]);
+        let actions = build_actiontypes_bytes(&["Despair"]);
+        let misc = build_miscanimated_bytes(&[
+            (
+                "DespairGround",
+                "Metadata/Effects/Spells/ground_effects/despair_geyser/ground_rig.ao",
+            ),
+            ("DespairCast", "Metadata/Effects/Spells/despair/cast.ao"),
+        ]);
+        let paths = effect_paths(&[
+            "metadata/effects/spells/ground_effects/despair_geyser/ground_rig.ao",
+            "metadata/effects/spells/despair/cast.ao",
+        ]);
+        let rows =
+            build_effect_skill_catalog(&active, &actions, None, Some(&misc), &paths).unwrap();
+        assert_eq!(row(&rows, "despair").folders, vec!["despair".to_string()]);
+    }
+
+    #[test]
+    fn other_scopes_support_legacy_parents_and_exact_loose_files() {
+        let filter = EffectsFilter::new(
+            &[
+                EffectSkillOverride {
+                    folder: "Ground_Effects_V3".into(),
+                    level: EffectLevel::Full,
+                },
+                EffectSkillOverride {
+                    folder: "loose.ao".into(),
+                    level: EffectLevel::Full,
+                },
+            ],
+            BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            filter.level_for("Metadata/Effects/Spells/ground_effects_v3/burning/burning_grd.ao"),
+            EffectLevel::Full
+        );
+        assert_eq!(
+            filter.level_for("metadata/effects/spells/loose.ao"),
+            EffectLevel::Full
+        );
+        assert_eq!(
+            filter.level_for("metadata/effects/spells/loose.aoc"),
+            EffectLevel::Reduced
+        );
+        assert_eq!(
+            filter.level_for("metadata/effects/spells/ground_effects_v30/burning.ao"),
+            EffectLevel::Reduced
+        );
     }
 }

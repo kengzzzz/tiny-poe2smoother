@@ -62,8 +62,9 @@ pub struct PatchSet {
 pub struct PatchParams {
     pub zoom: f64,
     pub color_mods: Vec<ColorModEntry>,
-    /// Non-default per-skill overrides for `Effects`; empty = every skill
-    /// folder at `Reduced` (the patch's long-standing behavior).
+    /// Full scopes from the Skills and Others tabs; missing scopes default
+    /// to Reduced. The field name remains stable for existing preferences.
+    /// Kept visual references are also protected from the Particles patch.
     pub effect_skills: Vec<EffectSkillOverride>,
     /// Non-default per-monster overrides for `Effects`; empty = every
     /// monster at `Reduced`.

@@ -129,12 +129,14 @@ fn draw_directory_card(app: &mut GuiApp, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if ui.button("Browse…").clicked() {
                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                    app.game_dir_input = display_path(&path);
-                    app.status = None;
+                    app.select_game_dir(path);
                 }
             }
-            if ui.button("Detect").clicked() {
+            if ui.button("Validate").clicked() {
                 app.spawn_status();
+            }
+            if ui.button("Detect").clicked() {
+                app.spawn_autodetect();
             }
         });
         if let Some(status) = &app.status {
@@ -308,7 +310,7 @@ fn draw_color_mods_row(app: &mut GuiApp, ui: &mut egui::Ui) {
 }
 
 fn draw_effects_row(app: &mut GuiApp, ui: &mut egui::Ui) {
-    if !app.selected_patches.contains(&PatchId::Effects) {
+    if !app.effects_editor_accessible() {
         return;
     }
     // The caption groups per skill only once the catalog is in, so start the
@@ -323,6 +325,13 @@ fn draw_effects_row(app: &mut GuiApp, ui: &mut egui::Ui) {
     {
         app.ensure_effect_catalog_loading();
     }
+    // The small Others catalog loads eagerly too for the summary counts.
+    if app.other_catalog.is_none()
+        && app.other_catalog_task.is_none()
+        && app.other_catalog_error.is_none()
+    {
+        app.ensure_other_effect_catalog_loading();
+    }
     ui.horizontal(|ui| {
         ui.add_space(26.0);
         if small_action(ui, "Edit effects…") {
@@ -331,7 +340,20 @@ fn draw_effects_row(app: &mut GuiApp, ui: &mut egui::Ui) {
         }
         let skills = app.kept_original_effect_skill_count();
         let monsters = app.kept_original_monster_count();
-        let caption = if skills == 0 && monsters == 0 {
+        // Others overrides share the skills map but count only in Others below.
+        let caption = if app.other_catalog.is_some() {
+            let others = app.kept_original_other_effect_count();
+            if skills == 0 && monsters == 0 && others == 0 {
+                "all effects reduced".to_string()
+            } else {
+                format!(
+                    "{} · {} · {} kept original",
+                    count_label(skills, "skill"),
+                    count_label(monsters, "monster"),
+                    count_label(others, "other")
+                )
+            }
+        } else if skills == 0 && monsters == 0 {
             "all effects reduced".to_string()
         } else {
             format!(
@@ -696,9 +718,12 @@ const EFFECTS_SKILLS_DESCRIPTION: &str =
 const EFFECTS_MONSTERS_DESCRIPTION: &str =
     "Toggled on strips heavy client effects (default) · off keeps original visuals. \
      Shared effects stay original for all monsters using them · unlisted monsters stay reduced.";
+const EFFECTS_OTHERS_DESCRIPTION: &str =
+    "Shared or unmapped effects (default reduced) · off keeps original visuals, including \
+     referenced particles even with Particles enabled. Kept effects stay original for other users.";
 
-/// The effects editor: one modal, a tab per exception list (skills and
-/// monsters). Each tab is a search box over its catalog with one on/off
+/// The effects editor: one modal, a tab per exception list (skills, monsters
+/// and others). Each tab is a search box over its catalog with one on/off
 /// smoothing toggle per row, same layout as the color-mods editor. Tab
 /// bodies keep separate search/filter/scroll state, and the bulk buttons
 /// only ever touch the active tab's filtered rows.
@@ -714,6 +739,7 @@ fn draw_effects_editor(app: &mut GuiApp, ctx: &egui::Context) {
                 for (tab, label) in [
                     (EffectsEditorTab::Skills, "Skills"),
                     (EffectsEditorTab::Monsters, "Monsters"),
+                    (EffectsEditorTab::Others, "Others"),
                 ] {
                     let active = app.effects_editor_tab == tab;
                     if ui.add(widgets::chip(label, active)).clicked() && !active {
@@ -726,6 +752,7 @@ fn draw_effects_editor(app: &mut GuiApp, ctx: &egui::Context) {
             match app.effects_editor_tab {
                 EffectsEditorTab::Skills => draw_effects_skills_tab(app, ui),
                 EffectsEditorTab::Monsters => draw_effects_monsters_tab(app, ui),
+                EffectsEditorTab::Others => draw_effects_others_tab(app, ui),
             }
         })
         .should_close();
@@ -766,8 +793,43 @@ fn draw_effects_skills_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
         ui.add_space(4.0);
     }
 
+    if app.other_catalog_task.is_some() {
+        ui.horizontal(|ui| {
+            ui.add(egui::Spinner::new().color(palette::ACCENT));
+            ui.label(theme::caption_text(
+                "Loading shared effects for cross-tab preservation…",
+            ));
+        });
+        ui.add_space(4.0);
+    } else if app.other_catalog.is_none() {
+        if let Some(error) = app.other_catalog_error.clone() {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Shared effects unavailable: {error} — reductions needing them stay pending"
+                    ))
+                    .size(11.5)
+                    .color(palette::WARNING),
+                );
+                if small_action(ui, "Retry") {
+                    app.other_catalog_error = None;
+                    app.ensure_other_effect_catalog_loading();
+                }
+            });
+            ui.add_space(4.0);
+        }
+    }
+
     app.refresh_effects_filter();
     let row_count = app.effects_filter_rows.len();
+    let bulk_folders: Vec<String> = {
+        let catalog = app.effect_catalog.as_deref().unwrap_or_default();
+        app.effects_filter_rows
+            .iter()
+            .flat_map(|&idx| catalog[idx].folders.iter().cloned())
+            .collect()
+    };
+    let can_bulk_reduce = app.can_reduce_effect_folders(&bulk_folders);
     draw_effects_list_header(
         ui,
         |ui| {
@@ -775,6 +837,11 @@ fn draw_effects_skills_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
         },
         |_| {},
     );
+    if !can_bulk_reduce && row_count > 0 {
+        ui.label(theme::caption_text(
+            "Waiting for skill/shared lists to preserve sibling visuals — reducing stays pending.",
+        ));
+    }
     ui.add_space(4.0);
     // Distinct salt per tab: both lists sit at the same spot in the modal,
     // so without it they would share one persisted scroll offset.
@@ -798,56 +865,244 @@ fn draw_effects_skills_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
             if ui.add(widgets::secondary_button("Uncheck all")).clicked() {
                 app.apply_effect_level_to_filtered_rows(EffectLevel::Full);
             }
-            if ui.add(widgets::secondary_button("Check all")).clicked() {
-                app.apply_effect_level_to_filtered_rows(EffectLevel::Reduced);
-            }
+            ui.add_enabled_ui(can_bulk_reduce, |ui| {
+                if ui.add(widgets::secondary_button("Check all")).clicked() {
+                    app.apply_effect_level_to_filtered_rows(EffectLevel::Reduced);
+                }
+            });
         });
     });
 }
 
-/// One skill row: smoothing toggle plus the skill name. A row can control
-/// multiple effect folders for skills whose visuals are split across
-/// buff/explosion/etc. folders. Toggling on removes all overrides.
+/// One skill row: smoothing toggle plus the skill name. A row may own several
+/// folders; reducing under an inherited parent expands it first, and stays
+/// disabled while a required catalog is missing.
 fn draw_effect_skill_row(app: &mut GuiApp, ui: &mut egui::Ui, idx: usize) {
-    let Some(catalog) = &app.effect_catalog else {
-        return;
+    let (folders, display, active_skill_id, action_type, level) = {
+        let Some(catalog) = &app.effect_catalog else {
+            return;
+        };
+        let row = &catalog[idx];
+        (
+            row.folders.clone(),
+            row.display.clone(),
+            row.active_skill_id.clone(),
+            row.action_type.clone(),
+            app.effect_level_for_folders(&row.folders),
+        )
     };
-    let row = &catalog[idx];
-    let folders = row.folders.clone();
-    let display = row.display.clone();
-    let level = app.effect_level_for_folders(&folders);
+    let reducible = app.can_reduce_effect_folders(&folders);
     let mixed = level.is_none();
     let mut reduced = level == Some(EffectLevel::Reduced);
+    let blocked = level != Some(EffectLevel::Reduced) && !reducible;
     let hover = format!(
         "{}\n{}\n{}",
-        row.active_skill_id,
-        row.action_type,
+        active_skill_id,
+        action_type,
         folders.join("\n")
     );
+    let hover = if blocked {
+        format!("{hover}\nWaiting for skill/shared lists to preserve sibling visuals…")
+    } else {
+        hover
+    };
     ui.allocate_ui_with_layout(
         egui::vec2(ui.available_width(), COLOR_ROW_HEIGHT),
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            let toggle = ui.add(egui::Checkbox::without_text(&mut reduced).indeterminate(mixed));
+            let toggle = ui.add_enabled_ui(!blocked, |ui| {
+                ui.add(egui::Checkbox::without_text(&mut reduced).indeterminate(mixed))
+            });
+            let toggle = toggle.inner;
             if toggle.changed() {
                 let new_level = if reduced {
                     EffectLevel::Reduced
                 } else {
                     EffectLevel::Full
                 };
-                for folder in &folders {
-                    if new_level == EffectLevel::Reduced {
-                        app.effect_overrides.remove(folder);
-                    } else {
-                        app.effect_overrides.insert(folder.clone(), new_level);
-                    }
-                }
+                app.set_skill_folders_level(&folders, new_level);
             }
             ui.add_space(4.0);
             ui.add(
                 egui::Label::new(egui::RichText::new(&display).size(11.5).color(
                     if level == Some(EffectLevel::Reduced) {
+                        palette::TEXT_MUTED
+                    } else {
+                        palette::TEXT
+                    },
+                ))
+                .truncate(),
+            )
+            .on_hover_text(&hover);
+            toggle.on_hover_text(hover);
+        },
+    );
+}
+
+/// The Others tab: same layout as Skills, with its own search/filter state so
+/// bulk buttons only touch this tab's filtered rows.
+fn draw_effects_others_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
+    draw_effects_tab_description(ui, EFFECTS_OTHERS_DESCRIPTION);
+    ui.add_space(8.0);
+    ui.add(
+        egui::TextEdit::singleline(&mut app.others_search)
+            .id_salt("effects_others_search")
+            .hint_text("Search shared effects — regex like in-game search, \"quotes\", !exclude…")
+            .desired_width(f32::INFINITY)
+            .margin(egui::Margin::symmetric(10, 8)),
+    );
+    ui.add_space(6.0);
+    if app.other_catalog_task.is_some() {
+        ui.horizontal(|ui| {
+            ui.add(egui::Spinner::new().color(palette::ACCENT));
+            ui.label(theme::caption_text(
+                "Loading shared effects list from game files…",
+            ));
+        });
+        ui.add_space(4.0);
+    } else if let Some(error) = app.other_catalog_error.clone() {
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!("Shared effects list unavailable: {error}"))
+                    .size(11.5)
+                    .color(palette::WARNING),
+            );
+            if small_action(ui, "Retry") {
+                app.other_catalog_error = None;
+                app.ensure_other_effect_catalog_loading();
+            }
+        });
+        ui.add_space(4.0);
+    }
+
+    if app.effect_catalog_task.is_some() {
+        ui.horizontal(|ui| {
+            ui.add(egui::Spinner::new().color(palette::ACCENT));
+            ui.label(theme::caption_text(
+                "Loading skill list for cross-tab preservation…",
+            ));
+        });
+        ui.add_space(4.0);
+    } else if app.effect_catalog.is_none() {
+        if let Some(error) = app.effect_catalog_error.clone() {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Skill list unavailable: {error} — reductions needing it stay pending"
+                    ))
+                    .size(11.5)
+                    .color(palette::WARNING),
+                );
+                if small_action(ui, "Retry") {
+                    app.effect_catalog_error = None;
+                    app.ensure_effect_catalog_loading();
+                }
+            });
+            ui.add_space(4.0);
+        }
+    }
+
+    app.refresh_others_filter();
+    let row_count = app.others_filter_rows.len();
+    let bulk_folders: Vec<String> = {
+        let catalog = app.other_catalog.as_deref().unwrap_or_default();
+        app.others_filter_rows
+            .iter()
+            .map(|&idx| catalog[idx].folder.clone())
+            .collect()
+    };
+    let can_bulk_reduce = app.can_reduce_effect_folders(&bulk_folders);
+    draw_effects_list_header(
+        ui,
+        |ui| {
+            ui.label(theme::caption_text(&format!("{row_count} shown")));
+        },
+        |_| {},
+    );
+    if !can_bulk_reduce && row_count > 0 {
+        ui.label(theme::caption_text(
+            "Waiting for skill/shared lists to preserve sibling visuals — reducing stays pending.",
+        ));
+    }
+    ui.add_space(4.0);
+    // Distinct salt per tab: all three lists sit at the same spot in the
+    // modal, so without it they would share one persisted scroll offset.
+    egui::ScrollArea::vertical()
+        .id_salt("effects_others_list")
+        .max_height(380.0)
+        .auto_shrink([false, false])
+        .show_rows(ui, COLOR_ROW_HEIGHT, row_count, |ui, range| {
+            for i in range {
+                let idx = app.others_filter_rows[i];
+                draw_other_effect_row(app, ui, idx);
+            }
+        });
+
+    ui.add_space(10.0);
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if ui.add(widgets::primary_button("Close")).clicked() {
+            app.show_effects_editor = false;
+        }
+        ui.add_enabled_ui(row_count > 0, |ui| {
+            if ui.add(widgets::secondary_button("Uncheck all")).clicked() {
+                app.apply_other_effect_level_to_filtered_rows(EffectLevel::Full);
+            }
+            ui.add_enabled_ui(can_bulk_reduce, |ui| {
+                if ui.add(widgets::secondary_button("Check all")).clicked() {
+                    app.apply_other_effect_level_to_filtered_rows(EffectLevel::Reduced);
+                }
+            });
+        });
+    });
+}
+
+/// One Others row: unchecked keeps the folder original; reducing under an
+/// inherited parent expands it first so siblings stay Full.
+fn draw_other_effect_row(app: &mut GuiApp, ui: &mut egui::Ui, idx: usize) {
+    let (folder, display, level) = {
+        let Some(catalog) = &app.other_catalog else {
+            return;
+        };
+        let row = &catalog[idx];
+        (
+            row.folder.clone(),
+            row.display.clone(),
+            app.other_effect_level(&row.folder),
+        )
+    };
+    let reducible = app.can_reduce_effect_folders(std::slice::from_ref(&folder));
+    let mut reduced = level == EffectLevel::Reduced;
+    let blocked = level == EffectLevel::Full && !reducible;
+    let hover = format!("metadata/effects/spells/{folder}");
+    let hover = if blocked {
+        format!("{hover}\nWaiting for skill/shared lists to preserve sibling visuals…")
+    } else {
+        hover
+    };
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), COLOR_ROW_HEIGHT),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let toggle = ui.add_enabled_ui(!blocked, |ui| {
+                ui.add(egui::Checkbox::without_text(&mut reduced))
+            });
+            let toggle = toggle.inner;
+            if toggle.changed() {
+                app.set_other_effect_level(
+                    &folder,
+                    if reduced {
+                        EffectLevel::Reduced
+                    } else {
+                        EffectLevel::Full
+                    },
+                );
+            }
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(egui::RichText::new(&display).size(11.5).color(
+                    if level == EffectLevel::Reduced {
                         palette::TEXT_MUTED
                     } else {
                         palette::TEXT
@@ -1158,6 +1413,8 @@ mod tests {
         assert_eq!(count_label(0, "skill"), "0 skills");
         assert_eq!(count_label(1, "skill"), "1 skill");
         assert_eq!(count_label(2, "monster"), "2 monsters");
+        assert_eq!(count_label(1, "other"), "1 other");
+        assert_eq!(count_label(2, "other"), "2 others");
     }
 
     #[test]
@@ -1168,7 +1425,7 @@ mod tests {
         );
     }
 
-    /// Both tab search fields sit at the same auto-widget position in the
+    /// All three tab search fields sit at the same auto-widget position in the
     /// modal, so without distinct salts egui persists one shared
     /// `TextEditState` (cursor, selection, undo history) across tabs.
     #[test]
@@ -1184,12 +1441,15 @@ mod tests {
         .drop_without_applying_deltas();
         assert_eq!(ctx.data(|d| d.count::<TextEditState>()), 1);
         ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_effects_others_tab(&mut app, ui);
+        })
+        .drop_without_applying_deltas();
+        assert_eq!(ctx.data(|d| d.count::<TextEditState>()), 2);
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             draw_effects_monsters_tab(&mut app, ui);
         })
         .drop_without_applying_deltas();
-        // A second state entry proves the two fields have distinct widget
-        // IDs; a shared ID would overwrite the first entry in place.
-        assert_eq!(ctx.data(|d| d.count::<TextEditState>()), 2);
+        assert_eq!(ctx.data(|d| d.count::<TextEditState>()), 3);
     }
 
     #[test]
@@ -1210,6 +1470,10 @@ mod tests {
         assert_eq!(
             description_bottom(EFFECTS_SKILLS_DESCRIPTION),
             description_bottom(EFFECTS_MONSTERS_DESCRIPTION)
+        );
+        assert_eq!(
+            description_bottom(EFFECTS_SKILLS_DESCRIPTION),
+            description_bottom(EFFECTS_OTHERS_DESCRIPTION)
         );
     }
 
@@ -1290,6 +1554,11 @@ mod tests {
             tab_height(&mut skills, draw_effects_skills_tab),
             tab_height(&mut monsters, draw_effects_monsters_tab)
         );
+        let mut others = GuiApp::default();
+        assert_eq!(
+            tab_height(&mut skills, draw_effects_skills_tab),
+            tab_height(&mut others, draw_effects_others_tab)
+        );
     }
 
     /// The rendered monsters tab default-hides fallback rows; ticking
@@ -1324,5 +1593,71 @@ mod tests {
         })
         .drop_without_applying_deltas();
         assert_eq!(app.monsters_filter_rows, vec![0, 1]);
+    }
+
+    fn other_row(folder: &str, display: &str) -> crate::OtherEffectRow {
+        crate::OtherEffectRow {
+            display_lower: display.to_lowercase(),
+            search_lower: format!("{display} {folder}").to_lowercase(),
+            folder: folder.to_string(),
+            display: display.to_string(),
+        }
+    }
+
+    /// The editor row must stay reachable for Particles-only selections, whose
+    /// referenced particles are still protected by Full scopes.
+    #[test]
+    fn effects_row_stays_reachable_for_particles_only() {
+        use tiny_poe2smoother::patches::PatchId;
+
+        let mut app = GuiApp::default();
+        app.selected_patches.clear();
+        assert!(!app.effects_editor_accessible());
+
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_effects_row(&mut app, ui);
+        })
+        .drop_without_applying_deltas();
+        assert!(app.effect_catalog_task.is_none());
+        assert!(app.other_catalog_task.is_none());
+
+        // Particles alone exposes the editor and starts the same eager loads.
+        app.selected_patches.insert(PatchId::Particles);
+        assert!(app.effects_editor_accessible());
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_effects_row(&mut app, ui);
+        })
+        .drop_without_applying_deltas();
+        assert!(app.effect_catalog_task.is_some());
+        assert!(app.other_catalog_task.is_some());
+    }
+
+    /// The Others tab keeps search/filter state independent of the Skills tab.
+    #[test]
+    fn others_tab_keeps_independent_filter_state_from_skills_tab() {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let mut app = GuiApp::default();
+        app.other_catalog = Some(vec![
+            other_row("ground_effects/fire", "Ground Fire"),
+            other_row("ambient_sparkles.ao", "Ambient Sparkles"),
+        ]);
+
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_effects_others_tab(&mut app, ui);
+        })
+        .drop_without_applying_deltas();
+        assert_eq!(app.others_filter_rows, vec![0, 1]);
+        assert!(app.effects_filter_rows.is_empty());
+
+        app.others_search = "ambient".to_string();
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_effects_others_tab(&mut app, ui);
+        })
+        .drop_without_applying_deltas();
+        assert_eq!(app.others_filter_rows, vec![1]);
+        assert!(app.effects_filter_rows.is_empty());
     }
 }
