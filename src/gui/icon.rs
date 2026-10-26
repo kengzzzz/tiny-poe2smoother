@@ -17,7 +17,7 @@ fn color_image() -> egui::ColorImage {
 }
 
 fn texture(ctx: &egui::Context) -> egui::TextureHandle {
-    let id = egui::Id::new(TEXTURE_ID);
+    let id = egui::Id::unique(TEXTURE_ID);
     if let Some(texture) = ctx.data(|data| data.get_temp::<egui::TextureHandle>(id)) {
         return texture;
     }
@@ -27,8 +27,6 @@ fn texture(ctx: &egui::Context) -> egui::TextureHandle {
     texture
 }
 
-/// Draws the same embedded asset as [`app_icon`], so the header logo and the
-/// window icon stay consistent.
 pub fn paint_logo_mark(painter: &egui::Painter, rect: egui::Rect) {
     let texture = texture(painter.ctx());
     painter.image(

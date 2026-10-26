@@ -1,14 +1,6 @@
-//! PoE2-style search queries for the color-mods editor, mirroring the
-//! in-game search bar: space-separated terms are ANDed, each term is a
-//! case-insensitive regex, `"quoted blocks"` keep spaces inside one term,
-//! and a leading `!` (inside or outside the quotes, both work in game)
-//! excludes rows the term matches.
-//!
-//! One deliberate extension over the game: a term also matches as a literal
-//! substring. This keeps plain-text queries working exactly as before regex
-//! support — including pasted stat ids like `map_monsters_damage_+%`, which
-//! compile as regex but would never match their own text — and gives invalid
-//! regex (e.g. a `(` mid-typing) a graceful meaning instead of no results.
+//! In-game style search: space-separated terms are ANDed regexes, "quotes" group
+//! words, and `!` excludes. Terms also match as literal substrings, so pasted stat
+//! ids like `map_monsters_damage_+%` and half-typed regex still work.
 
 use regex::{Regex, RegexBuilder};
 
@@ -18,9 +10,8 @@ pub struct SearchQuery {
 
 struct Term {
     negated: bool,
-    /// `None` when the term is not a valid regex; the literal still applies.
+    /// `None` when the term isn't a valid regex. The literal still applies.
     regex: Option<Regex>,
-    /// Lowercased raw term, matched with `contains` against lowercased text.
     literal: String,
 }
 
@@ -80,8 +71,7 @@ impl SearchQuery {
         Self { terms }
     }
 
-    /// True when every term matches (or, if negated, fails to match) at
-    /// least one of the two fields. Both fields must already be lowercase.
+    /// Both fields must already be lowercase.
     pub fn matches(&self, stat_id_lower: &str, text_lower: &str) -> bool {
         self.terms.iter().all(|term| {
             let hit = term.hits(stat_id_lower) || term.hits(text_lower);
@@ -92,10 +82,10 @@ impl SearchQuery {
 
 impl Term {
     fn hits(&self, text_lower: &str) -> bool {
-        if let Some(regex) = &self.regex {
-            if regex.is_match(text_lower) {
-                return true;
-            }
+        if let Some(regex) = &self.regex
+            && regex.is_match(text_lower)
+        {
+            return true;
         }
         text_lower.contains(&self.literal)
     }
@@ -159,8 +149,7 @@ mod tests {
     fn literal_fallback_covers_invalid_regex_and_stat_id_pastes() {
         // `+5` is not a valid regex (dangling repeat) but should match text.
         assert!(matches("+5", "+5 to Level of all Skills"));
-        // A pasted stat id is a *valid* regex (`_+%` = underscores then %)
-        // that never matches its own text; the literal fallback finds it.
+        // A pasted stat id is valid regex that never matches its own text.
         let query = SearchQuery::parse("map_monsters_damage_+%");
         assert!(query.matches("map_monsters_damage_+%", ""));
         assert!(!query.matches("map_monsters_life_+%", ""));
@@ -187,8 +176,7 @@ mod tests {
                 parsed.matches("map_monsters_damage_+%", text);
             }
         }
-        // Spot-check they actually select rows, not just avoid panics.
-        // `(…)` is a regex group (as in game), not literal parentheses.
+        // `(…)` is a regex group, as in game.
         assert!(matches("\"(1[0-8]) us\"", "15 uses remaining"));
         assert!(!matches("\"(1[0-8]) us\"", "19 uses remaining"));
         assert!(matches(

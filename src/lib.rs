@@ -6,9 +6,7 @@ pub mod patches;
 
 use std::time::Instant;
 
-/// Install the global tracing subscriber, writing to stderr. `RUST_LOG`
-/// selects a plain level (`error`..`trace`, no per-target filters — the
-/// env-filter feature costs an extra regex engine); defaults to `warn`.
+/// `RUST_LOG` takes a plain level only (no env-filter). Defaults to `warn`.
 pub fn init_tracing() {
     let level = std::env::var("RUST_LOG")
         .ok()

@@ -4,31 +4,26 @@ use eframe::egui::Color32;
 pub mod palette {
     use eframe::egui::Color32;
 
-    // Surfaces (elevation ramp)
-    pub const BG_APP: Color32 = Color32::from_rgb(11, 14, 20); // #0B0E14
-    pub const BG_CARD: Color32 = Color32::from_rgb(20, 26, 37); // #141A25
-    pub const BG_ELEVATED: Color32 = Color32::from_rgb(28, 36, 51); // #1C2433
-    pub const BG_ACTIVE: Color32 = Color32::from_rgb(36, 46, 64); // #242E40
+    pub const BG_APP: Color32 = Color32::from_rgb(11, 14, 20);
+    pub const BG_CARD: Color32 = Color32::from_rgb(20, 26, 37);
+    pub const BG_ELEVATED: Color32 = Color32::from_rgb(28, 36, 51);
+    pub const BG_ACTIVE: Color32 = Color32::from_rgb(36, 46, 64);
 
-    // Strokes
-    pub const BORDER: Color32 = Color32::from_rgb(42, 52, 71); // #2A3447
-    pub const BORDER_FAINT: Color32 = Color32::from_rgb(30, 38, 53); // #1E2635
+    pub const BORDER: Color32 = Color32::from_rgb(42, 52, 71);
+    pub const BORDER_FAINT: Color32 = Color32::from_rgb(30, 38, 53);
 
-    // Accent
-    pub const ACCENT: Color32 = Color32::from_rgb(20, 184, 166); // #14B8A6
-    pub const ACCENT_HOVER: Color32 = Color32::from_rgb(45, 212, 191); // #2DD4BF
-    pub const ACCENT_ACTIVE: Color32 = Color32::from_rgb(13, 148, 136); // #0D9488
+    pub const ACCENT: Color32 = Color32::from_rgb(20, 184, 166);
+    pub const ACCENT_HOVER: Color32 = Color32::from_rgb(45, 212, 191);
+    pub const ACCENT_ACTIVE: Color32 = Color32::from_rgb(13, 148, 136);
 
-    // Text
-    pub const TEXT: Color32 = Color32::from_rgb(230, 237, 247); // #E6EDF7
-    pub const TEXT_MUTED: Color32 = Color32::from_rgb(148, 163, 184); // #94A3B8
-    pub const TEXT_FAINT: Color32 = Color32::from_rgb(100, 112, 131); // #647083
-    pub const TEXT_ON_ACCENT: Color32 = Color32::from_rgb(6, 24, 22); // #061816
+    pub const TEXT: Color32 = Color32::from_rgb(230, 237, 247);
+    pub const TEXT_MUTED: Color32 = Color32::from_rgb(148, 163, 184);
+    pub const TEXT_FAINT: Color32 = Color32::from_rgb(100, 112, 131);
+    pub const TEXT_ON_ACCENT: Color32 = Color32::from_rgb(6, 24, 22);
 
-    // Semantic
-    pub const SUCCESS: Color32 = Color32::from_rgb(52, 211, 153); // #34D399
-    pub const WARNING: Color32 = Color32::from_rgb(250, 190, 88); // #FABE58
-    pub const ERROR: Color32 = Color32::from_rgb(244, 113, 116); // #F47174
+    pub const SUCCESS: Color32 = Color32::from_rgb(52, 211, 153);
+    pub const WARNING: Color32 = Color32::from_rgb(250, 190, 88);
+    pub const ERROR: Color32 = Color32::from_rgb(244, 113, 116);
     pub const NEUTRAL: Color32 = TEXT_MUTED;
 }
 
@@ -67,8 +62,7 @@ pub fn install_fonts(ctx: &egui::Context) {
         ))),
     );
 
-    // Inter leads the proportional family; egui defaults stay as fallbacks
-    // (emoji, symbols) and the default Hack monospace is untouched.
+    // Inter first. egui defaults stay as fallbacks for emoji and symbols.
     fonts
         .families
         .get_mut(&FontFamily::Proportional)

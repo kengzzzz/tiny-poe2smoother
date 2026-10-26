@@ -1,4 +1,4 @@
-//! Dev-only benchmark and correctness checker for the vendored ooz codec paths.
+//! Dev-only benchmark and correctness check for the vendored ooz codec.
 //!
 //! Usage:
 //!   cargo run --release --bin ooz-bench -- synth [--iters N] [--mib M]
@@ -7,15 +7,13 @@
 //!   cargo run --release --bin ooz-bench -- digest --game-dir <dir> \
 //!       [--budget-mib B] [--stride S]
 //!
-//! Prints one machine-readable `key=value` line per metric. Digest lines let a
-//! runner assert byte-identical output across differently-built binaries. Use
-//! the same real game data for both compiler variants: a synthetic round trip
-//! does not exercise the known Leviathan miscompile.
+//! Compare digests from differently built binaries on the same real game data.
+//! A synthetic round trip doesn't trigger the known Leviathan miscompile.
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use tiny_poe2smoother::bundle::{decompress_bundle, pack_uncompressed_bundle, BundleStore};
+use tiny_poe2smoother::bundle::{BundleStore, decompress_bundle, pack_uncompressed_bundle};
 
 fn fnv1a(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
@@ -26,7 +24,6 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// (median, min) of the samples, in the samples' unit.
 fn median_min(mut samples: Vec<f64>) -> (f64, f64) {
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
     (samples[samples.len() / 2], samples[0])
@@ -38,8 +35,7 @@ fn time_ms(f: impl FnOnce() -> Result<Vec<u8>>) -> Result<(f64, Vec<u8>)> {
     Ok((start.elapsed().as_secs_f64() * 1e3, out))
 }
 
-/// Deterministic mixed buffer: LCG noise blocks interleaved with repeated
-/// ASCII runs so Mermaid has real matches to find.
+/// Noise mixed with repeated runs so Mermaid has real matches to find.
 fn synth_data(mib: usize) -> Vec<u8> {
     let len = mib << 20;
     let mut out = Vec::with_capacity(len + 8192);
@@ -97,8 +93,7 @@ fn collect_bundles(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// Print one digest line per bundle so differently-built binaries can be
-/// diffed down to the exact bundle whose decompressed bytes diverge.
+/// One line per bundle so diverging builds point at the exact bundle.
 fn digest_real(game_dir: &Path, budget_mib: u64, stride: usize) -> Result<()> {
     let store = BundleStore::new(game_dir);
     let index_bytes = store.read_index_bytes().context("read bundle index")?;
@@ -241,6 +236,8 @@ fn main() -> Result<()> {
             let stride = parse_flag(&args, "--stride", 23usize)?;
             digest_real(Path::new(&game_dir), budget_mib, stride)
         }
-        _ => bail!("usage: ooz-bench synth [--iters N] [--mib M] | ooz-bench real|digest --game-dir <dir> [--iters N] [--budget-mib B] [--stride S]"),
+        _ => bail!(
+            "usage: ooz-bench synth [--iters N] [--mib M] | ooz-bench real|digest --game-dir <dir> [--iters N] [--budget-mib B] [--stride S]"
+        ),
     }
 }

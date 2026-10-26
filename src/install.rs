@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use sysinfo::{ProcessRefreshKind, RefreshKind, System, UpdateKind};
@@ -10,15 +10,6 @@ const STANDALONE_DIRS: &[&str] = &["Path of Exile 2", "Path of Exile 2 - poe2_pr
 pub enum InstallLayout {
     LooseBundles,
     ContentGgpk,
-}
-
-impl InstallLayout {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::LooseBundles => "loose Bundles2",
-            Self::ContentGgpk => "standalone Content.ggpk",
-        }
-    }
 }
 
 pub fn resolve_game_dir(explicit: Option<PathBuf>) -> Result<PathBuf> {
@@ -41,32 +32,30 @@ fn resolve_from_candidates(
         if !manifest.exists() {
             continue;
         }
-        // An unreadable manifest (permissions, broken library) should not stop
-        // the scan; keep trying the other Steam libraries and standalone paths.
         let Ok(text) = std::fs::read_to_string(&manifest) else {
             tracing::warn!("skipping unreadable {}", manifest.display());
             continue;
         };
         let install_dir = parse_install_dir(&text).unwrap_or_else(|| "Path of Exile 2".to_string());
         let game_dir = candidate.join("steamapps").join("common").join(install_dir);
-        if game_dir.exists() {
-            if let Ok(valid) = validate_game_dir(game_dir.clone()) {
-                return Ok(valid);
-            }
+        if game_dir.exists()
+            && let Ok(valid) = validate_game_dir(game_dir.clone())
+        {
+            return Ok(valid);
         }
     }
 
     for candidate in standalone() {
-        if candidate.exists() {
-            if let Ok(valid) = validate_game_dir(candidate.clone()) {
-                return Ok(valid);
-            }
+        if candidate.exists()
+            && let Ok(valid) = validate_game_dir(candidate.clone())
+        {
+            return Ok(valid);
         }
     }
 
     bail!(
-        "could not autodetect Path of Exile 2;\n\
-         use Browse to choose the game folder, or verify Steam/standalone install paths\n\
+        "could not autodetect Path of Exile 2.\n\
+         Use Browse to choose the game folder, or verify Steam/standalone install paths\n\
          Searched default Steam folders, configured Steam libraries, and standalone locations"
     );
 }
@@ -88,7 +77,7 @@ pub fn detect_install_layout(path: &Path) -> Result<InstallLayout> {
     }
 
     Err(anyhow!(
-        "{} does not look like a POE2 install; missing {} or {}",
+        "{} does not look like a POE2 install. Missing {} or {}",
         path.display(),
         index.display(),
         content.display()
@@ -98,17 +87,14 @@ pub fn detect_install_layout(path: &Path) -> Result<InstallLayout> {
 pub fn ensure_game_not_running() -> Result<()> {
     if is_game_running() {
         bail!(
-            "Path of Exile 2 appears to be running;\n\
-             close the game (and Steam if needed) before apply/restore"
+            "Path of Exile 2 appears to be running.\n\
+             Close the game (and Steam if needed) before apply/restore"
         );
     }
     Ok(())
 }
 
 pub fn is_game_running() -> bool {
-    // Runs synchronously on the UI thread when Apply/Restore is clicked; only
-    // process names and command lines are needed, so skip the full system
-    // refresh (CPU, memory, disks, ...) that `System::new_all` would do twice.
     let system = System::new_with_specifics(
         RefreshKind::nothing()
             .with_processes(ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always)),
@@ -118,8 +104,7 @@ pub fn is_game_running() -> bool {
         if name.contains("pathofexile") || name.contains("path of exile") {
             return true;
         }
-        // Under Proton/Wine the process name is often a thread label like "Main",
-        // but the command line still contains the game path.
+        // Under Proton the process name is often "Main", but the command line has the game path.
         process.cmd().iter().any(|arg| {
             let arg = arg.to_string_lossy().to_ascii_lowercase();
             arg.contains("pathofexile") || arg.contains("path of exile")

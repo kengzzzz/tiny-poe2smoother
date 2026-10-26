@@ -28,29 +28,16 @@ fn build_ooz() {
         // OOZ_BUILD_DLL must carry a value: kraken.cpp guards main() with `#if !OOZ_BUILD_DLL`.
         .define("OOZ_BUILD_DLL", "1")
         .define("NDEBUG", None)
-        // Always optimize: cargo passes OPT_LEVEL=0 in dev builds, which would make
-        // test/dev decompression drastically slower than the previous cmake
-        // RelWithDebInfo build. debug(true) matches that profile; the release
-        // binary is stripped anyway.
+        // Always optimize: dev and test decoding is far slower at OPT_LEVEL=0.
         .opt_level(2)
         .debug(true)
         .include("vendor/ooz");
-    // Opt-in LTO for the vendored codec. Requires a clang-family compiler
-    // (CXX=clang++) plus an LTO-capable final link (clang + lld via RUSTFLAGS)
-    // and AR=llvm-ar so the archive index covers bitcode members. Unset means
-    // no change, so the Windows/mingw Docker cross-build is unaffected.
+    // Opt-in LTO (OOZ_LTO). Needs CXX=clang++, clang + lld linking, and AR=llvm-ar.
     //
-    // WARNING: clang/LLVM 22.1.6 miscompiles Leviathan_ProcessLz in kraken.cpp
-    // at -O2: the SLP vectorizer fuses the two COPY_64s of the matchlen==9
-    // match copy into one 16-byte load/store without an overlap guard, so LZ
-    // matches at distance 8..15 copy stale bytes and real PoE2 bundles decode
-    // corrupted (Mermaid roundtrip tests still pass; only real Leviathan
-    // streams hit it). -fno-slp-vectorize fixes plain -O2 builds, but under
-    // (Thin)LTO the linker's backend reruns SLP, so that flag alone is NOT
-    // sufficient for OOZ_LTO builds. Verify any clang-built binary against a
-    // g++ baseline using the same real game data before trusting it:
+    // WARNING: clang/LLVM 22.1.6 miscompiles Leviathan_ProcessLz at -O2 (SLP fuses an
+    // overlapping match copy) and corrupts real PoE2 bundles. -fno-slp-vectorize fixes
+    // plain builds but not LTO. Verify clang builds against a g++ baseline on real data:
     // `cargo run --release --bin ooz-bench -- digest --game-dir <game-dir>`.
-    // A synthetic round trip is insufficient to expose this Leviathan failure.
     match std::env::var("OOZ_LTO").as_deref() {
         Ok("thin") => {
             assert_clang_for_lto(&build);

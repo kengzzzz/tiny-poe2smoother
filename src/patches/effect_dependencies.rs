@@ -1,5 +1,4 @@
-//! Preserve the visual references of effects kept Full, including particles
-//! outside the selected folder. Only actual index entries are followed.
+//! Keeps the visual references of Full effects, including particles in other folders.
 
 use super::effect_skills::{EffectLevel, EffectsFilter};
 use super::targeting::normalize_path;
@@ -20,11 +19,12 @@ fn scannable(path: &str) -> bool {
 }
 
 fn references(bytes: &[u8]) -> BTreeSet<String> {
-    // References occur in UTF-16 effect text and ASCII/UTF-8 packs. Scan both
-    // views rather than guessing encoding from a binary pack's first bytes.
+    // References appear in UTF-16 effect text and UTF-8 packs, so scan both views.
     let utf16 = String::from_utf16_lossy(
         &bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect::<Vec<_>>(),
     );
@@ -52,8 +52,7 @@ pub(super) fn resolve_full_effect_dependencies(
     let mut visited = BTreeSet::new();
     let mut kept = BTreeSet::new();
     while !pending.is_empty() {
-        // Bound each batch's working set. The visited set handles cycles;
-        // there is no depth cutoff that silently drops a kept visual's child.
+        // Batches bound memory. The visited set handles cycles, with no depth cutoff.
         let mut candidates = Vec::new();
         for _ in 0..256 {
             let Some(path) = pending.pop_first() else {

@@ -1,3 +1,4 @@
+pub mod editors;
 pub mod icon;
 pub mod search;
 pub mod theme;

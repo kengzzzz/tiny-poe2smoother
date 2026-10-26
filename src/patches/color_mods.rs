@@ -1,10 +1,5 @@
-//! Color Mods patch: colorize map-modifier text by annotating stat
-//! description files (`data/statdescriptions/**/*.csd`).
-//!
-//! A `.csd` file is UTF-16LE text made of `description` blocks: a header line
-//! listing stat ids, then per-language sections of quoted display-text
-//! variants. Wrapping a variant in `"<rgb(r,g,b)>{{text}}"` makes the game
-//! render it in that color.
+//! Colors stat text in `data/statdescriptions/**/*.csd` by wrapping variants in
+//! `<rgb(r,g,b)>{{text}}`.
 
 use super::text::{decode_utf16, encode_utf16_bom};
 use aho_corasick::AhoCorasick;
@@ -135,8 +130,7 @@ pub fn default_color_mods() -> Vec<ColorModEntry> {
         .collect()
 }
 
-/// Saved entries win (user edits preserved); defaults the user has never seen
-/// (added in a newer app version) are appended.
+/// Saved entries win. Defaults added in newer versions are appended.
 pub fn merge_with_defaults(mut saved: Vec<ColorModEntry>) -> Vec<ColorModEntry> {
     let have: std::collections::HashSet<String> =
         saved.iter().map(|entry| entry.stat_id.clone()).collect();
@@ -148,10 +142,7 @@ pub fn merge_with_defaults(mut saved: Vec<ColorModEntry>) -> Vec<ColorModEntry> 
     saved
 }
 
-/// Precomputed lookup shared across the rayon transform tasks: enabled
-/// stat id -> color, plus an aho-corasick prefilter over the ids encoded as
-/// UTF-16LE so files that cannot contain a match are skipped without the
-/// (expensive) full decode of e.g. the 30 MB stat_descriptions.csd.
+/// The UTF-16 prefilter skips files without a match before the costly decode.
 #[derive(Debug)]
 pub(super) struct ColorMatcher {
     colors: HashMap<String, [u8; 3]>,
@@ -159,7 +150,6 @@ pub(super) struct ColorMatcher {
 }
 
 impl ColorMatcher {
-    /// `None` when no entry is enabled (the patch is then a no-op).
     pub(super) fn new(entries: &[ColorModEntry]) -> Option<Self> {
         let colors: HashMap<String, [u8; 3]> = entries
             .iter()
@@ -191,8 +181,7 @@ impl ColorMatcher {
         let mut state = State::Seeking;
 
         for line in lines.iter_mut() {
-            // A new block resets the machine from any state. (`no_description`
-            // lines do not start with "description", so they never match.)
+            // A new block resets the state. `no_description` lines never match.
             if line.starts_with("description") {
                 state = State::Header;
                 continue;
@@ -208,13 +197,13 @@ impl ColorMatcher {
                     };
                 }
                 State::Data { color } => {
-                    if let Some(count) = first_token_count(line) {
-                        if count > 0 {
-                            state = State::Writing {
-                                color,
-                                remaining: count,
-                            };
-                        }
+                    if let Some(count) = first_token_count(line)
+                        && count > 0
+                    {
+                        state = State::Writing {
+                            color,
+                            remaining: count,
+                        };
                     }
                 }
                 State::Writing {
@@ -307,7 +296,7 @@ pub fn parse_stat_catalog(text: &str) -> Vec<StatCatalogEntry> {
                 if first_token_count(line).is_some() {
                     ParseState::AwaitText(ids)
                 } else {
-                    // `lang` or malformed: emit ids without text.
+                    // `lang` or malformed, so emit ids without text.
                     emit_catalog_entries(&mut out, ids, "");
                     ParseState::Seeking
                 }
@@ -337,11 +326,7 @@ fn first_quoted(line: &str) -> Option<&str> {
     Some(&line[open + 1..open + 1 + len])
 }
 
-/// Human-readable form of a raw `.csd` display string, matching what the
-/// game renders: `[Tag|Shown]` markup collapses to `Shown`, `[Tag]` to
-/// `Tag`, `{0}`-style value placeholders become `#`, and literal `\n`
-/// escapes become spaces. The editor uses this for row labels and search,
-/// so queries match the in-game wording rather than raw markup.
+/// Collapses `.csd` markup to what the game shows, so search matches in-game wording.
 pub fn display_stat_text(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut rest = raw;
@@ -359,7 +344,7 @@ pub fn display_stat_text(raw: &str) -> String {
             out.push(' ');
             rest = after;
         } else {
-            // Unmatched opener; emit it verbatim (all three are ASCII).
+            // Unmatched opener, emit it verbatim.
             out.push_str(&tail[..1]);
             rest = &tail[1..];
         }
@@ -458,8 +443,7 @@ description\r\n\
 
     #[test]
     fn description_line_mid_section_resets_the_machine() {
-        // Malformed count larger than the actual variant lines must not bleed
-        // into the next block.
+        // A count larger than the variant lines must not bleed into the next block.
         let fixture = "description\r\n\
 \t1 map_monsters_damage_+%\r\n\
 \t5\r\n\

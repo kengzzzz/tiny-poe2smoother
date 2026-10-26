@@ -1,13 +1,13 @@
 use super::compression::{decompress_bundle, decompress_bundle_slices};
 use super::ggpk::{
-    ggpk_file_record, ggpk_find_file, ggpk_find_pdir, ggpk_name_hash, ggpk_pdir_record,
-    GgpkArchive, GgpkFileSpan, GgpkPatchPlan, GgpkPdirEntry,
+    GgpkArchive, GgpkFileSpan, GgpkPatchPlan, GgpkPdirEntry, ggpk_file_record, ggpk_find_file,
+    ggpk_find_pdir, ggpk_name_hash, ggpk_pdir_record,
 };
-use super::hashing::{hash_fnv1a, HashMode};
+use super::hashing::{HashMode, hash_fnv1a};
 use super::index::{BundleFile, BundleIndex, BundleInfo, DirectoryRecord};
 use crate::backup::GgpkBackupMeta;
-use crate::install::{detect_install_layout, InstallLayout};
-use anyhow::{anyhow, bail, Context, Result};
+use crate::install::{InstallLayout, detect_install_layout};
+use anyhow::{Context, Result, anyhow, bail};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -48,8 +48,7 @@ fn default_cache_dir() -> PathBuf {
 }
 
 fn normalized_cache_game_dir(game_dir: &std::path::Path) -> PathBuf {
-    // Keep this cache-only: Windows canonical paths may use a `\\?\` prefix,
-    // which should not leak into the user-visible/persisted game directory.
+    // Cache-only: Windows canonical paths may carry a `\\?\` prefix.
     fs::canonicalize(game_dir)
         .or_else(|_| std::path::absolute(game_dir))
         .unwrap_or_else(|_| game_dir.to_path_buf())
@@ -97,8 +96,7 @@ fn retire_legacy_caches_with(
     cache_dir: &std::path::Path,
     remove: impl Fn(&std::path::Path) -> std::io::Result<()>,
 ) {
-    // The marker makes this a one-time, app-wide sweep. Exact legacy matching
-    // deliberately excludes v3, temporary, and unrelated files.
+    // One-time sweep of legacy cache files. v3 and temp files are kept.
     let marker = cache_dir.join(CACHE_MIGRATION_MARKER);
     if marker.exists() || fs::create_dir_all(cache_dir).is_err() {
         return;
@@ -139,9 +137,7 @@ fn retire_legacy_caches_with(
     }
 }
 
-/// Validate a length/count read from the cache against the bytes actually
-/// remaining, so a truncated or corrupt file is rejected instead of aborting
-/// on a huge allocation. `unit` is the minimum encoded size of one element.
+/// Caps a count by the remaining bytes so a corrupt cache can't force a huge allocation.
 fn checked_count(c: &Cursor<&[u8]>, count: u64, unit: u64) -> Option<usize> {
     let remaining = (c.get_ref().len() as u64).saturating_sub(c.position());
     (count.checked_mul(unit)? <= remaining).then_some(count as usize)
@@ -326,25 +322,22 @@ impl BundleStore {
     }
 
     fn cache_path(&self) -> PathBuf {
-        // Scoped per install: a shared file would let a second install (or a
-        // test suite's temp store) clobber or clear the real install's cache.
-        // Unlike bundle-path hashing, cache identity must preserve path case.
+        // Per install so other installs or tests can't clobber it. Path case is kept.
         let tag = hash_fnv1a(self.cache_source.as_bytes());
         self.cache_dir
             .join(format!("index-cache-v3-{tag:016x}.bin"))
     }
 
-    /// Refresh storage that is held open across index and bundle reads, then
-    /// return the metadata key for that exact snapshot. In particular, a GGPK
-    /// pathname may be replaced while an older memory map remains readable.
+    /// Reopens held storage and returns the cache key for that snapshot. A GGPK
+    /// can be replaced while an old mmap stays readable.
     fn refresh_source_snapshot(&mut self) -> Result<Option<CacheKey>> {
         let key_before = self.cache_key()?;
         if matches!(self.layout, InstallLayout::ContentGgpk) {
             let ggpk = GgpkArchive::from_file(&self.content_path)?;
             if self.cache_key()? != key_before {
                 bail!(
-                    "game data changed while opening Content.ggpk; \
-                     wait for the standalone launcher to finish updating, then retry"
+                    "game data changed while opening Content.ggpk. \
+                     Wait for the standalone launcher to finish updating, then retry"
                 );
             }
             self.ggpk = Some(Arc::new(ggpk));
@@ -355,8 +348,8 @@ impl BundleStore {
     fn ensure_source_unchanged(&self, source_key: &Option<CacheKey>, phase: &str) -> Result<()> {
         if &self.cache_key()? != source_key {
             bail!(
-                "game data changed while {phase} the bundle index; \
-                 wait for Steam or the standalone launcher to finish updating, then retry"
+                "game data changed while {phase} the bundle index. \
+                 Wait for Steam or the standalone launcher to finish updating, then retry"
             );
         }
         Ok(())
@@ -432,8 +425,7 @@ impl BundleStore {
         } else {
             data.write_u8(0).ok();
         }
-        // Serializing a large live index can take seconds. If the game updater
-        // changed the source meanwhile, do not publish this stale snapshot.
+        // The game may have updated while serializing, so don't publish a stale snapshot.
         if self.cache_key().ok().flatten().as_ref() != Some(source_key) {
             return;
         }
@@ -441,8 +433,7 @@ impl BundleStore {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        // Write-then-rename so concurrent readers never observe a torn
-        // cache file (a failed parse silently forces a full index rebuild).
+        // Write-then-rename so readers never see a torn file.
         let tmp = path.with_extension(format!("tmp{}", std::process::id()));
         write_cache_file(&path, &tmp, &data, |tmp, data| fs::write(tmp, data));
     }
@@ -463,10 +454,7 @@ impl BundleStore {
             tracing::debug!("using cached index metadata");
             return Ok(cached);
         }
-        // Cache miss. Rebuilds are expensive (full decompress + path build
-        // across all cores), and several background threads may open the
-        // index at once, so collapse concurrent misses into one rebuild;
-        // late arrivals re-read the cache the winner just wrote.
+        // Collapse concurrent misses into one rebuild. Late callers re-read the cache.
         static REBUILD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = REBUILD_LOCK
             .lock()
@@ -483,8 +471,7 @@ impl BundleStore {
             decompress_bundle(&bytes).context("failed to decompress bundle index")?;
         crate::timing!("index_parse");
         let mut index = BundleIndex::parse(decompressed)?;
-        // Build paths before caching so cache hits skip dir_decompress +
-        // build_paths, the dominant cost of a warm launch.
+        // Cache built paths: they dominate warm-launch cost.
         index.ensure_paths_built()?;
         self.ensure_source_unchanged(&source_key_before, "building")?;
         if let Some(source_key) = source_key_before.as_ref() {
@@ -563,8 +550,6 @@ impl BundleStore {
         }
     }
 
-    /// Read the bytes of each target file, decompressing only the bundle
-    /// chunks that cover them. Results are keyed by the file's index hash.
     pub fn read_files_batch(
         &self,
         index: &BundleIndex,
@@ -604,8 +589,6 @@ impl BundleStore {
             .map(std::borrow::Cow::into_owned)
     }
 
-    /// Read a storage file without copying when possible: the GGPK layout
-    /// returns a borrowed slice of the archive mmap.
     fn read_storage_file_cow(&self, rel_path: &str) -> Result<std::borrow::Cow<'_, [u8]>> {
         if matches!(self.layout, InstallLayout::ContentGgpk) {
             let span = self.ggpk_file_span(rel_path)?.ok_or_else(|| {
@@ -735,7 +718,7 @@ impl BundleStore {
         let current_len = file.metadata()?.len();
         if current_len != plan.backup.appended_start {
             bail!(
-                "{} changed while preparing patch; verify game files and retry",
+                "{} changed while preparing patch. Verify game files and retry",
                 self.content_path.display()
             );
         }
@@ -867,8 +850,7 @@ mod tests {
         let stale_index =
             BundleIndex::for_test_paths(&[("data/balance/activeskills.datc64", "old", 1)]);
 
-        // Model a launcher update finishing after the index was read but before
-        // its cache was serialized. A size change makes the key change exact.
+        // A launcher update lands after the index read but before caching.
         fs::write(game.join("Content.ggpk"), b"updated-ggpk").unwrap();
         assert_ne!(store.cache_key().unwrap().unwrap(), source_key_before);
 

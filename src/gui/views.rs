@@ -1,77 +1,82 @@
 use eframe::egui;
-use tiny_poe2smoother::app::PatchState;
-use tiny_poe2smoother::install::{display_path, is_game_running};
-use tiny_poe2smoother::patches::{
-    all_patches, all_presets, default_color_mods, ColorModEntry, EffectLevel, PatchId, PatchInfo,
-    PRESET_COLORS,
-};
+use tiny_poe2smoother::app::{AppStatus, PatchState};
+use tiny_poe2smoother::install::{InstallLayout, display_path, is_game_running};
+use tiny_poe2smoother::patches::{MinimapStyle, PatchId, all_profiles, patch_info, patch_options};
 
+use super::editors;
 use super::icon;
 use super::theme::{self, palette};
-use super::widgets;
-use crate::{ColorRowRef, EffectsEditorTab, GuiApp, MessageKind};
+use super::widgets::{self, count_label, small_action};
+use crate::{GuiApp, MessageKind};
 
-const GROUPS: &[(&str, &[PatchId])] = &[
-    (
-        "Camera & Map",
-        &[PatchId::Camera, PatchId::Minimap, PatchId::AtlasFog],
-    ),
-    (
-        "Environment",
-        &[
-            PatchId::Fog,
-            PatchId::Rain,
-            PatchId::Clouds,
-            PatchId::EnvParticles,
-            PatchId::Shadow,
-            PatchId::Light,
-        ],
-    ),
-    (
-        "Effects",
-        &[
-            PatchId::Delirium,
-            PatchId::Particles,
+pub struct Category {
+    pub title: &'static str,
+    pub description: &'static str,
+    pub patches: &'static [PatchId],
+}
+
+pub const CATEGORIES: &[Category] = &[
+    Category {
+        title: "Camera & Map",
+        description: "Camera distance, minimap reveal, and the Atlas.",
+        patches: &[PatchId::Camera, PatchId::Minimap, PatchId::AtlasFog],
+    },
+    Category {
+        title: "Environment",
+        description: "Weather, ambient particles, shadows, and lighting in zones.",
+        patches: &[PatchId::Atmosphere, PatchId::Shadow, PatchId::Light],
+    },
+    Category {
+        title: "Screen",
+        description: "Full-screen filters drawn over the world.",
+        patches: &[PatchId::PostProcess, PatchId::BlackScreen],
+    },
+    Category {
+        title: "Effects",
+        description: "Skill, monster, league, and microtransaction visuals.",
+        patches: &[
             PatchId::Effects,
+            PatchId::Particles,
+            PatchId::Delirium,
             PatchId::MtxSoft,
-            PatchId::BlackScreen,
         ],
-    ),
-    (
-        "Audio",
-        &[
+    },
+    Category {
+        title: "Audio",
+        description: "Effect sounds. Music and voices are not affected.",
+        patches: &[
             PatchId::DisableSounds,
             PatchId::SkillSounds,
             PatchId::MonsterSounds,
         ],
-    ),
-    ("Interface", &[PatchId::ColorMods, PatchId::MonsterHpBar]),
+    },
+    Category {
+        title: "Interface",
+        description: "Tooltips, item text, and health bars.",
+        patches: &[
+            PatchId::ColorMods,
+            PatchId::CompactModLines,
+            PatchId::MonsterHpBar,
+        ],
+    },
 ];
-
-// Column packing chosen to roughly balance column heights (3+3+2 vs 6+5).
-const COLUMNS: [&[usize]; 2] = [&[0, 3, 4], &[1, 2]];
 
 pub fn draw(app: &mut GuiApp, ui: &mut egui::Ui) {
     draw_header(app, ui);
-    draw_action_bar(app, ui);
+    draw_footer(app, ui);
+    draw_sidebar(app, ui);
 
     egui::CentralPanel::default()
         .frame(
             egui::Frame::new()
                 .fill(palette::BG_APP)
-                .inner_margin(egui::Margin::same(16)),
+                .inner_margin(egui::Margin::symmetric(24, 18)),
         )
         .show(ui, |ui| {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    ui.add_enabled_ui(!app.is_busy(), |ui| {
-                        draw_directory_card(app, ui);
-                        ui.add_space(12.0);
-                        draw_preset_toolbar(app, ui);
-                        ui.add_space(12.0);
-                        draw_patch_groups(app, ui);
-                    });
+                    ui.add_enabled_ui(!app.is_busy(), |ui| draw_category(app, ui));
                 });
         });
 
@@ -79,303 +84,244 @@ pub fn draw(app: &mut GuiApp, ui: &mut egui::Ui) {
     draw_modals(app, &ctx);
 }
 
-fn draw_header(app: &GuiApp, ui: &mut egui::Ui) {
+fn draw_header(app: &mut GuiApp, ui: &mut egui::Ui) {
     egui::Panel::top("header")
         .frame(
             egui::Frame::new()
-                .fill(palette::BG_APP)
-                .inner_margin(egui::Margin::symmetric(16, 12)),
+                .fill(palette::BG_CARD)
+                .stroke(egui::Stroke::new(1.0, palette::BORDER_FAINT))
+                .inner_margin(egui::Margin::symmetric(20, 14)),
         )
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 let (rect, _) =
                     ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::hover());
                 icon::paint_logo_mark(ui.painter(), rect);
-                ui.add_space(4.0);
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 1.0;
-                    ui.label(theme::title_text("tiny-poe2smoother"));
-                    ui.label(theme::caption_text(concat!(
-                        "Path of Exile 2 visual patch manager · v",
-                        env!("CARGO_PKG_VERSION")
-                    )));
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if let Some(status) = &app.status {
-                        let (text, color) = patch_state_pill(status.patch_state);
-                        widgets::status_pill(ui, text, color);
-                        widgets::status_pill(ui, "Install detected", palette::SUCCESS);
-                    } else {
-                        widgets::status_pill(ui, "No install detected", palette::WARNING);
-                    }
-                });
+                ui.add_space(2.0);
+                ui.label(theme::title_text("tiny-poe2smoother"));
+                ui.label(theme::caption_text(concat!("v", env!("CARGO_PKG_VERSION"))));
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| match &app.status {
+                        Some(status) => {
+                            let (text, color) = patch_state_pill(status.patch_state);
+                            widgets::status_pill(ui, text, color);
+                        }
+                        None => widgets::status_pill(ui, "No install", palette::WARNING),
+                    },
+                );
+            });
+            ui.add_space(10.0);
+            ui.add_enabled_ui(!app.is_busy(), |ui| {
+                draw_install_row(app, ui);
+                ui.add_space(12.0);
+                draw_profile_bar(app, ui);
             });
         });
 }
 
-fn draw_directory_card(app: &mut GuiApp, ui: &mut egui::Ui) {
-    widgets::card().show(ui, |ui| {
-        ui.set_min_width(ui.available_width());
-        ui.label(theme::heading_text("Game directory"));
-        ui.add_space(6.0);
-        ui.add(
+fn draw_install_row(app: &mut GuiApp, ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        let buttons_width = 190.0;
+        let response = ui.add(
             egui::TextEdit::singleline(&mut app.game_dir_input)
                 .font(egui::TextStyle::Monospace)
-                .hint_text("Path of Exile 2 install directory")
-                .desired_width(f32::INFINITY)
-                .margin(egui::Margin::symmetric(10, 8)),
+                .hint_text("Path of Exile 2 install folder")
+                .desired_width(ui.available_width() - buttons_width)
+                .margin(egui::Margin::symmetric(10, 7)),
         );
-        ui.add_space(2.0);
-        ui.horizontal(|ui| {
-            if ui.button("Browse…").clicked() {
-                if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                    app.select_game_dir(path);
-                }
-            }
-            if ui.button("Validate").clicked() {
-                app.spawn_status();
-            }
-            if ui.button("Detect").clicked() {
-                app.spawn_autodetect();
-            }
-        });
-        if let Some(status) = &app.status {
-            ui.add_space(8.0);
-            egui::Grid::new("status_grid")
-                .num_columns(2)
-                .spacing([16.0, 3.0])
-                .show(ui, |ui| {
-                    let label = |ui: &mut egui::Ui, text: &str| {
-                        ui.label(
-                            egui::RichText::new(text)
-                                .size(11.5)
-                                .color(palette::TEXT_FAINT),
-                        );
-                    };
-                    label(ui, "Layout");
-                    ui.label(theme::caption_text(status.install_layout.label()));
-                    ui.end_row();
-                    label(ui, "Index");
-                    ui.label(
-                        egui::RichText::new(&status.index_display_path)
-                            .size(11.5)
-                            .monospace()
-                            .color(palette::TEXT_MUTED),
-                    );
-                    ui.end_row();
-                    label(ui, "Indexed paths");
-                    ui.label(theme::caption_text(&status.indexed_paths.to_string()));
-                    ui.end_row();
-                    label(ui, "State");
-                    let (state_text, state_color) = patch_state_pill(status.patch_state);
-                    ui.label(
-                        egui::RichText::new(state_text)
-                            .size(11.5)
-                            .color(state_color),
-                    );
-                    ui.end_row();
-                    label(ui, "Backup");
-                    ui.label(theme::caption_text(&format!(
-                        "{} ({})",
-                        display_path(&status.backup_path),
-                        backup_label(status.patch_state)
-                    )));
-                    ui.end_row();
-                });
+        if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+            app.spawn_status();
+        }
+        if ui.button("Browse…").clicked()
+            && let Some(path) = rfd::FileDialog::new().pick_folder()
+        {
+            app.select_game_dir(path);
+        }
+        if ui
+            .button("Detect")
+            .on_hover_text("Find the Steam or standalone install automatically.")
+            .clicked()
+        {
+            app.spawn_autodetect();
         }
     });
+    if let Some(status) = &app.status {
+        let (text, color) = install_summary(status);
+        ui.label(egui::RichText::new(text).size(11.5).color(color));
+    }
 }
 
-fn draw_preset_toolbar(app: &mut GuiApp, ui: &mut egui::Ui) {
-    widgets::card().show(ui, |ui| {
-        ui.set_min_width(ui.available_width());
-        ui.horizontal(|ui| {
+fn install_summary(status: &AppStatus) -> (String, egui::Color32) {
+    let layout = match status.install_layout {
+        InstallLayout::LooseBundles => "Steam install",
+        InstallLayout::ContentGgpk => "Standalone install",
+    };
+    match status.patch_state {
+        PatchState::Clean => (
+            format!("{layout} · original game files"),
+            palette::TEXT_FAINT,
+        ),
+        PatchState::Patched => (
+            format!("{layout} · patched, backup ready to restore"),
+            palette::TEXT_FAINT,
+        ),
+        PatchState::StaleBackup => (
+            format!(
+                "{layout} · the game updated since the last apply. The old backup will be replaced"
+            ),
+            palette::WARNING,
+        ),
+        PatchState::PatchedMissingBackup => (
+            format!(
+                "{layout} · patched but the backup is missing. Verify the game files in Steam or the launcher"
+            ),
+            palette::ERROR,
+        ),
+    }
+}
+
+fn draw_profile_bar(app: &mut GuiApp, ui: &mut egui::Ui) {
+    let size = egui::vec2(ui.available_width(), 30.0);
+    ui.allocate_ui_with_layout(
+        size,
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
             ui.label(
-                egui::RichText::new("Presets")
-                    .size(11.5)
+                egui::RichText::new("Profile")
+                    .size(12.0)
                     .family(theme::family_medium())
                     .color(palette::TEXT_FAINT),
             );
+            ui.add_space(4.0);
+            let active = app.active_profile();
+            ui.spacing_mut().item_spacing.x = 6.0;
+            for (index, profile) in all_profiles().iter().enumerate() {
+                let response = widgets::segment(ui, profile.title, active == Some(index), true)
+                    .on_hover_text(profile.description);
+                if response.clicked() {
+                    app.apply_profile(profile);
+                }
+            }
+            widgets::segment(ui, "Custom", active.is_none(), false)
+                .on_hover_text("Your own selection. Pick a profile to replace it.");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if small_action(ui, "Select none") {
+                if small_action(ui, "Clear all") {
                     app.selected_patches.clear();
                 }
-                if small_action(ui, "Select all") {
-                    app.selected_patches = all_patches().iter().map(|patch| patch.id).collect();
-                }
             });
-        });
-        ui.add_space(2.0);
-        ui.horizontal_wrapped(|ui| {
-            for preset in all_presets() {
-                let active = preset
+        },
+    );
+}
+
+fn draw_sidebar(app: &mut GuiApp, ui: &mut egui::Ui) {
+    egui::Panel::left("categories")
+        .resizable(false)
+        .exact_size(200.0)
+        .frame(
+            egui::Frame::new()
+                .fill(palette::BG_APP)
+                .stroke(egui::Stroke::new(1.0, palette::BORDER_FAINT))
+                .inner_margin(egui::Margin::symmetric(12, 18)),
+        )
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 4.0;
+            for (index, category) in CATEGORIES.iter().enumerate() {
+                let count = category
                     .patches
                     .iter()
-                    .all(|patch| app.selected_patches.contains(patch));
-                let chip = widgets::chip(&display_name(preset.name), active);
-                if ui.add(chip).on_hover_text(preset.description).clicked() {
-                    for patch in preset.patches {
-                        app.selected_patches.insert(*patch);
-                    }
+                    .filter(|patch| app.selected_patches.contains(patch))
+                    .count();
+                if widgets::nav_item(ui, category.title, count, app.active_category == index)
+                    .clicked()
+                {
+                    app.active_category = index;
                 }
             }
-        });
-    });
-}
-
-fn draw_patch_groups(app: &mut GuiApp, ui: &mut egui::Ui) {
-    ui.columns(2, |columns| {
-        for (column, group_indices) in columns.iter_mut().zip(COLUMNS) {
-            for (i, &group_index) in group_indices.iter().enumerate() {
-                if i > 0 {
-                    column.add_space(12.0);
-                }
-                let (title, patch_ids) = GROUPS[group_index];
-                draw_patch_group(app, column, title, patch_ids);
-            }
-        }
-    });
-}
-
-fn draw_patch_group(app: &mut GuiApp, ui: &mut egui::Ui, title: &str, patch_ids: &[PatchId]) {
-    widgets::card().show(ui, |ui| {
-        ui.set_min_width(ui.available_width());
-        let selected_count = patch_ids
-            .iter()
-            .filter(|id| app.selected_patches.contains(id))
-            .count();
-        ui.horizontal(|ui| {
-            ui.label(theme::heading_text(title));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(
-                    egui::RichText::new(format!("{selected_count}/{}", patch_ids.len()))
-                        .size(11.5)
-                        .color(palette::TEXT_FAINT),
-                );
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                let selected = app.selected_patches.len();
+                let noun = if selected == 1 { "patch" } else { "patches" };
+                ui.label(theme::caption_text(&format!("{selected} {noun} selected")));
             });
         });
-        ui.add_space(4.0);
-        for &patch_id in patch_ids {
-            let patch = patch_info(patch_id);
-            let mut selected = app.selected_patches.contains(&patch_id);
-            widgets::patch_row(
-                ui,
-                &mut selected,
-                &display_name(patch.name),
-                patch.description,
-            );
-            if selected {
-                app.selected_patches.insert(patch_id);
-            } else {
-                app.selected_patches.remove(&patch_id);
-            }
-            if patch_id == PatchId::Camera {
-                draw_zoom_row(app, ui);
-            }
-            if patch_id == PatchId::ColorMods {
-                draw_color_mods_row(app, ui);
-            }
-            if patch_id == PatchId::Effects {
-                draw_effects_row(app, ui);
-            }
-        }
-    });
 }
 
-/// `1 skill`, `2 skills` — count with a singular/plural noun.
-fn count_label(count: usize, noun: &str) -> String {
-    if count == 1 {
-        format!("{count} {noun}")
+fn draw_category(app: &mut GuiApp, ui: &mut egui::Ui) {
+    let category = &CATEGORIES[app.active_category.min(CATEGORIES.len() - 1)];
+    ui.label(theme::heading_text(category.title));
+    ui.label(theme::caption_text(category.description));
+    ui.add_space(12.0);
+    for &patch in category.patches {
+        widgets::card().show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            draw_patch(app, ui, patch);
+        });
+        ui.add_space(8.0);
+    }
+}
+
+fn draw_patch(app: &mut GuiApp, ui: &mut egui::Ui, patch: PatchId) {
+    let info = patch_info(patch);
+    let mut selected = app.selected_patches.contains(&patch);
+    widgets::patch_row(ui, &mut selected, info.title, info.description);
+    if selected {
+        app.selected_patches.insert(patch);
     } else {
-        format!("{count} {noun}s")
+        app.selected_patches.remove(&patch);
+        return;
+    }
+
+    draw_patch_options(app, ui, patch);
+    match patch {
+        PatchId::Camera => draw_zoom_row(app, ui),
+        PatchId::Minimap => draw_minimap_controls(app, ui),
+        PatchId::ColorMods => draw_color_mods_row(app, ui),
+        PatchId::Effects => draw_effects_row(app, ui),
+        PatchId::Particles if !app.selected_patches.contains(&PatchId::Effects) => {
+            draw_effects_row(app, ui)
+        }
+        _ => {}
     }
 }
 
-fn draw_color_mods_row(app: &mut GuiApp, ui: &mut egui::Ui) {
-    if !app.selected_patches.contains(&PatchId::ColorMods) {
+fn draw_patch_options(app: &mut GuiApp, ui: &mut egui::Ui, patch: PatchId) {
+    let options = patch_options(patch);
+    if options.is_empty() {
         return;
     }
-    ui.horizontal(|ui| {
-        ui.add_space(26.0);
-        if small_action(ui, "Edit colors…") {
-            app.show_color_editor = true;
-            app.ensure_catalog_loading();
-        }
-        let enabled = app.color_mods.iter().filter(|entry| entry.enabled).count();
-        ui.label(theme::caption_text(&format!(
-            "{} enabled",
-            count_label(enabled, "mod")
-        )));
-    });
-}
-
-fn draw_effects_row(app: &mut GuiApp, ui: &mut egui::Ui) {
-    if !app.effects_editor_accessible() {
-        return;
-    }
-    // The caption groups per skill only once the catalog is in, so start the
-    // load right away instead of waiting for the editor to be opened. The
-    // error guard keeps a failed load from respawning the loader every frame;
-    // the editor's Retry button clears it for manual retries. The monster
-    // catalog reads every monster metadata file, so it only loads once its
-    // editor tab is shown.
-    if app.effect_catalog.is_none()
-        && app.effect_catalog_task.is_none()
-        && app.effect_catalog_error.is_none()
-    {
-        app.ensure_effect_catalog_loading();
-    }
-    // The small Others catalog loads eagerly too for the summary counts.
-    if app.other_catalog.is_none()
-        && app.other_catalog_task.is_none()
-        && app.other_catalog_error.is_none()
-    {
-        app.ensure_other_effect_catalog_loading();
-    }
-    ui.horizontal(|ui| {
-        ui.add_space(26.0);
-        if small_action(ui, "Edit effects…") {
-            app.show_effects_editor = true;
-            app.ensure_active_effects_tab_loading();
-        }
-        let skills = app.kept_original_effect_skill_count();
-        let monsters = app.kept_original_monster_count();
-        // Others overrides share the skills map but count only in Others below.
-        let caption = if app.other_catalog.is_some() {
-            let others = app.kept_original_other_effect_count();
-            if skills == 0 && monsters == 0 && others == 0 {
-                "all effects reduced".to_string()
-            } else {
-                format!(
-                    "{} · {} · {} kept original",
-                    count_label(skills, "skill"),
-                    count_label(monsters, "monster"),
-                    count_label(others, "other")
-                )
+    ui.add_space(4.0);
+    widgets::indented(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 14.0;
+            for option in options {
+                let mut enabled = app.options.enabled(patch, option.key);
+                let label = egui::RichText::new(option.label)
+                    .size(12.5)
+                    .color(palette::TEXT);
+                if ui
+                    .checkbox(&mut enabled, label)
+                    .on_hover_text(option.description)
+                    .changed()
+                {
+                    app.options.set(patch, option.key, enabled);
+                }
             }
-        } else if skills == 0 && monsters == 0 {
-            "all effects reduced".to_string()
-        } else {
-            format!(
-                "{} · {} kept original",
-                count_label(skills, "skill"),
-                count_label(monsters, "monster")
-            )
-        };
-        ui.label(theme::caption_text(&caption));
+        });
+        if !app.options.any_enabled(patch) {
+            ui.label(
+                egui::RichText::new("Turn on at least one option, or uncheck this patch.")
+                    .size(11.5)
+                    .color(palette::WARNING),
+            );
+        }
     });
 }
 
 fn draw_zoom_row(app: &mut GuiApp, ui: &mut egui::Ui) {
-    let camera_selected = app.selected_patches.contains(&PatchId::Camera);
-    ui.horizontal(|ui| {
-        ui.add_space(26.0);
-        ui.add_enabled_ui(camera_selected, |ui| {
-            ui.label(
-                egui::RichText::new("Zoom")
-                    .size(11.5)
-                    .color(palette::TEXT_FAINT),
-            );
+    ui.add_space(4.0);
+    widgets::indented(ui, |ui| {
+        ui.horizontal(|ui| {
+            control_label(ui, "Zoom");
             ui.add(
                 egui::Slider::new(&mut app.zoom, 1.2..=2.4)
                     .step_by(0.1)
@@ -385,87 +331,214 @@ fn draw_zoom_row(app: &mut GuiApp, ui: &mut egui::Ui) {
                 egui::RichText::new(format!("{:.1}×", app.zoom))
                     .size(12.5)
                     .monospace()
-                    .color(if camera_selected {
-                        palette::ACCENT
-                    } else {
-                        palette::TEXT_FAINT
-                    }),
+                    .color(palette::ACCENT),
             );
         });
     });
 }
 
-fn draw_action_bar(app: &mut GuiApp, ui: &mut egui::Ui) {
-    egui::Panel::bottom("actions")
+fn draw_minimap_controls(app: &mut GuiApp, ui: &mut egui::Ui) {
+    ui.add_space(4.0);
+    widgets::indented(ui, |ui| {
+        ui.horizontal(|ui| {
+            control_label(ui, "Reveal");
+            ui.add(
+                egui::Slider::new(&mut app.minimap.reveal, 0.0..=1.0)
+                    .step_by(0.01)
+                    .show_value(false),
+            )
+            .on_hover_text("How strongly unexplored terrain is drawn.");
+            ui.label(
+                egui::RichText::new(format!("{:.0}%", app.minimap.reveal * 100.0))
+                    .size(12.5)
+                    .monospace()
+                    .color(palette::ACCENT),
+            );
+        });
+        ui.horizontal(|ui| {
+            control_label(ui, "Floor");
+            ui.color_edit_button_rgba_unmultiplied(&mut app.minimap.walkable)
+                .on_hover_text("Fill color and opacity of walkable ground.");
+            ui.add_space(12.0);
+            control_label(ui, "Walls");
+            ui.color_edit_button_rgba_unmultiplied(&mut app.minimap.edge)
+                .on_hover_text("Color and opacity of walls and edges.");
+            ui.add_space(12.0);
+            if app.minimap != MinimapStyle::DEFAULT && small_action(ui, "Reset") {
+                app.minimap = MinimapStyle::DEFAULT;
+            }
+        });
+    });
+}
+
+fn control_label(ui: &mut egui::Ui, text: &str) {
+    ui.add_sized(
+        [44.0, 18.0],
+        egui::Label::new(
+            egui::RichText::new(text)
+                .size(12.0)
+                .color(palette::TEXT_FAINT),
+        ),
+    );
+}
+
+fn draw_color_mods_row(app: &mut GuiApp, ui: &mut egui::Ui) {
+    ui.add_space(4.0);
+    widgets::indented(ui, |ui| {
+        ui.horizontal(|ui| {
+            if small_action(ui, "Edit colors…") {
+                app.show_color_editor = true;
+                app.ensure_catalog_loading();
+            }
+            let enabled = app.color_mods.iter().filter(|entry| entry.enabled).count();
+            ui.label(theme::caption_text(&format!(
+                "{} colored",
+                count_label(enabled, "mod")
+            )));
+        });
+    });
+}
+
+fn draw_effects_row(app: &mut GuiApp, ui: &mut egui::Ui) {
+    if !app.effects_editor_accessible() {
+        return;
+    }
+    // Load eagerly so the caption can count per skill. The error guard stops a failed
+    // load from respawning every frame. Monsters load only when their tab opens.
+    if app.effect_catalog.is_none()
+        && app.effect_catalog_task.is_none()
+        && app.effect_catalog_error.is_none()
+    {
+        app.ensure_effect_catalog_loading();
+    }
+    if app.other_catalog.is_none()
+        && app.other_catalog_task.is_none()
+        && app.other_catalog_error.is_none()
+    {
+        app.ensure_other_effect_catalog_loading();
+    }
+    ui.add_space(4.0);
+    widgets::indented(ui, |ui| {
+        ui.horizontal(|ui| {
+            if small_action(ui, "Edit effects…") {
+                app.show_effects_editor = true;
+                app.ensure_active_effects_tab_loading();
+            }
+            ui.label(theme::caption_text(&effects_caption(app)));
+        });
+    });
+}
+
+fn effects_caption(app: &GuiApp) -> String {
+    let skills = app.kept_original_effect_skill_count();
+    let monsters = app.kept_original_monster_count();
+    // Others overrides share the skills map but count only in Others.
+    let others = app
+        .other_catalog
+        .is_some()
+        .then(|| app.kept_original_other_effect_count());
+    if skills == 0 && monsters == 0 && others.unwrap_or(0) == 0 {
+        return "every effect reduced".to_string();
+    }
+    let mut parts = vec![
+        count_label(skills, "skill"),
+        count_label(monsters, "monster"),
+    ];
+    if let Some(others) = others {
+        parts.push(count_label(others, "other"));
+    }
+    format!("{} kept original", parts.join(" · "))
+}
+
+fn draw_footer(app: &mut GuiApp, ui: &mut egui::Ui) {
+    egui::Panel::bottom("footer")
         .frame(
             egui::Frame::new()
                 .fill(palette::BG_CARD)
-                .inner_margin(egui::Margin::symmetric(16, 10)),
+                .stroke(egui::Stroke::new(1.0, palette::BORDER_FAINT))
+                .inner_margin(egui::Margin::symmetric(20, 12)),
         )
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 let busy = app.is_busy();
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let already_patched = app
-                        .status
-                        .as_ref()
-                        .map(|status| status.patch_state.is_currently_patched())
-                        .unwrap_or(false);
-                    let can_restore = app
-                        .status
-                        .as_ref()
-                        .map(|status| status.patch_state.can_restore())
-                        .unwrap_or(false);
+                let patched = app
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.patch_state.is_currently_patched());
+                let can_restore = app
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.patch_state.can_restore());
 
-                    let apply = widgets::primary_button("Apply");
-                    if ui.add_enabled(!already_patched && !busy, apply).clicked() {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let apply = ui
+                        .add_enabled(!patched && !busy, widgets::primary_button("Apply"))
+                        .on_disabled_hover_text(if patched {
+                            "Restore first to apply a different selection."
+                        } else {
+                            "Working…"
+                        });
+                    if apply.clicked() {
                         match app.patch_request() {
                             Ok(_) => app.confirm_apply = true,
                             Err(err) => app.set_message(err, MessageKind::Error),
                         }
                     }
-                    let restore = widgets::secondary_button("Restore");
-                    if ui.add_enabled(can_restore && !busy, restore).clicked() {
+                    if ui
+                        .add_enabled(can_restore && !busy, widgets::secondary_button("Restore"))
+                        .clicked()
+                    {
                         app.confirm_restore = true;
                     }
 
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         if busy {
                             ui.add(egui::Spinner::new().color(palette::ACCENT));
-                            if let Some(label) = &app.busy_label {
-                                ui.label(theme::caption_text(label));
-                            }
-                            let t = ((ui.input(|i| i.time) * 0.9) % 1.0) as f32;
-                            ui.add(
-                                egui::ProgressBar::new(t)
-                                    .desired_width(140.0)
-                                    .desired_height(4.0)
-                                    .fill(palette::ACCENT)
-                                    .corner_radius(2),
+                        } else {
+                            let (rect, _) =
+                                ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                            ui.painter().circle_filled(
+                                rect.center(),
+                                4.0,
+                                message_color(app.message_kind),
                             );
                         }
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&app.message)
+                                    .size(12.5)
+                                    .color(message_color(app.message_kind)),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(&app.message);
                     });
                 });
             });
         });
 }
 
+fn message_color(kind: MessageKind) -> egui::Color32 {
+    match kind {
+        MessageKind::Info => palette::TEXT_MUTED,
+        MessageKind::Success => palette::SUCCESS,
+        MessageKind::Error => palette::ERROR,
+    }
+}
+
 fn draw_modals(app: &mut GuiApp, ctx: &egui::Context) {
     if app.confirm_apply {
-        let modal = confirm_modal(ctx, "confirm_apply", |ui| {
+        let close = confirm_modal(ctx, "confirm_apply", |ui| {
             ui.label(theme::heading_text("Apply patches?"));
             ui.add_space(6.0);
             ui.label(
                 egui::RichText::new(
-                    "This will modify Path of Exile 2 bundle files after creating a backup.",
+                    "Path of Exile 2 game files will be modified. A backup is created first.",
                 )
                 .color(palette::TEXT_MUTED),
             );
-            ui.add_space(2.0);
-            ui.label(theme::caption_text(&format!(
-                "{} patch(es) selected",
-                app.selected_patches.len()
-            )));
+            ui.add_space(6.0);
+            ui.label(theme::caption_text(&selected_titles(app)));
             ui.add_space(12.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.add(widgets::primary_button("Apply")).clicked() {
@@ -484,21 +557,32 @@ fn draw_modals(app: &mut GuiApp, ctx: &egui::Context) {
                 }
             });
         });
-        if modal {
+        if close {
             app.confirm_apply = false;
         }
     }
 
     if app.confirm_restore {
-        let modal = confirm_modal(ctx, "confirm_restore", |ui| {
-            ui.label(theme::heading_text("Restore backup?"));
+        let backup = app
+            .status
+            .as_ref()
+            .map(|status| display_path(&status.backup_path));
+        let close = confirm_modal(ctx, "confirm_restore", |ui| {
+            ui.label(theme::heading_text("Restore original files?"));
             ui.add_space(6.0);
             ui.label(
-                egui::RichText::new(
-                    "This will restore files from the current tiny-poe2smoother backup.",
-                )
-                .color(palette::TEXT_MUTED),
+                egui::RichText::new("Every patched file is restored from the backup.")
+                    .color(palette::TEXT_MUTED),
             );
+            if let Some(backup) = &backup {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(backup)
+                        .size(11.5)
+                        .monospace()
+                        .color(palette::TEXT_FAINT),
+                );
+            }
             ui.add_space(12.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.add(widgets::danger_button("Restore")).clicked() {
@@ -514,21 +598,21 @@ fn draw_modals(app: &mut GuiApp, ctx: &egui::Context) {
                 }
             });
         });
-        if modal {
+        if close {
             app.confirm_restore = false;
         }
     }
 
     if app.show_color_editor {
-        draw_color_editor(app, ctx);
+        editors::draw_color_editor(app, ctx);
     }
 
     if app.show_effects_editor {
-        draw_effects_editor(app, ctx);
+        editors::draw_effects_editor(app, ctx);
     }
 
     if app.show_game_running_dialog {
-        let modal = confirm_modal(ctx, "game_running", |ui| {
+        let close = confirm_modal(ctx, "game_running", |ui| {
             ui.label(
                 egui::RichText::new("Path of Exile 2 is running")
                     .size(15.0)
@@ -537,12 +621,10 @@ fn draw_modals(app: &mut GuiApp, ctx: &egui::Context) {
             );
             ui.add_space(6.0);
             ui.label(
-                egui::RichText::new("Close Path of Exile 2 before applying patches or restoring.")
-                    .color(palette::TEXT_MUTED),
-            );
-            ui.label(
-                egui::RichText::new("The game must be fully closed — not minimized to tray.")
-                    .color(palette::TEXT_MUTED),
+                egui::RichText::new(
+                    "Close the game completely, not just minimized to the tray, then try again.",
+                )
+                .color(palette::TEXT_MUTED),
             );
             ui.add_space(12.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -551,862 +633,47 @@ fn draw_modals(app: &mut GuiApp, ctx: &egui::Context) {
                 }
             });
         });
-        if modal {
+        if close {
             app.show_game_running_dialog = false;
         }
     }
 }
 
-const COLOR_ROW_HEIGHT: f32 = 26.0;
-
-/// The color-mods editor: search box over the configured entries plus the
-/// stat catalog parsed from the game files, one row per mod with an enabled
-/// checkbox, preset swatches, and a custom RGB picker. Wider than
-/// `confirm_modal`, hence its own modal.
-fn draw_color_editor(app: &mut GuiApp, ctx: &egui::Context) {
-    let modal = egui::Modal::new(egui::Id::new("color_mods_editor"))
-        .frame(widgets::card().inner_margin(20))
-        .backdrop_color(egui::Color32::from_black_alpha(140))
-        .show(ctx, |ui| {
-            ui.set_width(640.0);
-            ui.label(theme::heading_text("Color mods"));
-            ui.add_space(2.0);
-            ui.label(theme::caption_text(
-                "Colorize modifier text wherever it appears in game — waystones, items, tablets.",
-            ));
-            ui.add_space(8.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut app.color_search)
-                    .hint_text(
-                        "Search stat id or text — regex like in-game search, \"quotes\", !exclude…",
-                    )
-                    .desired_width(f32::INFINITY)
-                    .margin(egui::Margin::symmetric(10, 8)),
-            );
-            ui.add_space(6.0);
-            if app.catalog_task.is_some() {
-                ui.horizontal(|ui| {
-                    ui.add(egui::Spinner::new().color(palette::ACCENT));
-                    ui.label(theme::caption_text("Loading mod catalog from game files…"));
-                });
-                ui.add_space(4.0);
-            } else if let Some(error) = app.catalog_error.clone() {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!("Mod catalog unavailable: {error}"))
-                            .size(11.5)
-                            .color(palette::WARNING),
-                    );
-                    if small_action(ui, "Retry") {
-                        app.catalog_error = None;
-                        app.ensure_catalog_loading();
-                    }
-                });
-                ui.add_space(4.0);
-            }
-
-            app.refresh_color_filter();
-            let row_count = app.color_filter_rows.len();
-            egui::ScrollArea::vertical()
-                .max_height(380.0)
-                .auto_shrink([false, true])
-                .show_rows(ui, COLOR_ROW_HEIGHT, row_count, |ui, range| {
-                    for i in range {
-                        let row = app.color_filter_rows[i];
-                        draw_color_mod_list_row(app, ui, row);
-                    }
-                });
-
-            ui.add_space(10.0);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add(widgets::primary_button("Close")).clicked() {
-                    app.show_color_editor = false;
-                }
-                if ui
-                    .add(widgets::secondary_button("Reset to defaults"))
-                    .clicked()
-                {
-                    app.color_mods = default_color_mods();
-                    app.color_filter_key = None;
-                }
-            });
-        })
-        .should_close();
-    if modal {
-        app.show_color_editor = false;
-    }
-}
-
-fn draw_color_mod_list_row(app: &mut GuiApp, ui: &mut egui::Ui, row: ColorRowRef) {
-    match row {
-        ColorRowRef::Config(idx) => {
-            let text = app
-                .catalog_text(&app.color_mods[idx].stat_id)
-                .map(str::to_string);
-            color_row_ui(ui, &mut app.color_mods[idx], text.as_deref());
-        }
-        ColorRowRef::Catalog(idx) => {
-            // Not configured yet: render an ephemeral disabled entry; any
-            // interaction (checkbox, swatch, picker) promotes it into the
-            // config as enabled. That is the whole "add custom mod" flow.
-            let Some(catalog) = &app.stat_catalog else {
-                return;
-            };
-            let catalog_row = &catalog[idx];
-            let mut entry = ColorModEntry {
-                stat_id: catalog_row.stat_id.clone(),
-                color: PRESET_COLORS[0].1,
-                enabled: false,
-            };
-            let text = (!catalog_row.text.is_empty()).then(|| catalog_row.text.clone());
-            if color_row_ui(ui, &mut entry, text.as_deref()) {
-                entry.enabled = true;
-                app.color_mods.push(entry);
-            }
-        }
-    }
-}
-
-/// One editor row; returns true when the user changed anything.
-fn color_row_ui(ui: &mut egui::Ui, entry: &mut ColorModEntry, text: Option<&str>) -> bool {
-    let mut changed = false;
-    ui.allocate_ui_with_layout(
-        egui::vec2(ui.available_width(), COLOR_ROW_HEIGHT),
-        egui::Layout::left_to_right(egui::Align::Center),
-        |ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            changed |= ui.checkbox(&mut entry.enabled, "").changed();
-            for (name, color) in PRESET_COLORS {
-                let selected = entry.color == color;
-                let swatch = widgets::color_swatch(
-                    ui,
-                    egui::Color32::from_rgb(color[0], color[1], color[2]),
-                    selected,
-                )
-                .on_hover_text(name);
-                if swatch.clicked() && !selected {
-                    entry.color = color;
-                    changed = true;
-                }
-            }
-            changed |= ui.color_edit_button_srgb(&mut entry.color).changed();
-            ui.add_space(4.0);
-            // Show only the human-readable text; fall back to the stat id
-            // when the catalog has no text for it (or is still loading).
-            // Truncated so long entries never widen the row while scrolling.
-            let display = text.unwrap_or(&entry.stat_id);
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(display)
-                        .size(11.5)
-                        .color(if entry.enabled {
-                            palette::TEXT
-                        } else {
-                            palette::TEXT_MUTED
-                        }),
-                )
-                .truncate(),
-            )
-            .on_hover_text(&entry.stat_id);
-        },
-    );
-    changed
-}
-
-const EFFECTS_SKILLS_DESCRIPTION: &str =
-    "Toggled on strips heavy client effects (default) · off keeps original visuals.";
-const EFFECTS_MONSTERS_DESCRIPTION: &str =
-    "Toggled on strips heavy client effects (default) · off keeps original visuals. \
-     Shared effects stay original for all monsters using them · unlisted monsters stay reduced.";
-const EFFECTS_OTHERS_DESCRIPTION: &str =
-    "Shared or unmapped effects (default reduced) · off keeps original visuals, including \
-     referenced particles even with Particles enabled. Kept effects stay original for other users.";
-
-/// The effects editor: one modal, a tab per exception list (skills, monsters
-/// and others). Each tab is a search box over its catalog with one on/off
-/// smoothing toggle per row, same layout as the color-mods editor. Tab
-/// bodies keep separate search/filter/scroll state, and the bulk buttons
-/// only ever touch the active tab's filtered rows.
-fn draw_effects_editor(app: &mut GuiApp, ctx: &egui::Context) {
-    let modal = egui::Modal::new(egui::Id::new("effects_editor"))
-        .frame(widgets::card().inner_margin(20))
-        .backdrop_color(egui::Color32::from_black_alpha(140))
-        .show(ctx, |ui| {
-            ui.set_width(640.0);
-            ui.horizontal(|ui| {
-                ui.label(theme::heading_text("Effects"));
-                ui.add_space(8.0);
-                for (tab, label) in [
-                    (EffectsEditorTab::Skills, "Skills"),
-                    (EffectsEditorTab::Monsters, "Monsters"),
-                    (EffectsEditorTab::Others, "Others"),
-                ] {
-                    let active = app.effects_editor_tab == tab;
-                    if ui.add(widgets::chip(label, active)).clicked() && !active {
-                        app.effects_editor_tab = tab;
-                        app.ensure_active_effects_tab_loading();
-                    }
-                }
-            });
-            ui.add_space(2.0);
-            match app.effects_editor_tab {
-                EffectsEditorTab::Skills => draw_effects_skills_tab(app, ui),
-                EffectsEditorTab::Monsters => draw_effects_monsters_tab(app, ui),
-                EffectsEditorTab::Others => draw_effects_others_tab(app, ui),
-            }
-        })
-        .should_close();
-    if modal {
-        app.show_effects_editor = false;
-    }
-}
-
-fn draw_effects_skills_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
-    draw_effects_tab_description(ui, EFFECTS_SKILLS_DESCRIPTION);
-    ui.add_space(8.0);
-    ui.add(
-        egui::TextEdit::singleline(&mut app.effects_search)
-            .id_salt("effects_skills_search")
-            .hint_text("Search skills — regex like in-game search, \"quotes\", !exclude…")
-            .desired_width(f32::INFINITY)
-            .margin(egui::Margin::symmetric(10, 8)),
-    );
-    ui.add_space(6.0);
-    if app.effect_catalog_task.is_some() {
-        ui.horizontal(|ui| {
-            ui.add(egui::Spinner::new().color(palette::ACCENT));
-            ui.label(theme::caption_text("Loading skill list from game files…"));
-        });
-        ui.add_space(4.0);
-    } else if let Some(error) = app.effect_catalog_error.clone() {
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(format!("Skill list unavailable: {error}"))
-                    .size(11.5)
-                    .color(palette::WARNING),
-            );
-            if small_action(ui, "Retry") {
-                app.effect_catalog_error = None;
-                app.ensure_effect_catalog_loading();
-            }
-        });
-        ui.add_space(4.0);
-    }
-
-    if app.other_catalog_task.is_some() {
-        ui.horizontal(|ui| {
-            ui.add(egui::Spinner::new().color(palette::ACCENT));
-            ui.label(theme::caption_text(
-                "Loading shared effects for cross-tab preservation…",
-            ));
-        });
-        ui.add_space(4.0);
-    } else if app.other_catalog.is_none() {
-        if let Some(error) = app.other_catalog_error.clone() {
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Shared effects unavailable: {error} — reductions needing them stay pending"
-                    ))
-                    .size(11.5)
-                    .color(palette::WARNING),
-                );
-                if small_action(ui, "Retry") {
-                    app.other_catalog_error = None;
-                    app.ensure_other_effect_catalog_loading();
-                }
-            });
-            ui.add_space(4.0);
-        }
-    }
-
-    app.refresh_effects_filter();
-    let row_count = app.effects_filter_rows.len();
-    let bulk_folders: Vec<String> = {
-        let catalog = app.effect_catalog.as_deref().unwrap_or_default();
-        app.effects_filter_rows
-            .iter()
-            .flat_map(|&idx| catalog[idx].folders.iter().cloned())
-            .collect()
-    };
-    let can_bulk_reduce = app.can_reduce_effect_folders(&bulk_folders);
-    draw_effects_list_header(
-        ui,
-        |ui| {
-            ui.label(theme::caption_text(&format!("{row_count} shown")));
-        },
-        |_| {},
-    );
-    if !can_bulk_reduce && row_count > 0 {
-        ui.label(theme::caption_text(
-            "Waiting for skill/shared lists to preserve sibling visuals — reducing stays pending.",
-        ));
-    }
-    ui.add_space(4.0);
-    // Distinct salt per tab: both lists sit at the same spot in the modal,
-    // so without it they would share one persisted scroll offset.
-    egui::ScrollArea::vertical()
-        .id_salt("effects_skills_list")
-        .max_height(380.0)
-        .auto_shrink([false, false])
-        .show_rows(ui, COLOR_ROW_HEIGHT, row_count, |ui, range| {
-            for i in range {
-                let idx = app.effects_filter_rows[i];
-                draw_effect_skill_row(app, ui, idx);
-            }
-        });
-
-    ui.add_space(10.0);
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        if ui.add(widgets::primary_button("Close")).clicked() {
-            app.show_effects_editor = false;
-        }
-        ui.add_enabled_ui(row_count > 0, |ui| {
-            if ui.add(widgets::secondary_button("Uncheck all")).clicked() {
-                app.apply_effect_level_to_filtered_rows(EffectLevel::Full);
-            }
-            ui.add_enabled_ui(can_bulk_reduce, |ui| {
-                if ui.add(widgets::secondary_button("Check all")).clicked() {
-                    app.apply_effect_level_to_filtered_rows(EffectLevel::Reduced);
-                }
-            });
-        });
-    });
-}
-
-/// One skill row: smoothing toggle plus the skill name. A row may own several
-/// folders; reducing under an inherited parent expands it first, and stays
-/// disabled while a required catalog is missing.
-fn draw_effect_skill_row(app: &mut GuiApp, ui: &mut egui::Ui, idx: usize) {
-    let (folders, display, active_skill_id, action_type, level) = {
-        let Some(catalog) = &app.effect_catalog else {
-            return;
-        };
-        let row = &catalog[idx];
-        (
-            row.folders.clone(),
-            row.display.clone(),
-            row.active_skill_id.clone(),
-            row.action_type.clone(),
-            app.effect_level_for_folders(&row.folders),
-        )
-    };
-    let reducible = app.can_reduce_effect_folders(&folders);
-    let mixed = level.is_none();
-    let mut reduced = level == Some(EffectLevel::Reduced);
-    let blocked = level != Some(EffectLevel::Reduced) && !reducible;
-    let hover = format!(
-        "{}\n{}\n{}",
-        active_skill_id,
-        action_type,
-        folders.join("\n")
-    );
-    let hover = if blocked {
-        format!("{hover}\nWaiting for skill/shared lists to preserve sibling visuals…")
-    } else {
-        hover
-    };
-    ui.allocate_ui_with_layout(
-        egui::vec2(ui.available_width(), COLOR_ROW_HEIGHT),
-        egui::Layout::left_to_right(egui::Align::Center),
-        |ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            let toggle = ui.add_enabled_ui(!blocked, |ui| {
-                ui.add(egui::Checkbox::without_text(&mut reduced).indeterminate(mixed))
-            });
-            let toggle = toggle.inner;
-            if toggle.changed() {
-                let new_level = if reduced {
-                    EffectLevel::Reduced
-                } else {
-                    EffectLevel::Full
-                };
-                app.set_skill_folders_level(&folders, new_level);
-            }
-            ui.add_space(4.0);
-            ui.add(
-                egui::Label::new(egui::RichText::new(&display).size(11.5).color(
-                    if level == Some(EffectLevel::Reduced) {
-                        palette::TEXT_MUTED
-                    } else {
-                        palette::TEXT
-                    },
-                ))
-                .truncate(),
-            )
-            .on_hover_text(&hover);
-            toggle.on_hover_text(hover);
-        },
-    );
-}
-
-/// The Others tab: same layout as Skills, with its own search/filter state so
-/// bulk buttons only touch this tab's filtered rows.
-fn draw_effects_others_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
-    draw_effects_tab_description(ui, EFFECTS_OTHERS_DESCRIPTION);
-    ui.add_space(8.0);
-    ui.add(
-        egui::TextEdit::singleline(&mut app.others_search)
-            .id_salt("effects_others_search")
-            .hint_text("Search shared effects — regex like in-game search, \"quotes\", !exclude…")
-            .desired_width(f32::INFINITY)
-            .margin(egui::Margin::symmetric(10, 8)),
-    );
-    ui.add_space(6.0);
-    if app.other_catalog_task.is_some() {
-        ui.horizontal(|ui| {
-            ui.add(egui::Spinner::new().color(palette::ACCENT));
-            ui.label(theme::caption_text(
-                "Loading shared effects list from game files…",
-            ));
-        });
-        ui.add_space(4.0);
-    } else if let Some(error) = app.other_catalog_error.clone() {
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(format!("Shared effects list unavailable: {error}"))
-                    .size(11.5)
-                    .color(palette::WARNING),
-            );
-            if small_action(ui, "Retry") {
-                app.other_catalog_error = None;
-                app.ensure_other_effect_catalog_loading();
-            }
-        });
-        ui.add_space(4.0);
-    }
-
-    if app.effect_catalog_task.is_some() {
-        ui.horizontal(|ui| {
-            ui.add(egui::Spinner::new().color(palette::ACCENT));
-            ui.label(theme::caption_text(
-                "Loading skill list for cross-tab preservation…",
-            ));
-        });
-        ui.add_space(4.0);
-    } else if app.effect_catalog.is_none() {
-        if let Some(error) = app.effect_catalog_error.clone() {
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Skill list unavailable: {error} — reductions needing it stay pending"
-                    ))
-                    .size(11.5)
-                    .color(palette::WARNING),
-                );
-                if small_action(ui, "Retry") {
-                    app.effect_catalog_error = None;
-                    app.ensure_effect_catalog_loading();
-                }
-            });
-            ui.add_space(4.0);
-        }
-    }
-
-    app.refresh_others_filter();
-    let row_count = app.others_filter_rows.len();
-    let bulk_folders: Vec<String> = {
-        let catalog = app.other_catalog.as_deref().unwrap_or_default();
-        app.others_filter_rows
-            .iter()
-            .map(|&idx| catalog[idx].folder.clone())
-            .collect()
-    };
-    let can_bulk_reduce = app.can_reduce_effect_folders(&bulk_folders);
-    draw_effects_list_header(
-        ui,
-        |ui| {
-            ui.label(theme::caption_text(&format!("{row_count} shown")));
-        },
-        |_| {},
-    );
-    if !can_bulk_reduce && row_count > 0 {
-        ui.label(theme::caption_text(
-            "Waiting for skill/shared lists to preserve sibling visuals — reducing stays pending.",
-        ));
-    }
-    ui.add_space(4.0);
-    // Distinct salt per tab: all three lists sit at the same spot in the
-    // modal, so without it they would share one persisted scroll offset.
-    egui::ScrollArea::vertical()
-        .id_salt("effects_others_list")
-        .max_height(380.0)
-        .auto_shrink([false, false])
-        .show_rows(ui, COLOR_ROW_HEIGHT, row_count, |ui, range| {
-            for i in range {
-                let idx = app.others_filter_rows[i];
-                draw_other_effect_row(app, ui, idx);
-            }
-        });
-
-    ui.add_space(10.0);
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        if ui.add(widgets::primary_button("Close")).clicked() {
-            app.show_effects_editor = false;
-        }
-        ui.add_enabled_ui(row_count > 0, |ui| {
-            if ui.add(widgets::secondary_button("Uncheck all")).clicked() {
-                app.apply_other_effect_level_to_filtered_rows(EffectLevel::Full);
-            }
-            ui.add_enabled_ui(can_bulk_reduce, |ui| {
-                if ui.add(widgets::secondary_button("Check all")).clicked() {
-                    app.apply_other_effect_level_to_filtered_rows(EffectLevel::Reduced);
-                }
-            });
-        });
-    });
-}
-
-/// One Others row: unchecked keeps the folder original; reducing under an
-/// inherited parent expands it first so siblings stay Full.
-fn draw_other_effect_row(app: &mut GuiApp, ui: &mut egui::Ui, idx: usize) {
-    let (folder, display, level) = {
-        let Some(catalog) = &app.other_catalog else {
-            return;
-        };
-        let row = &catalog[idx];
-        (
-            row.folder.clone(),
-            row.display.clone(),
-            app.other_effect_level(&row.folder),
-        )
-    };
-    let reducible = app.can_reduce_effect_folders(std::slice::from_ref(&folder));
-    let mut reduced = level == EffectLevel::Reduced;
-    let blocked = level == EffectLevel::Full && !reducible;
-    let hover = format!("metadata/effects/spells/{folder}");
-    let hover = if blocked {
-        format!("{hover}\nWaiting for skill/shared lists to preserve sibling visuals…")
-    } else {
-        hover
-    };
-    ui.allocate_ui_with_layout(
-        egui::vec2(ui.available_width(), COLOR_ROW_HEIGHT),
-        egui::Layout::left_to_right(egui::Align::Center),
-        |ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            let toggle = ui.add_enabled_ui(!blocked, |ui| {
-                ui.add(egui::Checkbox::without_text(&mut reduced))
-            });
-            let toggle = toggle.inner;
-            if toggle.changed() {
-                app.set_other_effect_level(
-                    &folder,
-                    if reduced {
-                        EffectLevel::Reduced
-                    } else {
-                        EffectLevel::Full
-                    },
-                );
-            }
-            ui.add_space(4.0);
-            ui.add(
-                egui::Label::new(egui::RichText::new(&display).size(11.5).color(
-                    if level == EffectLevel::Reduced {
-                        palette::TEXT_MUTED
-                    } else {
-                        palette::TEXT
-                    },
-                ))
-                .truncate(),
-            )
-            .on_hover_text(&hover);
-            toggle.on_hover_text(hover);
-        },
-    );
-}
-
-/// The monsters tab: search box over the monsters mapped from the game
-/// files, one row per monster name with an on/off smoothing toggle. Same
-/// layout as the skills tab.
-fn draw_effects_monsters_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
-    draw_effects_tab_description(ui, EFFECTS_MONSTERS_DESCRIPTION);
-    ui.add_space(8.0);
-    ui.add(
-        egui::TextEdit::singleline(&mut app.monsters_search)
-            .id_salt("effects_monsters_search")
-            .hint_text("Search monsters — regex like in-game search, \"quotes\", !exclude…")
-            .desired_width(f32::INFINITY)
-            .margin(egui::Margin::symmetric(10, 8)),
-    );
-    ui.add_space(6.0);
-    if app.monster_catalog_task.is_some() {
-        ui.horizontal(|ui| {
-            ui.add(egui::Spinner::new().color(palette::ACCENT));
-            ui.label(theme::caption_text(
-                "Loading monster list from game files… (first open takes a moment)",
-            ));
-        });
-        ui.add_space(4.0);
-    } else if let Some(error) = app.monster_catalog_error.clone() {
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(format!("Monster list unavailable: {error}"))
-                    .size(11.5)
-                    .color(palette::WARNING),
-            );
-            if small_action(ui, "Retry") {
-                app.monster_catalog_error = None;
-                app.ensure_monster_catalog_loading();
-            }
-        });
-        ui.add_space(4.0);
-    }
-
-    let unnamed_rows = app.unnamed_monster_row_count();
-    let overridden = app.overridden_unnamed_monster_row_count();
-    let show_unnamed = std::cell::Cell::new(app.show_unnamed_monsters);
-    let (row_count, ()) = draw_effects_list_header(
-        ui,
-        |ui| {
-            // The right side is rendered first, so filter and count both see
-            // a checkbox change during this frame.
-            app.show_unnamed_monsters = show_unnamed.get();
-            app.refresh_monsters_filter();
-            let row_count = app.monsters_filter_rows.len();
-            ui.label(theme::caption_text(&format!("{row_count} shown")));
-            row_count
-        },
-        |ui| {
-            if unnamed_rows > 0 {
-                // Distinct ID space: the Skills tab renders widgets at the
-                // same position and egui would otherwise share state.
-                let mut show = show_unnamed.get();
-                ui.push_id("effects_monsters_show_unnamed", |ui| {
-                    ui.checkbox(
-                        &mut show,
-                        egui::RichText::new(format!("Show unnamed entities ({unnamed_rows})"))
-                            .size(11.5),
-                    )
-                    .on_hover_text(
-                        "Internal rows with no in-game name. While hidden, rows keeping \
-                         original visuals are flagged here — never dropped silently.",
-                    );
-                });
-                if !show {
-                    if overridden > 0 {
-                        if small_action(ui, "Show") {
-                            show = true;
-                        }
-                        ui.label(theme::caption_text(&format!(
-                            "{} keeping original visuals hidden",
-                            count_label(overridden, "unnamed row")
-                        )));
-                    }
-                }
-                show_unnamed.set(show);
-            }
-        },
-    );
-    ui.add_space(4.0);
-    egui::ScrollArea::vertical()
-        .id_salt("effects_monsters_list")
-        .max_height(380.0)
-        .auto_shrink([false, false])
-        .show_rows(ui, COLOR_ROW_HEIGHT, row_count, |ui, range| {
-            for i in range {
-                let idx = app.monsters_filter_rows[i];
-                draw_monster_row(app, ui, idx);
-            }
-        });
-
-    ui.add_space(10.0);
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        if ui.add(widgets::primary_button("Close")).clicked() {
-            app.show_effects_editor = false;
-        }
-        ui.add_enabled_ui(row_count > 0, |ui| {
-            if ui.add(widgets::secondary_button("Uncheck all")).clicked() {
-                app.apply_monster_level_to_filtered_rows(EffectLevel::Full);
-            }
-            if ui.add(widgets::secondary_button("Check all")).clicked() {
-                app.apply_monster_level_to_filtered_rows(EffectLevel::Reduced);
-            }
-        });
-    });
-}
-
-fn draw_effects_tab_description(ui: &mut egui::Ui, text: &str) {
-    // The monster copy wraps to two lines; reserve that height for both tabs
-    // so the search field stays anchored while switching between them.
-    let height = 2.0 * ui.text_style_height(&egui::TextStyle::Small);
-    let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), height),
-        egui::Sense::hover(),
-    );
-    ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(rect)
-            .layout(egui::Layout::top_down(egui::Align::Min)),
-    )
-    .add(egui::Label::new(theme::caption_text(text)).wrap());
-}
-
-fn draw_effects_list_header<L, R>(
-    ui: &mut egui::Ui,
-    add_left: impl FnOnce(&mut egui::Ui) -> L,
-    add_right: impl FnOnce(&mut egui::Ui) -> R,
-) -> (L, R) {
-    // Monster-only controls share this row with the result count. Keeping the
-    // row fixed-height also anchors the list and footer across both tabs.
-    const HEIGHT: f32 = 32.0;
-    // Render right first so a monster-control change can update the left-side
-    // count in the same frame, while both sides keep independent anchors.
-    egui::Sides::new()
-        .height(HEIGHT)
-        .shrink_left()
-        .show(ui, add_left, add_right)
-}
-
-/// One monster row: smoothing toggle plus the monster name. A row controls
-/// every variant sharing the display name (runemarked etc.); toggling on
-/// removes all their overrides.
-fn draw_monster_row(app: &mut GuiApp, ui: &mut egui::Ui, idx: usize) {
-    let Some(catalog) = &app.monster_catalog else {
-        return;
-    };
-    let row = &catalog[idx];
-    let keys = row.monster_keys.clone();
-    let display = row.display.clone();
-    let context = row.context.clone();
-    let level = app.monster_level_for_keys(&keys);
-    let mixed = level.is_none();
-    let mut reduced = level == Some(EffectLevel::Reduced);
-    let hover = hover_key_list(&keys);
-    ui.allocate_ui_with_layout(
-        egui::vec2(ui.available_width(), COLOR_ROW_HEIGHT),
-        egui::Layout::left_to_right(egui::Align::Center),
-        |ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            let toggle = ui.add(egui::Checkbox::without_text(&mut reduced).indeterminate(mixed));
-            if toggle.changed() {
-                let new_level = if reduced {
-                    EffectLevel::Reduced
-                } else {
-                    EffectLevel::Full
-                };
-                for key in &keys {
-                    if new_level == EffectLevel::Reduced {
-                        app.monster_overrides.remove(key);
-                    } else {
-                        app.monster_overrides.insert(key.clone(), new_level);
-                    }
-                }
-            }
-            ui.add_space(4.0);
-            ui.add(
-                egui::Label::new(egui::RichText::new(&display).size(11.5).color(
-                    if level == Some(EffectLevel::Reduced) {
-                        palette::TEXT_MUTED
-                    } else {
-                        palette::TEXT
-                    },
-                ))
-                .truncate(),
-            )
-            .on_hover_text(&hover);
-            // Fallback rows carry a muted "where does this belong" suffix;
-            // truncation keeps the row single-line, the name has priority.
-            if let Some(context) = &context {
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(monster_context_label(context))
-                            .size(11.5)
-                            .color(palette::TEXT_MUTED),
-                    )
-                    .truncate(),
-                )
-                .on_hover_text(&hover);
-            }
-            toggle.on_hover_text(hover);
-        },
-    );
-}
-
-fn monster_context_label(context: &str) -> String {
-    format!("· {context}")
-}
-
-/// Variant keys for a row hover, truncated so huge groups stay readable.
-fn hover_key_list(keys: &[String]) -> String {
-    const MAX_HOVER_KEYS: usize = 12;
-    let mut hover = keys
+fn selected_titles(app: &GuiApp) -> String {
+    CATEGORIES
         .iter()
-        .take(MAX_HOVER_KEYS)
-        .cloned()
+        .flat_map(|category| category.patches)
+        .filter(|patch| app.selected_patches.contains(patch))
+        .map(|patch| patch_info(*patch).title)
         .collect::<Vec<_>>()
-        .join("\n");
-    if keys.len() > MAX_HOVER_KEYS {
-        hover.push_str(&format!("\n… {} more", keys.len() - MAX_HOVER_KEYS));
-    }
-    hover
+        .join(", ")
 }
 
-/// Shows a modal with shared styling; returns true when it should close
-/// (Esc or backdrop click).
+/// Returns true when the modal should close (Esc or backdrop click).
 fn confirm_modal(ctx: &egui::Context, id: &str, add_contents: impl FnOnce(&mut egui::Ui)) -> bool {
-    egui::Modal::new(egui::Id::new(id))
+    egui::Modal::new(egui::Id::unique(id))
         .frame(widgets::card().inner_margin(20))
         .backdrop_color(egui::Color32::from_black_alpha(140))
         .show(ctx, |ui| {
-            ui.set_max_width(380.0);
+            ui.set_max_width(400.0);
             add_contents(ui);
         })
         .should_close()
-}
-
-fn patch_info(id: PatchId) -> &'static PatchInfo {
-    all_patches()
-        .iter()
-        .find(|patch| patch.id == id)
-        .expect("every PatchId has a PatchInfo")
-}
-
-/// "atlas-fog" -> "Atlas fog", "mtx-soft" -> "MTX soft".
-fn display_name(name: &str) -> String {
-    let spaced = name.replace('-', " ");
-    let mut chars = spaced.chars();
-    let capitalized = match chars.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-        None => spaced,
-    };
-    capitalized.replace("Mtx", "MTX").replace("mtx", "MTX")
 }
 
 fn patch_state_pill(state: PatchState) -> (&'static str, egui::Color32) {
     match state {
         PatchState::Clean => ("Not patched", palette::NEUTRAL),
         PatchState::Patched => ("Patched", palette::SUCCESS),
-        PatchState::StaleBackup => ("Obsolete backup", palette::WARNING),
+        PatchState::StaleBackup => ("Game updated", palette::WARNING),
         PatchState::PatchedMissingBackup => ("Backup missing", palette::ERROR),
     }
-}
-
-fn backup_label(state: PatchState) -> &'static str {
-    match state {
-        PatchState::Clean => "none",
-        PatchState::Patched => "present",
-        PatchState::StaleBackup => "obsolete",
-        PatchState::PatchedMissingBackup => "missing",
-    }
-}
-
-fn small_action(ui: &mut egui::Ui, text: &str) -> bool {
-    ui.add(
-        egui::Button::new(
-            egui::RichText::new(text)
-                .size(11.5)
-                .color(palette::TEXT_MUTED),
-        )
-        .fill(egui::Color32::TRANSPARENT)
-        .stroke(egui::Stroke::new(1.0, palette::BORDER)),
-    )
-    .clicked()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn count_label_pluralizes() {
@@ -1418,198 +685,22 @@ mod tests {
     }
 
     #[test]
-    fn monster_context_label_formats_the_rendered_suffix() {
+    fn every_patch_appears_in_exactly_one_category() {
+        let listed: Vec<PatchId> = CATEGORIES
+            .iter()
+            .flat_map(|category| category.patches.iter().copied())
+            .collect();
+        let unique: HashSet<PatchId> = listed.iter().copied().collect();
+        assert_eq!(listed.len(), unique.len());
         assert_eq!(
-            monster_context_label("Viper Legionnaire"),
-            "· Viper Legionnaire"
+            unique.len(),
+            tiny_poe2smoother::patches::all_patches().len()
         );
     }
 
-    /// All three tab search fields sit at the same auto-widget position in the
-    /// modal, so without distinct salts egui persists one shared
-    /// `TextEditState` (cursor, selection, undo history) across tabs.
-    #[test]
-    fn effects_tab_search_fields_persist_state_under_distinct_ids() {
-        use egui::widgets::text_edit::TextEditState;
-
-        let ctx = egui::Context::default();
-        theme::install_fonts(&ctx);
-        let mut app = GuiApp::default();
-        ctx.run_ui(egui::RawInput::default(), |ui| {
-            draw_effects_skills_tab(&mut app, ui);
-        })
-        .drop_without_applying_deltas();
-        assert_eq!(ctx.data(|d| d.count::<TextEditState>()), 1);
-        ctx.run_ui(egui::RawInput::default(), |ui| {
-            draw_effects_others_tab(&mut app, ui);
-        })
-        .drop_without_applying_deltas();
-        assert_eq!(ctx.data(|d| d.count::<TextEditState>()), 2);
-        ctx.run_ui(egui::RawInput::default(), |ui| {
-            draw_effects_monsters_tab(&mut app, ui);
-        })
-        .drop_without_applying_deltas();
-        assert_eq!(ctx.data(|d| d.count::<TextEditState>()), 3);
-    }
-
-    #[test]
-    fn effects_tab_descriptions_reserve_the_same_height() {
-        fn description_bottom(text: &str) -> f32 {
-            let ctx = egui::Context::default();
-            theme::install_fonts(&ctx);
-            let mut bottom = 0.0;
-            ctx.run_ui(egui::RawInput::default(), |ui| {
-                ui.set_width(640.0);
-                draw_effects_tab_description(ui, text);
-                bottom = ui.cursor().top();
-            })
-            .drop_without_applying_deltas();
-            bottom
-        }
-
-        assert_eq!(
-            description_bottom(EFFECTS_SKILLS_DESCRIPTION),
-            description_bottom(EFFECTS_MONSTERS_DESCRIPTION)
-        );
-        assert_eq!(
-            description_bottom(EFFECTS_SKILLS_DESCRIPTION),
-            description_bottom(EFFECTS_OTHERS_DESCRIPTION)
-        );
-    }
-
-    #[test]
-    fn effects_list_header_keeps_count_at_the_left_anchor() {
-        fn count_left(with_monster_control: bool) -> f32 {
-            let ctx = egui::Context::default();
-            theme::install_fonts(&ctx);
-            theme::install_style(&ctx);
-            let mut left = 0.0;
-            ctx.run_ui(egui::RawInput::default(), |ui| {
-                ui.set_width(640.0);
-                let mut show_unnamed = false;
-                let response = if with_monster_control {
-                    let (count, ()) = draw_effects_list_header(
-                        ui,
-                        |ui| ui.label(theme::caption_text("539 shown")),
-                        |ui| {
-                            ui.checkbox(&mut show_unnamed, "Show unnamed entities (427)");
-                        },
-                    );
-                    count
-                } else {
-                    let (count, ()) = draw_effects_list_header(
-                        ui,
-                        |ui| ui.label(theme::caption_text("287 shown")),
-                        |_| {},
-                    );
-                    count
-                };
-                left = response.rect.left();
-            })
-            .drop_without_applying_deltas();
-            left
-        }
-
-        assert_eq!(count_left(false), count_left(true));
-    }
-
-    fn monster_row(display: &str, keys: &[&str], named: bool) -> crate::MonsterCatalogRow {
-        let monster_keys: Vec<String> = keys.iter().map(|key| key.to_string()).collect();
-        crate::MonsterCatalogRow {
-            display_lower: display.to_lowercase(),
-            search_lower: format!("{} {}", display.to_lowercase(), monster_keys.join(" ")),
-            display: display.to_string(),
-            monster_keys,
-            context: None,
-            named,
-        }
-    }
-
-    #[test]
-    fn effects_tabs_keep_the_same_vertical_extent_with_monster_controls() {
-        fn tab_height(app: &mut GuiApp, draw_tab: fn(&mut GuiApp, &mut egui::Ui)) -> f32 {
-            let ctx = egui::Context::default();
-            theme::install_fonts(&ctx);
-            theme::install_style(&ctx);
-            let mut height = 0.0;
-            ctx.run_ui(egui::RawInput::default(), |ui| {
-                ui.set_width(640.0);
-                let top = ui.cursor().top();
-                draw_tab(app, ui);
-                height = ui.cursor().top() - top;
-            })
-            .drop_without_applying_deltas();
-            height
-        }
-
-        let mut skills = GuiApp::default();
-        let mut monsters = GuiApp::default();
-        monsters.monster_catalog = Some(vec![monster_row(
-            "internal helper",
-            &["metadata/monsters/internal/helper"],
-            false,
-        )]);
-
-        assert_eq!(
-            tab_height(&mut skills, draw_effects_skills_tab),
-            tab_height(&mut monsters, draw_effects_monsters_tab)
-        );
-        let mut others = GuiApp::default();
-        assert_eq!(
-            tab_height(&mut skills, draw_effects_skills_tab),
-            tab_height(&mut others, draw_effects_others_tab)
-        );
-    }
-
-    /// The rendered monsters tab default-hides fallback rows; ticking
-    /// "Show unnamed entities" (state flip, as the checkbox does) reveals
-    /// them, and an overridden hidden row is flagged by the hint count
-    /// rather than silently dropped.
-    #[test]
-    fn monsters_tab_hides_unnamed_rows_until_checkbox_enabled() {
-        let ctx = egui::Context::default();
-        theme::install_fonts(&ctx);
-        let mut app = GuiApp::default();
-        let wolf = "metadata/monsters/baron/phase2/baronphase2wolf";
-        let mut fallback = monster_row("baronphase 2 wolf", &[wolf], false);
-        fallback.context = Some("Count Geonor / Geonor, the Putrid Wolf".to_string());
-        app.monster_catalog = Some(vec![
-            monster_row("Bog Hulk", &["metadata/monsters/boghulk/boghulk"], true),
-            fallback,
-        ]);
-        app.monster_overrides
-            .insert(wolf.to_string(), EffectLevel::Full);
-
-        ctx.run_ui(egui::RawInput::default(), |ui| {
-            draw_effects_monsters_tab(&mut app, ui);
-        })
-        .drop_without_applying_deltas();
-        assert_eq!(app.monsters_filter_rows, vec![0]);
-        assert_eq!(app.overridden_unnamed_monster_row_count(), 1);
-
-        app.show_unnamed_monsters = true;
-        ctx.run_ui(egui::RawInput::default(), |ui| {
-            draw_effects_monsters_tab(&mut app, ui);
-        })
-        .drop_without_applying_deltas();
-        assert_eq!(app.monsters_filter_rows, vec![0, 1]);
-    }
-
-    fn other_row(folder: &str, display: &str) -> crate::OtherEffectRow {
-        crate::OtherEffectRow {
-            display_lower: display.to_lowercase(),
-            search_lower: format!("{display} {folder}").to_lowercase(),
-            folder: folder.to_string(),
-            display: display.to_string(),
-        }
-    }
-
-    /// The editor row must stay reachable for Particles-only selections, whose
-    /// referenced particles are still protected by Full scopes.
+    /// Particles alone still needs the editor because Full scopes protect particles.
     #[test]
     fn effects_row_stays_reachable_for_particles_only() {
-        use tiny_poe2smoother::patches::PatchId;
-
         let mut app = GuiApp::default();
         app.selected_patches.clear();
         assert!(!app.effects_editor_accessible());
@@ -1623,41 +714,13 @@ mod tests {
         assert!(app.effect_catalog_task.is_none());
         assert!(app.other_catalog_task.is_none());
 
-        // Particles alone exposes the editor and starts the same eager loads.
         app.selected_patches.insert(PatchId::Particles);
         assert!(app.effects_editor_accessible());
         ctx.run_ui(egui::RawInput::default(), |ui| {
-            draw_effects_row(&mut app, ui);
+            draw_patch(&mut app, ui, PatchId::Particles);
         })
         .drop_without_applying_deltas();
         assert!(app.effect_catalog_task.is_some());
         assert!(app.other_catalog_task.is_some());
-    }
-
-    /// The Others tab keeps search/filter state independent of the Skills tab.
-    #[test]
-    fn others_tab_keeps_independent_filter_state_from_skills_tab() {
-        let ctx = egui::Context::default();
-        theme::install_fonts(&ctx);
-        let mut app = GuiApp::default();
-        app.other_catalog = Some(vec![
-            other_row("ground_effects/fire", "Ground Fire"),
-            other_row("ambient_sparkles.ao", "Ambient Sparkles"),
-        ]);
-
-        ctx.run_ui(egui::RawInput::default(), |ui| {
-            draw_effects_others_tab(&mut app, ui);
-        })
-        .drop_without_applying_deltas();
-        assert_eq!(app.others_filter_rows, vec![0, 1]);
-        assert!(app.effects_filter_rows.is_empty());
-
-        app.others_search = "ambient".to_string();
-        ctx.run_ui(egui::RawInput::default(), |ui| {
-            draw_effects_others_tab(&mut app, ui);
-        })
-        .drop_without_applying_deltas();
-        assert_eq!(app.others_filter_rows, vec![1]);
-        assert!(app.effects_filter_rows.is_empty());
     }
 }

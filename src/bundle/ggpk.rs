@@ -1,6 +1,6 @@
 use super::hashing::murmur2_32;
 use crate::backup::GgpkBackupMeta;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::fs;
 use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -21,7 +21,7 @@ impl GgpkArchive {
             bail!("{} is too small to be a GGPK archive", path.display());
         }
         let version = u32::from_le_bytes(mmap[8..12].try_into().expect("length checked"));
-        // Version ids 2 and 3 store names as UTF-16; 4 (and anything newer/unknown) as UTF-32.
+        // Versions 2 and 3 store UTF-16 names, 4 and newer store UTF-32.
         Ok(Self {
             mmap,
             utf32_paths: !matches!(version, 2 | 3),

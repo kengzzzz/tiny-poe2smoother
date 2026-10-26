@@ -3,7 +3,7 @@ use super::index::{BundleFile, BundleIndex};
 use super::store::BundleStore;
 use crate::backup::BackupStore;
 use crate::install::InstallLayout;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fs;
@@ -78,9 +78,8 @@ pub fn apply_bundle_replacements(
     })?;
 
     if let Err(e) = atomic_write(&store.index_path, &index_bytes) {
-        // Index replacement failed; remove the orphaned generated bundle
         let _ = fs::remove_file(&custom_path);
-        return Err(e.context("failed to replace index; generated bundle has been cleaned up"));
+        return Err(e.context("failed to replace index. Generated bundle has been cleaned up"));
     }
     touched.push(custom_path);
     touched.push(store.index_path.clone());

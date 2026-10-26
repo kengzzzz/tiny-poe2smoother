@@ -1,10 +1,7 @@
-//! Per-monster "keep original visuals" support for the `Effects` patch:
-//! monsters are mapped to their effect files via the game's data tables and
-//! the references embedded in monster metadata; a monster set to `Full` has
-//! those files excluded from the Effects patch.
+//! Maps monsters to their effect files so a Full monster keeps its original visuals.
 
-use super::datc64::{parse_table, row_strings, utf16le_string_at, DatTable};
-use super::effect_skills::{clean_display_name, EffectLevel};
+use super::datc64::{DatTable, parse_table, row_strings, utf16le_string_at};
+use super::effect_skills::{EffectLevel, clean_display_name};
 use super::targeting::{ends_with_path_ci, normalize_path, starts_with_path_ci};
 use crate::bundle::{BundleFile, BundleIndex, BundleStore};
 use anyhow::{Context, Result};
@@ -14,8 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::LazyLock;
 
 pub const MONSTER_VARIETIES_DATC64_PATH: &str = "data/balance/monstervarieties.datc64";
-/// Secondary tables pairing monster paths with effect paths. All optional:
-/// a missing table degrades the mapping, never fails it.
+/// Optional tables. A missing one weakens the mapping but never fails it.
 const MONSTER_EXTRA_TABLE_PATHS: &[&str] = &[
     "data/balance/monstervarietiesartvariations.datc64",
     "data/balance/legionmonstervarieties.datc64",
@@ -27,11 +23,8 @@ const MONSTERS_PREFIX: &str = "metadata/monsters/";
 const MONSTERS_EFFECTS_PREFIX: &str = "metadata/effects/spells/monsters_effects/";
 const MIN_MONSTER_ALIAS_LEN: usize = 6;
 
-/// Helper-asset subtrees under `metadata/monsters/` (attachment rigs, arena
-/// markers) are not monsters. Folder spellings verified against a real
-/// install: `attachments`, `effects`, and `objects`/`boss_objects`/
-/// `arenaobjects`/`bossarenaobjects`/`orionarenaobjects` — hence the
-/// ends-with match. Expects a normalized path; only folder segments count.
+/// Helper subtrees under `metadata/monsters/` (rigs, arena markers) aren't monsters.
+/// Real folders end in "attachments", "effects", or "objects".
 fn in_non_monster_subtree(path: &str) -> bool {
     let dir = path.rsplit_once('/').map_or("", |(dir, _)| dir);
     dir.split('/')
@@ -41,20 +34,14 @@ fn in_non_monster_subtree(path: &str) -> bool {
 static EFFECT_REF_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?i)metadata[/\\]effects[/\\][^"'\s\)\};,]+"#).unwrap());
 
-/// One persisted non-default per-monster setting. `monster` is the lowercase
-/// metadata path without extension ("metadata/monsters/a/b/b"); monsters
-/// without an override are `Reduced`.
+/// `monster` is the lowercase metadata path without extension.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MonsterEffectOverride {
     pub monster: String,
     pub level: EffectLevel,
 }
 
-/// One editor row: a display name grouping the monster variants that share
-/// it within one family folder. `search_aliases` are hand-verified names;
-/// `derived_context` is the fallback row's nearest recognizable ancestry,
-/// shared by search and the GUI suffix. `named` is true when the display came
-/// from the varieties table rather than the humanized-key fallback.
+/// Groups the variants sharing a display name within one family folder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MonsterEffectCatalogEntry {
     pub display: String,
@@ -65,11 +52,8 @@ pub struct MonsterEffectCatalogEntry {
     pub named: bool,
 }
 
-/// Hand-verified extra search terms for monsters players know by another
-/// name; folded into the row's search text, never shown as the name.
-/// The Abyssal Lich is "Vessel of Kulemak" in `monstervarieties` but known
-/// by its lineage titles (Amanamu/Ulaman/Kurgal) and the "Amanamu's Void"
-/// buff (`abyss_lightless_well` in `buffdefinitions`/`buffvisuals`).
+/// Extra search terms for monsters players know by another name. The Abyssal Lich is
+/// "Vessel of Kulemak" in the tables but known as Amanamu, Ulaman, and Kurgal.
 const MONSTER_SEARCH_ALIASES: &[(&str, &[&str])] = &[(
     "metadata/monsters/leagueabyss/lichboss/kulemakboss",
     &[
@@ -89,11 +73,8 @@ fn search_aliases_for(monster_keys: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Effect paths mapped to one monster. `high`/`low` are patch targets split
-/// by evidence confidence (game tables + metadata refs vs folder-name match
-/// only). `refs` are non-target scannable files (`.epk`, out-of-scope `.ao`)
-/// — never kept themselves, but the reference closure walks through them
-/// because they can attach patch targets.
+/// `high` and `low` split targets by evidence confidence. `refs` are non-target files
+/// the reference closure walks through.
 #[derive(Debug, Default)]
 struct MonsterEdges {
     high: BTreeSet<String>,
@@ -103,9 +84,7 @@ struct MonsterEdges {
 
 type EdgeMap = BTreeMap<String, MonsterEdges>;
 
-/// Build the editor catalog: monsters with at least one high-confidence edge
-/// leading (directly or through referenced effect files) to a patch target.
-/// Heavy — GUI background thread only, never part of apply.
+/// Heavy. Runs on a GUI background thread, never during apply.
 pub fn build_monster_effect_catalog(
     store: &BundleStore,
     index: &mut BundleIndex,
@@ -113,16 +92,14 @@ pub fn build_monster_effect_catalog(
     index.ensure_paths_built()?;
     let mut candidates: Vec<(String, BundleFile)> = Vec::new();
     for path in index.paths() {
-        if let Some(key) = monster_key_of(path) {
-            if let Some(file) = index.file_by_path(path).copied() {
-                candidates.push((key, file));
-            }
+        if let Some(key) = monster_key_of(path)
+            && let Some(file) = index.file_by_path(path).copied()
+        {
+            candidates.push((key, file));
         }
     }
     let monster_file_bytes = read_candidate_bytes(store, index, candidates)?;
-    // Full candidate key population — a strictly better sample than
-    // edges.keys() for path-column detection (monsters with no edges still
-    // anchor the statistics).
+    // Monsters without edges still anchor path-column detection.
     let known_keys: BTreeSet<String> = monster_file_bytes
         .iter()
         .map(|(key, _)| key.clone())
@@ -138,8 +115,7 @@ pub fn build_monster_effect_catalog(
         monstervarieties.as_deref(),
         &extra_tables,
     );
-    // Monsters whose only refs are non-targets (.epk packs) still belong in
-    // the catalog when those files transitively attach patch targets.
+    // Monsters referencing only .epk packs count when those packs reach a target.
     let seeds: BTreeSet<String> = edges
         .values()
         .flat_map(|edge| edge.refs.iter().cloned())
@@ -155,10 +131,7 @@ pub fn build_monster_effect_catalog(
     ))
 }
 
-/// Resolve `Full` overrides to the patch-target paths that must stay
-/// original. Stale monster keys resolve to nothing. Unlike the catalog,
-/// low-confidence edges are included: keeping an unrelated extra file
-/// original is visually safe, missing one of the monster's files is not.
+/// Includes low-confidence edges. Keeping an extra file original is safe, missing one is not.
 pub(super) fn resolve_full_monster_effect_paths(
     store: &BundleStore,
     index: &mut BundleIndex,
@@ -184,10 +157,10 @@ pub(super) fn resolve_full_monster_effect_paths(
             folder_alias_paths.push(path.as_str());
         }
         if let Some(key) = monster_key_of(path) {
-            if full_keys.contains(&key) {
-                if let Some(file) = index.file_by_path(path).copied() {
-                    candidates.push((key.clone(), file));
-                }
+            if full_keys.contains(&key)
+                && let Some(file) = index.file_by_path(path).copied()
+            {
+                candidates.push((key.clone(), file));
             }
             all_keys.insert(key);
         }
@@ -217,8 +190,7 @@ pub(super) fn resolve_full_monster_effect_paths(
         }
         seeds.extend(edge.refs);
     }
-    // Kept files can attach further effect files (.ao -> .ao, .epk -> .ao);
-    // walk those so a kept visual's children don't render half-stripped.
+    // Walk attached files so a kept visual's children aren't half-stripped.
     let graph = collect_effect_ref_graph(store, index, &seeds)?;
     for refs in graph.values() {
         for path in refs {
@@ -245,8 +217,6 @@ fn read_candidate_bytes(
         .collect())
 }
 
-/// Pure edge collection over pre-read data; keys repeat in
-/// `monster_file_bytes` when a monster has several metadata files.
 fn collect_edges(
     monster_file_bytes: &[(String, Vec<u8>)],
     monstervarieties: Option<&[u8]>,
@@ -270,11 +240,8 @@ fn collect_edges(
     edges
 }
 
-/// Pure catalog assembly. Rows group variants sharing a display name and name
-/// provenance *within one family folder* — display text alone couples
-/// unrelated monsters (dozens are named "Daemon"), while a humanized fallback
-/// can collide with a table name. Strictly attributable helpers are folded into
-/// named rows afterward (see `merge_unnamed_helper_rows`).
+/// Groups by display name within a family folder, since dozens of unrelated monsters
+/// are named "Daemon".
 fn catalog_rows(
     edges: &EdgeMap,
     monstervarieties: Option<&[u8]>,
@@ -330,10 +297,8 @@ fn catalog_rows(
     rows
 }
 
-/// Fallback names like `basemutewindbanditman` read better without the
-/// `base` rig prefix. Skipped when the stripped name is already another
-/// row's text in the same family, so no two rows turn visually identical
-/// (cross-family duplicates already get a family suffix in the GUI).
+/// Drops the `base` rig prefix from fallback names unless that would duplicate a
+/// row in the same family.
 fn strip_base_prefix_from_fallback_rows(rows: &mut [MonsterEffectCatalogEntry]) {
     let mut taken: HashSet<(String, String)> = rows
         .iter()
@@ -358,9 +323,7 @@ fn strip_base_prefix_from_fallback_rows(rows: &mut [MonsterEffectCatalogEntry]) 
     }
 }
 
-/// All table-named keys under each proper sub-family ancestor, including keys
-/// filtered out of the catalog for lacking a relevant effect edge. A key maps
-/// to a catalog target only when that exact key survived in a named row.
+/// Table-named keys per sub-family, including ones filtered out of the catalog.
 struct NamedIdentityIndex {
     keys_by_folder: HashMap<String, BTreeSet<String>>,
     catalog_target_by_key: HashMap<String, usize>,
@@ -396,9 +359,7 @@ impl NamedIdentityIndex {
     }
 }
 
-/// The complete set of named identities at the nearest proper sub-family
-/// ancestor. An ambiguous or targetless nearest set must not be skipped in
-/// favor of weaker evidence higher in the tree.
+/// An ambiguous nearest set blocks weaker evidence higher in the tree.
 fn nearest_named_candidates<'a>(
     key: &str,
     identities: &'a NamedIdentityIndex,
@@ -408,9 +369,7 @@ fn nearest_named_candidates<'a>(
         .find_map(|folder| identities.keys_by_folder.get(folder))
 }
 
-/// Resolve one fallback key only when every named identity at its nearest
-/// branch survived into the same catalog row. A filtered named key has no
-/// target and therefore blocks the merge.
+/// Resolves only when every named identity at the nearest branch shares one row.
 fn strict_named_target(key: &str, identities: &NamedIdentityIndex) -> Option<usize> {
     let candidates = nearest_named_candidates(key, identities)?;
     let mut targets = candidates
@@ -420,10 +379,7 @@ fn strict_named_target(key: &str, identities: &NamedIdentityIndex) -> Option<usi
     targets.all(|target| target == Some(first)).then_some(first)
 }
 
-/// Derive one fallback row's search/display context from the same nearest
-/// identity sets used by ownership. Every key must report the identical set;
-/// missing or conflicting evidence falls back to the family folder. Named
-/// rows deliberately carry no derived context.
+/// Every key must report the same identity set, otherwise the family folder is used.
 fn derived_context_for(
     row: &MonsterEffectCatalogEntry,
     identities: &NamedIdentityIndex,
@@ -461,10 +417,8 @@ fn derived_context_for(
     }
 }
 
-/// Fold each unnamed helper row (base rigs, phase forms, clones) into the
-/// single named row established by the full table-named identity population.
-/// Every key in the fallback row must resolve to the same target. Missing,
-/// targetless, ambiguous, or contradictory evidence leaves it standalone.
+/// Folds unnamed helper rows (base rigs, phase forms, clones) into their named row
+/// when every key agrees.
 fn merge_unnamed_helper_rows(
     mut rows: Vec<MonsterEffectCatalogEntry>,
     identities: &NamedIdentityIndex,
@@ -475,10 +429,10 @@ fn merge_unnamed_helper_rows(
             .monster_keys
             .iter()
             .map(|key| strict_named_target(key, identities));
-        if let Some(Some(first)) = targets.next() {
-            if targets.all(|target| target == Some(first)) {
-                target_of[idx] = Some(first);
-            }
+        if let Some(Some(first)) = targets.next()
+            && targets.all(|target| target == Some(first))
+        {
+            target_of[idx] = Some(first);
         }
     }
 
@@ -494,9 +448,7 @@ fn merge_unnamed_helper_rows(
         .collect()
 }
 
-/// Proper sub-family folder prefixes of a monster key, deepest first. The
-/// family folder itself is excluded because family-wide uniqueness is not
-/// ownership evidence.
+/// Deepest first. The family folder itself isn't ownership evidence.
 fn ancestor_folders(key: &str) -> Vec<&str> {
     let mut folders = Vec::new();
     let mut end = key.len();
@@ -512,8 +464,6 @@ fn ancestor_folders(key: &str) -> Vec<&str> {
     folders
 }
 
-/// The lowercase monster key for a monster metadata index path, or `None`
-/// for paths that are not monster metadata.
 fn monster_key_of(path: &str) -> Option<String> {
     if !starts_with_path_ci(path, MONSTERS_PREFIX) {
         return None;
@@ -531,11 +481,8 @@ fn monster_key_of(path: &str) -> Option<String> {
     Some(strip_ext(&normalized).to_string())
 }
 
-/// The monster key for a path found in a data-table row. `monstervarieties`
-/// stores metadata paths *without* an extension (verified in-game data), so
-/// extensionless paths are the key itself; other extensions (.ais etc.) are
-/// not monster identity. Phantom keys from row noise are harmless: callers
-/// filter against the real key population.
+/// `monstervarieties` stores paths without an extension, so those are keys. Other
+/// extensions aren't monster identity.
 fn monster_key_from_table_path(path: &str) -> Option<String> {
     if !path.starts_with(MONSTERS_PREFIX) || in_non_monster_subtree(path) {
         return None;
@@ -547,8 +494,6 @@ fn monster_key_from_table_path(path: &str) -> Option<String> {
     }
 }
 
-/// Table rows pairing a known monster path with effect paths yield
-/// high-confidence edges.
 fn collect_table_edges(bytes: &[u8], monster_keys: &BTreeSet<String>, edges: &mut EdgeMap) {
     let Some(table) = parse_table(bytes) else {
         return;
@@ -584,8 +529,7 @@ fn collect_table_edges(bytes: &[u8], monster_keys: &BTreeSet<String>, edges: &mu
     }
 }
 
-/// Effect paths referenced by a monster's own metadata file: targets become
-/// high-confidence edges, non-target scannable files become closure seeds.
+/// Targets become high-confidence edges, other scannable files become closure seeds.
 fn collect_metadata_ref_edges(monster_key: &str, bytes: &[u8], edges: &mut EdgeMap) {
     let text = decode_text_lossy(bytes);
     for matched in EFFECT_REF_RE.find_iter(&text) {
@@ -611,16 +555,12 @@ fn collect_metadata_ref_edges(monster_key: &str, bytes: &[u8], edges: &mut EdgeM
 const REF_CLOSURE_MAX_FILES: usize = 8192;
 const REF_CLOSURE_MAX_DEPTH: usize = 8;
 
-/// Effect files that can attach further effect files and are worth reading
-/// during the reference closure; expects a normalized path.
 fn is_scannable_effect_file(path: &str) -> bool {
     path.starts_with("metadata/effects/") && (is_target_ext(path) || path.ends_with(".epk"))
 }
 
-/// Breadth-first reference closure over scannable effect files. Returns
-/// path -> referenced paths for every file read; missing seeds have no node.
-/// The depth/file caps cut runaway graphs short — a truncated closure only
-/// means some deeply nested children stay reduced, never an error.
+/// Depth and file caps cut runaway graphs. A truncated closure only leaves some
+/// nested children reduced.
 fn collect_effect_ref_graph(
     store: &BundleStore,
     index: &BundleIndex,
@@ -662,18 +602,17 @@ fn scannable_effect_refs(bytes: &[u8]) -> Vec<String> {
     let text = decode_text_lossy(bytes);
     let mut refs: Vec<String> = Vec::new();
     for matched in EFFECT_REF_RE.find_iter(&text) {
-        if let Some(path) = normalized_metadata_path(matched.as_str()) {
-            if is_scannable_effect_file(&path) && !refs.contains(&path) {
-                refs.push(path);
-            }
+        if let Some(path) = normalized_metadata_path(matched.as_str())
+            && is_scannable_effect_file(&path)
+            && !refs.contains(&path)
+        {
+            refs.push(path);
         }
     }
     refs
 }
 
-/// Graph nodes leading to at least one patch target, directly or through
-/// other files. A referenced target counts even when the target file itself
-/// was missing or cut off by the closure caps.
+/// A referenced target counts even when its file is missing or past the caps.
 fn paths_reaching_targets(graph: &BTreeMap<String, Vec<String>>) -> BTreeSet<String> {
     let mut reaches: BTreeSet<String> = BTreeSet::new();
     loop {
@@ -698,8 +637,7 @@ fn paths_reaching_targets(graph: &BTreeMap<String, Vec<String>>) -> BTreeSet<Str
     reaches
 }
 
-/// `monsters_effects` folders whose name unambiguously matches one monster
-/// alias yield low-confidence edges.
+/// Folder-name matches only yield low-confidence edges.
 fn is_folder_alias_candidate(path: &str) -> bool {
     starts_with_path_ci(path, MONSTERS_EFFECTS_PREFIX) && is_target_ext(path)
 }
@@ -740,8 +678,7 @@ fn collect_folder_alias_edges(
     }
 }
 
-/// Alias -> monster key for every path-segment alias that identifies exactly
-/// one monster; ambiguous aliases are dropped.
+/// Ambiguous aliases are dropped.
 fn unique_monster_aliases(monster_keys: &BTreeSet<String>) -> HashMap<String, String> {
     let mut aliases: HashMap<String, Option<&String>> = HashMap::new();
     for monster_key in monster_keys {
@@ -767,15 +704,9 @@ fn unique_monster_aliases(monster_keys: &BTreeSet<String>) -> HashMap<String, St
         .collect()
 }
 
-/// Monster key -> display name from `monstervarieties` rows. The schema is
-/// unknown, so both columns are detected statistically: the name column (see
-/// `detect_display_column`; a naive first-plausible-string scan grouped 237
-/// unrelated monsters under "Any" on a real install) and the monster's own
-/// file-path column (see `detect_path_column`). A row names *only* that
-/// column's key: rows cross-reference other monsters (spawned clones,
-/// sibling varieties), so keying by every path in the row bled names onto
-/// the wrong monsters — "Atziri, the Fell Serpent" showed up on Xipocado,
-/// Royal Architect on a real install.
+/// The schema is unknown, so the name and own-path columns are detected statistically.
+/// A row names only its own-path key. Rows also reference other monsters, and keying
+/// by every path once put "Atziri, the Fell Serpent" on Xipocado.
 fn monster_display_names(bytes: &[u8], known_keys: &BTreeSet<String>) -> HashMap<String, String> {
     let mut displays = HashMap::new();
     let Some(table) = parse_table(bytes) else {
@@ -804,8 +735,7 @@ fn monster_display_names(bytes: &[u8], known_keys: &BTreeSet<String>) -> HashMap
     displays
 }
 
-/// A field position within a fixed-size row: byte offset plus whether the
-/// heap offset is u64 (`wide`) or u32.
+/// `wide` means a u64 heap offset, otherwise u32.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FieldColumn {
     offset: usize,
@@ -814,12 +744,8 @@ struct FieldColumn {
 
 const DISPLAY_COLUMN_SAMPLE_ROWS: usize = 512;
 
-/// Score every candidate (offset, width) by how many sampled rows hold a
-/// known monster key there; the max is the monster's own metadata file-path
-/// column. Column 0 is *not* it: that column is a variety ID, path-shaped
-/// but often not a real file (`Baron/BaronBossHumanForm` where the actual
-/// file is `Baron/BaronHumanForm`), and keying by its basename collapses
-/// coverage.
+/// Column 0 is a variety ID that is path-shaped but often not a real file, so the
+/// column holding the most known keys wins instead.
 fn detect_path_column(table: &DatTable<'_>, known_keys: &BTreeSet<String>) -> Option<FieldColumn> {
     let heap = table.heap();
     let known_key_at = |row: &[u8], column| {
@@ -871,8 +797,7 @@ fn detect_path_column(table: &DatTable<'_>, known_keys: &BTreeSet<String>) -> Op
         by_offset.push((score, column));
     }
 
-    // Equal best evidence at distinct offsets cannot establish which column
-    // owns the row. Fail closed instead of silently preferring a lower offset.
+    // Equal best scores at different offsets are ambiguous, so fail closed.
     let best_score = by_offset.iter().map(|(score, _)| *score).max()?;
     let mut winners = by_offset
         .into_iter()
@@ -884,9 +809,7 @@ fn detect_path_column(table: &DatTable<'_>, known_keys: &BTreeSet<String>) -> Op
     column
 }
 
-/// Score every candidate (offset, width) by how many sampled rows yield a
-/// multi-word name there. Multi-word only for scoring — shared single-word
-/// fields ("Any") must never win; extraction then accepts single words too.
+/// Scored on multi-word names so shared single words like "Any" never win.
 fn detect_display_column(table: &DatTable<'_>) -> Option<FieldColumn> {
     let heap = table.heap();
     let mut scores: HashMap<(usize, bool), usize> = HashMap::new();
@@ -894,10 +817,10 @@ fn detect_display_column(table: &DatTable<'_>) -> Option<FieldColumn> {
         for offset in (0..row.len()).step_by(4) {
             for wide in [true, false] {
                 let column = FieldColumn { offset, wide };
-                if let Some(value) = string_at_column(row, heap, column) {
-                    if monster_display(&value).is_some_and(|name| name.contains(' ')) {
-                        *scores.entry((offset, wide)).or_default() += 1;
-                    }
+                if let Some(value) = string_at_column(row, heap, column)
+                    && monster_display(&value).is_some_and(|name| name.contains(' '))
+                {
+                    *scores.entry((offset, wide)).or_default() += 1;
                 }
             }
         }
@@ -920,9 +843,7 @@ fn string_at_column(row: &[u8], heap: &[u8], column: FieldColumn) -> Option<Stri
     utf16le_string_at(heap, offset)
 }
 
-/// A plausible in-game monster name: multi-word text ("Bog Hulk") or a
-/// single capitalized word ("Hyena"). Rejects paths, CamelCase internal ids,
-/// all-caps markers, and bracket fragments.
+/// Multi-word text or one capitalized word. Rejects paths, CamelCase ids, and markers.
 fn monster_display(value: &str) -> Option<String> {
     if value.contains('/') || value.contains('\\') || value.contains('.') {
         return None;
@@ -946,8 +867,6 @@ fn is_single_word_name(value: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c == '\'' || c == '-')
 }
 
-/// Extract and normalize an embedded `metadata/...` path from a raw string;
-/// normalizes first so backslash spellings resolve, then trims quote noise.
 fn normalized_metadata_path(value: &str) -> Option<String> {
     let normalized = normalize_path(value);
     let start = normalized.find("metadata/")?;
@@ -960,8 +879,6 @@ fn normalized_metadata_path(value: &str) -> Option<String> {
     (!path.is_empty()).then(|| path.to_string())
 }
 
-/// Matches the Effects patch's long-standing target shape (`.ao`/`.aoc`
-/// under `metadata/effects/spells/`); expects a normalized path.
 fn is_effects_patch_target(path: &str) -> bool {
     path.starts_with("metadata/effects/spells/") && is_target_ext(path)
 }
@@ -990,19 +907,18 @@ fn family_of(monster_key: &str) -> String {
         .to_string()
 }
 
-/// Fallback display for keys without a table name: path basename, `_` as
-/// space, a space at every digit boundary ("baronphase2wolf" →
-/// "baronphase 2 wolf"). Index paths are lowercase, so digits and
-/// separators are the only word boundaries recoverable from the key.
+/// Index paths are lowercase, so digits and `_` are the only word boundaries left.
 fn humanize_key(monster_key: &str) -> String {
     let base = monster_key.rsplit('/').next().unwrap_or(monster_key);
     let mut out = String::with_capacity(base.len() + 4);
     for ch in base.chars() {
         let ch = if ch == '_' { ' ' } else { ch };
-        if let Some(prev) = out.chars().next_back() {
-            if prev != ' ' && ch != ' ' && prev.is_ascii_digit() != ch.is_ascii_digit() {
-                out.push(' ');
-            }
+        if let Some(prev) = out.chars().next_back()
+            && prev != ' '
+            && ch != ' '
+            && prev.is_ascii_digit() != ch.is_ascii_digit()
+        {
+            out.push(' ');
         }
         out.push(ch);
     }
@@ -1012,7 +928,9 @@ fn humanize_key(monster_key: &str) -> String {
 fn decode_text_lossy(bytes: &[u8]) -> String {
     if bytes.starts_with(&[0xff, 0xfe]) {
         let units: Vec<u16> = bytes[2..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
             .collect();
         String::from_utf16_lossy(&units)
@@ -1021,8 +939,7 @@ fn decode_text_lossy(bytes: &[u8]) -> String {
     }
 }
 
-/// Test-only shorthand: edges + assembly in one step, with no reference
-/// closure (an empty reachability set).
+/// Edges plus assembly with no reference closure.
 #[cfg(test)]
 fn monster_effect_catalog_from_parts(
     monster_file_bytes: &[(String, Vec<u8>)],
@@ -1098,8 +1015,7 @@ mod tests {
                 "metadata/monsters/chimera/chimera.act",
                 Some("metadata/monsters/chimera/chimera"),
             ),
-            // Helper subtrees are not monsters (all seen on a real install:
-            // attachment rigs, arena markers, standalone effect helpers).
+            // Helper subtrees seen on a real install.
             ("metadata/monsters/boghulk/attachments/arm.ao", None),
             ("metadata/monsters/boghulk/objects/rock.ot", None),
             (
@@ -1163,8 +1079,7 @@ other = "Metadata/Effects/utility/epks/off.ao"
             ]
         );
         assert!(edge.low.is_empty());
-        // Non-target scannable files become closure seeds; leaf assets
-        // (.pet) never do.
+        // Non-target scannable files become seeds. Leaf .pet files never do.
         assert_eq!(
             edge.refs.iter().cloned().collect::<Vec<_>>(),
             vec![
@@ -1194,7 +1109,7 @@ other = "Metadata/Effects/utility/epks/off.ao"
 
         assert_eq!(edges.len(), 1);
         let edge = &edges["metadata/monsters/boghulk/boghulk"];
-        // Only the .ao is a patch target; the .epk becomes a closure seed.
+        // Only the .ao is a target. The .epk becomes a closure seed.
         assert_eq!(
             edge.high.iter().cloned().collect::<Vec<_>>(),
             vec!["metadata/effects/spells/monsters_effects/boghulk/slam.ao".to_string()]
@@ -1295,8 +1210,7 @@ other = "Metadata/Effects/utility/epks/off.ao"
                 "wanted",
                 metadata.len() as u32,
             ),
-            // This bundle is deliberately absent. Resolution succeeds only
-            // when unrelated monster metadata is excluded from the batch.
+            // This bundle is absent, so unrelated metadata must stay out of the batch.
             ("metadata/monsters/unrelated/unrelated.ot", "missing", 1),
             (
                 MONSTER_VARIETIES_DATC64_PATH,
@@ -1377,7 +1291,10 @@ other = "Metadata/Effects/utility/epks/off.ao"
             ),
         ];
         let varieties = table(&[
-            &["Metadata/Monsters/Anchorite/AnchoriteMother/AnchoriteMother.ot", "Filthy First-born"],
+            &[
+                "Metadata/Monsters/Anchorite/AnchoriteMother/AnchoriteMother.ot",
+                "Filthy First-born",
+            ],
             &[
                 "Metadata/Monsters/Anchorite/AnchoriteMother/Runemarked/AnchoriteMotherRunemarked.ot",
                 "Filthy First-born",
@@ -1398,9 +1315,7 @@ other = "Metadata/Effects/utility/epks/off.ao"
 
     #[test]
     fn display_names_come_from_the_detected_name_column_only() {
-        // A generic "Any" column precedes the real name column in every row;
-        // detection must skip it, and extensionless monster paths (the
-        // monstervarieties spelling) must key the display map.
+        // A generic "Any" column precedes the name. Extensionless paths must key the map.
         let varieties = table(&[
             &["Metadata/Monsters/BogHulk/BogHulk", "Any", "Bog Hulk"],
             &[
@@ -1431,21 +1346,15 @@ other = "Metadata/Effects/utility/epks/off.ao"
                 .map(String::as_str),
             Some("Sand Spitter")
         );
-        // No name in the detected column -> no display entry (humanized
-        // fallback happens at catalog assembly), and "Any" never leaks in.
+        // No name means no entry, and "Any" never leaks in.
         assert!(!displays.contains_key("metadata/monsters/unnamed/unnamed"));
         assert!(displays.values().all(|display| display != "Any"));
     }
 
     #[test]
     fn display_names_key_by_the_detected_path_column_only() {
-        // Row layout mirrors the real table: [variety ID, own file path,
-        // cross-reference, name]. The variety ID is path-shaped but not a
-        // real file (BaronBossHumanForm vs the actual BaronHumanForm), and
-        // the cross-reference points at *another* monster's key — before
-        // path-column detection, Geonor's row here would have named
-        // TheArchitect "Count Geonor" (the real-install bug put "Atziri,
-        // the Fell Serpent" on Xipocado this way).
+        // Mirrors the real layout: variety ID, own path, cross-reference, name. Keying by
+        // the cross-reference would name TheArchitect "Count Geonor".
         let geonor = "metadata/monsters/baron/baronhumanform";
         let architect = "metadata/monsters/leagueincursionnew/architectboss/thearchitect";
         let varieties = table(&[
@@ -1526,9 +1435,7 @@ other = "Metadata/Effects/utility/epks/off.ao"
     fn path_column_tie_between_distinct_offsets_fails_closed() {
         let a = "metadata/monsters/a/a";
         let b = "metadata/monsters/b/b";
-        // Column 0 cross-references the other monster; column 1 is the intended
-        // own path. Both columns contain two known keys and score 2, so the data
-        // does not prove which identity column is correct.
+        // Both columns hold two known keys, so neither proves which one is the identity.
         let varieties = table(&[
             &[
                 "Metadata/Monsters/B/B",
@@ -1594,16 +1501,17 @@ other = "Metadata/Effects/utility/epks/off.ao"
             .iter()
             .find(|row| row.monster_keys.iter().any(|key| key == lich))
             .unwrap();
-        assert!(lich_row
-            .search_aliases
-            .iter()
-            .any(|alias| alias == "amanamu"));
+        assert!(
+            lich_row
+                .search_aliases
+                .iter()
+                .any(|alias| alias == "amanamu")
+        );
         let other = rows
             .iter()
             .find(|row| row.monster_keys[0].contains("boghulk"))
             .unwrap();
-        // Hand-verified terms attach only to the lich. Derived context is
-        // carried separately for both fallback rows.
+        // Hand-verified terms attach only to the lich.
         assert!(!other.search_aliases.iter().any(|alias| alias == "amanamu"));
         assert!(other.search_aliases.is_empty());
         assert_eq!(other.derived_context, vec!["boghulk".to_string()]);
@@ -1641,8 +1549,7 @@ other = "Metadata/Effects/utility/epks/off.ao"
 
         let rows = monster_effect_catalog_from_parts(&monster_files, Some(&varieties), &[]);
 
-        // Two named rows in the family keep the phase row ambiguous — it
-        // stays its own row instead of merging.
+        // Two named rows in the family keep the phase row ambiguous, so it stays separate.
         let fallback = rows
             .iter()
             .find(|row| {
@@ -1726,13 +1633,11 @@ epk = "Metadata\Effects\Utility\epks\pack.epk"
         let mid = "metadata/effects/utility/epks/pack.epk".to_string();
         let root = "metadata/effects/utility/epks/root.epk".to_string();
         let dead = "metadata/effects/utility/epks/dead.epk".to_string();
-        // Mutually referencing files must not loop forever and must not
-        // count as reaching when neither leads to a target.
+        // Mutual references must not loop or count as reaching a target.
         let loop_a = "metadata/effects/utility/epks/loop_a.epk".to_string();
         let loop_b = "metadata/effects/utility/epks/loop_b.epk".to_string();
         let graph: BTreeMap<String, Vec<String>> = [
-            // root -> mid -> target, where the target file itself was never
-            // read (missing from the graph): the reference alone counts.
+            // The target file was never read, but the reference alone counts.
             (root.clone(), vec![mid.clone()]),
             (mid.clone(), vec![target.clone()]),
             (dead.clone(), Vec::new()),
@@ -1752,9 +1657,7 @@ epk = "Metadata\Effects\Utility\epks\pack.epk"
 
     #[test]
     fn catalog_lists_monsters_whose_refs_reach_targets() {
-        // Neither monster references a patch target directly; both reference
-        // .epk packs. Only the pack that transitively attaches a target
-        // makes its monster a catalog row.
+        // Only the pack that reaches a target makes its monster a row.
         let reaching_pack = "metadata/effects/spells/monsters_effects/act1/boghulk/spawn.epk";
         let monster_files: Vec<(String, Vec<u8>)> = vec![
             (
@@ -1784,9 +1687,7 @@ epk = "Metadata\Effects\Utility\epks\pack.epk"
 
     #[test]
     fn catalog_splits_shared_display_names_by_family() {
-        // Unrelated monsters named "Daemon" live in different family
-        // folders and must not share one checkbox; true variants inside one
-        // family still group.
+        // "Daemon" in different families stays separate. Variants in one family group.
         let monster_files: Vec<(String, Vec<u8>)> = vec![
             (
                 "metadata/monsters/daemon/bossdaemon".to_string(),
@@ -1829,12 +1730,14 @@ epk = "Metadata\Effects\Utility\epks\pack.epk"
         let rows = monster_effect_catalog_from_parts(&monster_files, Some(&varieties), &[]);
 
         assert_eq!(rows.len(), 2);
-        assert!(rows
-            .iter()
-            .any(|row| { row.named && row.monster_keys == vec![named.to_string()] }));
-        assert!(rows
-            .iter()
-            .any(|row| { !row.named && row.monster_keys == vec![fallback.to_string()] }));
+        assert!(
+            rows.iter()
+                .any(|row| { row.named && row.monster_keys == vec![named.to_string()] })
+        );
+        assert!(
+            rows.iter()
+                .any(|row| { !row.named && row.monster_keys == vec![fallback.to_string()] })
+        );
     }
 
     #[test]
@@ -1845,8 +1748,7 @@ epk = "Metadata\Effects\Utility\epks\pack.epk"
         let hidden_variant = "metadata/monsters/a/hiddenvariant";
         let monster_files = vec![
             (visible.to_string(), utf16_file(rig)),
-            // Named in the table, but filtered from catalog rows because it has
-            // no relevant effect edge.
+            // Named in the table but filtered out for lacking an effect edge.
             (hidden_named.to_string(), utf16_file("version 3")),
             (hidden_variant.to_string(), utf16_file(rig)),
         ];
@@ -1861,13 +1763,17 @@ epk = "Metadata\Effects\Utility\epks\pack.epk"
             .iter()
             .find(|row| row.display == "Visible Monster")
             .unwrap();
-        assert!(!visible_row
-            .monster_keys
-            .iter()
-            .any(|key| key == hidden_variant));
-        assert!(rows
-            .iter()
-            .any(|row| { !row.named && row.monster_keys.iter().any(|key| key == hidden_variant) }));
+        assert!(
+            !visible_row
+                .monster_keys
+                .iter()
+                .any(|key| key == hidden_variant)
+        );
+        assert!(
+            rows.iter().any(|row| {
+                !row.named && row.monster_keys.iter().any(|key| key == hidden_variant)
+            })
+        );
     }
 
     #[test]
@@ -1891,17 +1797,18 @@ epk = "Metadata\Effects\Utility\epks\pack.epk"
 
         let rows = monster_effect_catalog_from_parts(&monster_files, Some(&varieties), &[]);
 
-        assert!(rows
-            .iter()
-            .any(|row| { !row.named && row.monster_keys.iter().any(|key| key == hidden_variant) }));
-        assert!(rows
-            .iter()
-            .find(|row| row.display == "Visible Monster")
-            .is_some_and(|row| !row.monster_keys.iter().any(|key| key == hidden_variant)));
+        assert!(
+            rows.iter().any(|row| {
+                !row.named && row.monster_keys.iter().any(|key| key == hidden_variant)
+            })
+        );
+        assert!(
+            rows.iter()
+                .find(|row| row.display == "Visible Monster")
+                .is_some_and(|row| !row.monster_keys.iter().any(|key| key == hidden_variant))
+        );
     }
 
-    /// Merge-test shorthand; family derives from the first key like the
-    /// real grouping does.
     fn merge_entry(display: &str, keys: &[&str], named: bool) -> MonsterEffectCatalogEntry {
         MonsterEffectCatalogEntry {
             display: display.to_string(),
@@ -1955,10 +1862,12 @@ epk = "Metadata\Effects\Utility\epks\pack.epk"
         );
 
         assert_eq!(rows[2].derived_context, vec!["Beta Monster".to_string()]);
-        assert!(!rows[2]
-            .derived_context
-            .iter()
-            .any(|name| name == "Alpha Monster"));
+        assert!(
+            !rows[2]
+                .derived_context
+                .iter()
+                .any(|name| name == "Alpha Monster")
+        );
         assert!(rows[..2].iter().all(|row| row.derived_context.is_empty()));
     }
 
@@ -2064,10 +1973,11 @@ epk = "Metadata\Effects\Utility\epks\pack.epk"
 
         assert_eq!(rows.len(), 3);
         assert!(rows.contains(&unnamed));
-        assert!(rows
-            .iter()
-            .filter(|row| row.named)
-            .all(|row| row.monster_keys.len() == 1));
+        assert!(
+            rows.iter()
+                .filter(|row| row.named)
+                .all(|row| row.monster_keys.len() == 1)
+        );
     }
 
     #[test]
@@ -2222,9 +2132,10 @@ epk = "Metadata\Effects\Utility\epks\pack.epk"
 
         assert_eq!(rows.len(), 2);
         let x = rows.iter().find(|row| row.display == "X").unwrap();
-        assert!(x
-            .monster_keys
-            .contains(&"metadata/monsters/a/b/c/helper".to_string()));
+        assert!(
+            x.monster_keys
+                .contains(&"metadata/monsters/a/b/c/helper".to_string())
+        );
         let y = rows.iter().find(|row| row.display == "Y").unwrap();
         assert_eq!(y.monster_keys, vec!["metadata/monsters/a/b/y".to_string()]);
     }
@@ -2241,8 +2152,7 @@ epk = "Metadata\Effects\Utility\epks\pack.epk"
 
         strip_base_prefix_from_fallback_rows(&mut rows);
 
-        // "wolf" is taken by another row in the family; digit remainders
-        // ("base 2 wolf") and table-named rows keep their text.
+        // "wolf" is taken in the family. Digit remainders and named rows keep their text.
         assert_eq!(rows[0].display, "basewolf");
         assert_eq!(rows[1].display, "wolf");
         assert_eq!(rows[2].display, "bear");
@@ -2252,10 +2162,8 @@ epk = "Metadata\Effects\Utility\epks\pack.epk"
 
     #[test]
     fn catalog_merges_unnamed_helpers_and_recomputes_aliases() {
-        // kulemakboss has no varieties name here, so it folds into the named
-        // "Vessel of Kulemak" row next to it — which must then pick up the
-        // hand-verified aliases keyed to the folded-in key. The orphan family
-        // has no named relative and stays a fallback row.
+        // kulemakboss folds into "Vessel of Kulemak" and must pick up its aliases. The
+        // orphan family has no named relative and stays a fallback row.
         let lich = "metadata/monsters/leagueabyss/lichboss/lich";
         let helper = "metadata/monsters/leagueabyss/lichboss/kulemakboss";
         let orphan = "metadata/monsters/orphanfam/orphan";

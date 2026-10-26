@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::collections::HashSet;
 use std::fs;
@@ -135,9 +135,7 @@ impl BackupStore {
         Ok(())
     }
 
-    /// Restore `entries` (as returned by [`Self::entries`]) into the game dir,
-    /// then remove the backup file. Taking the entries avoids re-parsing the
-    /// backup when the caller already read them.
+    /// Restores `entries` into the game dir, then deletes the backup.
     pub fn restore(
         &self,
         entries: &[BackupEntry],
@@ -192,7 +190,6 @@ fn is_ggpk_meta_path(path: &Path) -> bool {
     path == Path::new(GGPK_META_PATH)
 }
 
-/// Find and decode the GGPK metadata entry among already-read backup entries.
 pub fn ggpk_backup_meta(entries: &[BackupEntry]) -> Result<Option<GgpkBackupMeta>> {
     entries
         .iter()
@@ -246,11 +243,8 @@ fn read_entries(path: &Path) -> Result<Vec<BackupEntry>> {
         cursor.seek(std::io::SeekFrom::Current(i64::from(manifest_len)))?;
     }
     let mut entries = Vec::new();
-    // A crash while appending can leave a truncated trailing entry; treat
-    // anything running past end-of-file as end-of-archive so the intact
-    // entries before it stay restorable. Lengths are checked against the
-    // remaining bytes before allocating so a corrupt file cannot trigger an
-    // absurd allocation.
+    // A crash mid-append can leave a truncated tail. Stop there so earlier
+    // entries stay restorable.
     while cursor.position() < bytes.len() as u64 {
         let Ok(path_len) = cursor.read_u32::<LittleEndian>() else {
             break;
@@ -272,7 +266,6 @@ fn read_entries(path: &Path) -> Result<Vec<BackupEntry>> {
     Ok(entries)
 }
 
-/// Read exactly `len` bytes, or `None` if fewer remain.
 fn read_chunk(cursor: &mut Cursor<&[u8]>, len: u64) -> Option<Vec<u8>> {
     let remaining = (cursor.get_ref().len() as u64).saturating_sub(cursor.position());
     if len > remaining {

@@ -8,7 +8,7 @@ pub struct DatTable<'a> {
 }
 
 impl<'a> DatTable<'a> {
-    pub fn rows(&self) -> impl Iterator<Item = &'a [u8]> {
+    pub fn rows(&self) -> impl Iterator<Item = &'a [u8]> + use<'a> {
         self.row_block.chunks_exact(self.row_len)
     }
 
@@ -22,9 +22,7 @@ pub fn parse_table(bytes: &[u8]) -> Option<DatTable<'_>> {
     if row_count == 0 {
         return None;
     }
-    // The heap marker is 0xBB x8. Accept a candidate only when the preceding
-    // row block splits cleanly into rows of >=8 bytes; otherwise it can be a
-    // false positive inside fixed row data.
+    // 0xBB x8 can also occur in row data, so accept it only where rows split evenly.
     let marker_pos = {
         let mut search_from = 4;
         loop {
@@ -51,11 +49,7 @@ pub fn parse_table(bytes: &[u8]) -> Option<DatTable<'_>> {
     })
 }
 
-/// Reads a null-terminated UTF-16LE string starting at `offset` in `heap`.
-/// Returns `None` for out-of-range offsets, unterminated runs, invalid UTF-16,
-/// and empty strings; those cases usually mean the field was not a string.
-/// `offset` may be any u64 row value — sentinel fields like
-/// `0xFFFF_FFFF_FFFF_FFFF` (a common dat null) must not overflow.
+/// `None` for anything that isn't a valid non-empty string, including dat nulls (u64::MAX).
 pub fn utf16le_string_at(heap: &[u8], offset: usize) -> Option<String> {
     if heap.starts_with(&ROW_HEAP_MARKER) && offset < ROW_HEAP_MARKER.len() {
         return None;
@@ -79,6 +73,26 @@ pub fn utf16le_string_at(heap: &[u8], offset: usize) -> Option<String> {
         return None;
     }
     String::from_utf16(&units).ok()
+}
+
+/// Rows can share heap strings, so edits append new ones instead of overwriting.
+pub fn with_strings(bytes: &[u8], edits: &[(usize, usize, &str)]) -> Option<Vec<u8>> {
+    let table = parse_table(bytes)?;
+    let marker_pos = 4 + table.row_count * table.row_len;
+    let mut out = bytes.to_vec();
+    for &(row, column, text) in edits {
+        if row >= table.row_count || column + 8 > table.row_len {
+            return None;
+        }
+        let offset = (out.len() - marker_pos) as u64;
+        for unit in text.encode_utf16() {
+            out.extend_from_slice(&unit.to_le_bytes());
+        }
+        out.extend_from_slice(&[0; 4]);
+        let cell = 4 + row * table.row_len + column;
+        out[cell..cell + 8].copy_from_slice(&offset.to_le_bytes());
+    }
+    Some(out)
 }
 
 pub fn row_strings(row: &[u8], heap: &[u8]) -> Vec<String> {
@@ -148,9 +162,7 @@ mod tests {
     fn utf16le_string_at_handles_sentinel_and_huge_offsets() {
         let mut heap = ROW_HEAP_MARKER.to_vec();
         push_utf16(&mut heap, "Hello");
-        // 0xFFFF_FFFF_FFFF_FFFF row fields are a common dat "null"; they and
-        // any other out-of-range offset must resolve to None, not panic
-        // (mods.datc64 on a real install crashed here before the fix).
+        // u64::MAX is a common dat null. mods.datc64 used to crash here.
         assert_eq!(utf16le_string_at(&heap, usize::MAX), None);
         assert_eq!(utf16le_string_at(&heap, usize::MAX - 1), None);
         assert_eq!(utf16le_string_at(&heap, heap.len()), None);
@@ -159,6 +171,35 @@ mod tests {
         let mut row = Vec::new();
         row.extend_from_slice(&u64::MAX.to_le_bytes());
         assert!(row_strings(&row, &heap).is_empty());
+    }
+
+    #[test]
+    fn with_strings_appends_and_repoints_only_edited_cells() {
+        let mut heap = ROW_HEAP_MARKER.to_vec();
+        let shared = push_utf16(&mut heap, "Shared");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        for _ in 0..2 {
+            bytes.extend_from_slice(&shared.to_le_bytes());
+            bytes.extend_from_slice(&shared.to_le_bytes());
+        }
+        bytes.extend_from_slice(&heap);
+
+        let out = with_strings(&bytes, &[(1, 8, "New")]).unwrap();
+        let table = parse_table(&out).unwrap();
+        let rows: Vec<_> = table.rows().collect();
+        let cell = |row: &[u8], column: usize| {
+            let offset = u64::from_le_bytes(row[column..column + 8].try_into().unwrap());
+            utf16le_string_at(table.heap(), offset as usize).unwrap()
+        };
+        assert_eq!(cell(rows[0], 0), "Shared");
+        assert_eq!(cell(rows[0], 8), "Shared");
+        assert_eq!(cell(rows[1], 0), "Shared");
+        assert_eq!(cell(rows[1], 8), "New");
+        assert_eq!(&out[..bytes.len() - heap.len()][..4], &bytes[..4]);
+        assert!(out.ends_with(&[b'w', 0, 0, 0, 0, 0]));
+        assert_eq!(with_strings(&bytes, &[(2, 0, "x")]), None);
+        assert_eq!(with_strings(&bytes, &[(0, 9, "x")]), None);
     }
 
     #[test]
