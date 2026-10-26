@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256"><defs><linearGradient id="bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#1F2838"/><stop offset="1" stop-color="#0B0E14"/></linearGradient><linearGradient id="teal" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5EEAD4"/><stop offset="1" stop-color="#0D9488"/></linearGradient><radialGradient id="glow" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#2DD4BF" stop-opacity="0.28"/><stop offset="1" stop-color="#2DD4BF" stop-opacity="0"/></radialGradient></defs><rect x="16" y="16" width="224" height="224" rx="52" fill="url(#bg)" stroke="#2A3447" stroke-width="4"/><circle cx="128" cy="128" r="92" fill="url(#glow)"/>
+<g stroke="#0B3B37" stroke-width="2.5" stroke-linejoin="round">
+<polygon points="94,82 162,82 190,112 66,112" fill="#5EEAD4"/>
+<polygon points="66,112 190,112 128,196" fill="url(#teal)"/>
+<polygon points="94,82 112,112 66,112" fill="#99F6E4"/>
+<polygon points="112,112 144,112 128,196" fill="#14B8A6"/>
+<polygon points="144,112 190,112 128,196" fill="#0F766E"/>
+<polyline points="94,82 112,112 128,82 144,112 162,82" fill="none"/>
+</g>
+<g fill="#2DD4BF">
+<circle cx="54" cy="66" r="6" opacity="0.55"/><circle cx="40" cy="96" r="4" opacity="0.35"/>
+<circle cx="204" cy="70" r="5" opacity="0.45"/><circle cx="214" cy="150" r="4" opacity="0.3"/>
+<circle cx="56" cy="168" r="5" opacity="0.4"/><circle cx="190" cy="196" r="4" opacity="0.3"/>
+</g>
+<g fill="#FB923C"><circle cx="76" cy="48" r="3" opacity="0.6"/><circle cx="208" cy="112" r="2.5" opacity="0.5"/></g>
+</svg>
