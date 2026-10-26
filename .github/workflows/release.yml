@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Verify tag matches Cargo.toml version
+      - name: Verify tag and changelog
         if: startsWith(github.ref, 'refs/tags/')
         run: |
           tag="${GITHUB_REF_NAME#v}"
@@ -28,6 +28,7 @@ jobs:
             echo "Tag v$tag does not match Cargo.toml version $version" >&2
             exit 1
           fi
+          ci/release-notes.sh "$version" > /dev/null
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -99,11 +100,17 @@ jobs:
           path: /tmp/artifacts/${{ matrix.target.name }}/*
 
   release:
+    if: startsWith(github.ref, 'refs/tags/')
     needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Write release notes
+        run: ci/release-notes.sh "${GITHUB_REF_NAME#v}" > /tmp/release-notes.md
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -118,4 +125,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: /tmp/release-artifacts/*
-          generate_release_notes: true
+          body_path: /tmp/release-notes.md
