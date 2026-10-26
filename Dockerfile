@@ -15,9 +15,12 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --default-toolchain stable --no-modify-path
+    | sh -s -- -y --default-toolchain none --profile minimal --no-modify-path
 ENV CARGO_HOME=/root/.cargo
 ENV PATH="${CARGO_HOME}/bin:${PATH}"
+
+COPY rust-toolchain.toml ./
+RUN rustup toolchain install
 
 COPY docker-build.sh /docker-build.sh
 
