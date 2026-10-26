@@ -11,6 +11,7 @@ fn main() {
         println!("cargo:rustc-link-lib=static=stdc++");
         println!("cargo:rustc-link-arg=-static-libstdc++");
         println!("cargo:rustc-link-arg=-static-libgcc");
+        embed_windows_icon();
     } else {
         println!("cargo:rustc-link-lib=dylib=stdc++");
     }
@@ -67,6 +68,26 @@ fn build_ooz() {
         build.file(format!("vendor/ooz/{file}"));
     }
     build.compile("ooz");
+}
+
+fn embed_windows_icon() {
+    println!("cargo:rerun-if-changed=assets/icons/app-icon.rc");
+    println!("cargo:rerun-if-changed=assets/icons/app-icon.ico");
+    println!("cargo:rerun-if-env-changed=WINDRES");
+    let windres = std::env::var("WINDRES").unwrap_or_else(|_| "x86_64-w64-mingw32-windres".into());
+    let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR is set"));
+    let object = out_dir.join("app-icon.o");
+    let status = std::process::Command::new(&windres)
+        .args(["-I", "assets/icons", "-O", "coff", "-o"])
+        .arg(&object)
+        .arg("assets/icons/app-icon.rc")
+        .status()
+        .unwrap_or_else(|err| panic!("failed to run {windres}: {err}"));
+    assert!(
+        status.success(),
+        "{windres} failed on assets/icons/app-icon.rc"
+    );
+    println!("cargo:rustc-link-arg-bins={}", object.display());
 }
 
 fn assert_clang_for_lto(build: &cc::Build) {
