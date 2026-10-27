@@ -37,6 +37,14 @@ RUN /docker-build.sh build
 
 RUN /docker-build.sh export
 
+FROM build AS test-build
+
+RUN /docker-build.sh tests
+
+FROM scratch AS tests
+
+COPY --from=test-build /tests /
+
 FROM scratch AS output
 
 COPY --from=build /output /

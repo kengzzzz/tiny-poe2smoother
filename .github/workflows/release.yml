@@ -99,9 +99,59 @@ jobs:
           name: poe2smoother-${{ matrix.target.name }}
           path: /tmp/artifacts/${{ matrix.target.name }}/*
 
+  build-windows-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Windows test binaries
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: tests
+          build-args: TARGET=x86_64-pc-windows-gnu
+          outputs: type=local,dest=/tmp/windows-tests
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          sbom: false
+
+      - name: Upload test binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-tests
+          path: /tmp/windows-tests/*.exe
+
+  windows-tests:
+    needs: build-windows-tests
+    runs-on: windows-latest
+    steps:
+      - name: Download test binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-tests
+          path: tests
+
+      - name: Run tests
+        shell: pwsh
+        run: |
+          $failed = @()
+          foreach ($exe in Get-ChildItem tests -Filter *.exe) {
+            Write-Host "== $($exe.Name)"
+            & $exe.FullName
+            if ($LASTEXITCODE -ne 0) { $failed += $exe.Name }
+          }
+          if ($failed.Count -gt 0) {
+            Write-Error "Failed: $($failed -join ', ')"
+            exit 1
+          }
+
   release:
     if: startsWith(github.ref, 'refs/tags/')
-    needs: build
+    needs: [build, windows-tests]
     runs-on: ubuntu-latest
     permissions:
       contents: write

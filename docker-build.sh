@@ -49,6 +49,20 @@ build() {
     cargo build --release --target "$TARGET" --bin tiny-poe2smoother
 }
 
+build_tests() {
+    mkdir -p /tests
+    cargo test --release --target "$TARGET" --no-run --message-format=json \
+        | grep '"test":true' \
+        | grep -o '"executable":"[^"]*"' \
+        | cut -d'"' -f4 \
+        | while read -r exe; do cp "$exe" /tests/; done
+    if [ -z "$(ls -A /tests)" ]; then
+        echo "No test binaries were built for $TARGET" >&2
+        exit 1
+    fi
+    ls -la /tests
+}
+
 export_binaries() {
     mkdir -p /output
 
@@ -92,8 +106,9 @@ case "${1:-build}" in
     fetch)  fetch  ;;
     build)  build  ;;
     export) export_binaries  ;;
+    tests)  build_tests  ;;
     *)
-        echo "Usage: $0 {setup|fetch|build|export}" >&2
+        echo "Usage: $0 {setup|fetch|build|export|tests}" >&2
         exit 1
         ;;
 esac
