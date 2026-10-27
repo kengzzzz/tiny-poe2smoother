@@ -35,9 +35,10 @@ fn build_ooz() {
         .include("vendor/ooz");
     // Opt-in LTO (OOZ_LTO). Needs CXX=clang++, clang + lld linking, and AR=llvm-ar.
     //
-    // WARNING: clang/LLVM 22.1.6 miscompiles Leviathan_ProcessLz at -O2 (SLP fuses an
-    // overlapping match copy) and corrupts real PoE2 bundles. -fno-slp-vectorize fixes
-    // plain builds but not LTO. Verify clang builds against a g++ baseline on real data:
+    // WARNING: clang/LLVM miscompiles Leviathan_ProcessLz at -O2 (SLP fuses an overlapping
+    // match copy) and corrupts real PoE2 bundles. Seen in 22.1.6 and still in 23.1.4
+    // (2026-10-27). -fno-slp-vectorize fixes plain builds but not thin or full LTO.
+    // Verify clang builds against a g++ baseline on real data:
     // `cargo run --release --bin ooz-bench -- digest --game-dir <game-dir>`.
     match std::env::var("OOZ_LTO").as_deref() {
         Ok("thin") => {
