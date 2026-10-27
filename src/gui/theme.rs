@@ -82,6 +82,9 @@ pub fn install_fonts(ctx: &egui::Context) {
 pub fn install_style(ctx: &egui::Context) {
     use palette::*;
 
+    // Otherwise egui follows the OS theme and uses its stock light style.
+    ctx.set_theme(egui::Theme::Dark);
+
     let mut visuals = egui::Visuals::dark();
 
     visuals.panel_fill = BG_APP;
@@ -185,4 +188,23 @@ pub fn caption_text(text: &str) -> egui::RichText {
     egui::RichText::new(text)
         .size(11.5)
         .color(palette::TEXT_MUTED)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn style_survives_a_light_system_theme() {
+        let ctx = egui::Context::default();
+        install_style(&ctx);
+        let input = egui::RawInput {
+            system_theme: Some(egui::Theme::Light),
+            ..Default::default()
+        };
+        ctx.run_ui(input, |_| {}).drop_without_applying_deltas();
+        let style = ctx.global_style();
+        assert!(style.visuals.dark_mode);
+        assert_eq!(style.spacing.button_padding, egui::vec2(14.0, 7.0));
+    }
 }
