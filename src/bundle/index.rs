@@ -1,14 +1,13 @@
 use super::compression::{decompress_bundle, pack_uncompressed_bundle};
-use super::hashing::{hash_path, HashMode};
-use anyhow::{anyhow, bail, Context, Result};
+use super::hashing::{HashMode, hash_path};
+use anyhow::{Context, Result, anyhow, bail};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::io::{Cursor, Read};
 
-/// One file record from the bundle index. The owning bundle's name is not
-/// stored per record (that would clone ~1M strings on parse); resolve it via
-/// [`BundleIndex::bundle_name`] from `bundle_index`.
+/// The owning bundle is resolved via `BundleIndex::bundle_name` to avoid
+/// cloning ~1M strings on parse.
 #[derive(Debug, Clone, Copy)]
 pub struct BundleFile {
     pub hash: u64,
@@ -206,7 +205,6 @@ impl BundleIndex {
         self.files.get(&self.name_hash(path))
     }
 
-    /// Resolve a file record's owning bundle name from its `bundle_index`.
     pub fn bundle_name(&self, bundle_index: u32) -> Result<&str> {
         self.bundles
             .get(bundle_index as usize)

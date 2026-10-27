@@ -1,4 +1,4 @@
-use super::catalog::{patch_label, PatchChange, PatchId, PatchParams, PatchSet};
+use super::catalog::{PatchChange, PatchId, PatchParams, PatchSet, patch_label};
 use super::color_mods::ColorMatcher;
 use super::effect_dependencies::resolve_full_effect_dependencies;
 use super::effect_skills::EffectsFilter;
@@ -6,9 +6,9 @@ use super::monster_effects::resolve_full_monster_effect_paths;
 use super::targeting::{
     effects_targets_path, exact_patch_targets, patch_applies_path, patch_targets_path,
 };
-use super::transform::{transform, TransformCtx};
+use super::transform::{TransformCtx, transform};
 use crate::bundle::{BundleFile, BundleIndex, BundleStore};
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -22,9 +22,7 @@ pub fn compute_patch_set(
 
     let patches = unique_patches(patches);
     let color_matcher = ColorMatcher::new(&params.color_mods);
-    // Per-monster exclusions are resolved against the live index, but only
-    // when Effects or Particles is selected and Full monster overrides exist — the
-    // default path stays free of extra reads and byte-identical.
+    // Only resolved when needed so the default path skips the extra reads.
     let protects_visuals =
         patches.contains(&PatchId::Effects) || patches.contains(&PatchId::Particles);
     let full_monster_paths = if protects_visuals {
@@ -33,14 +31,14 @@ pub fn compute_patch_set(
         BTreeSet::new()
     };
     let mut effects_filter = EffectsFilter::new(&params.effect_skills, full_monster_paths);
-    if protects_visuals {
-        if let Some(filter) = effects_filter.as_mut() {
-            let dependencies = resolve_full_effect_dependencies(store, index, filter)?;
-            filter.protect_paths(dependencies);
-        }
+    if protects_visuals && let Some(filter) = effects_filter.as_mut() {
+        let dependencies = resolve_full_effect_dependencies(store, index, filter)?;
+        filter.protect_paths(dependencies);
     }
     let ctx = TransformCtx {
         zoom: params.zoom,
+        minimap: &params.minimap,
+        options: &params.options,
         color: color_matcher.as_ref(),
         effects: effects_filter.as_ref(),
     };
@@ -91,7 +89,7 @@ fn collect_patch_targets(
     effects: Option<&EffectsFilter>,
 ) -> Result<Vec<(String, BundleFile)>> {
     let patches = unique_patches(patches);
-    // Effects is the one filter-aware patch: Full folders are never read.
+    // Full folders are never read.
     let targets_path = |patch: PatchId, path: &str| match patch {
         PatchId::Effects => effects_targets_path(path, effects),
         PatchId::Particles => {
@@ -154,8 +152,8 @@ fn collect_patch_targets(
                 continue;
             }
             bail!(
-                "patch '{}' has no matching files in this game version;\n\
-                 verify game files or wait for a tiny-poe2smoother update",
+                "patch '{}' has no matching files in this game version.\n\
+                 Verify game files or wait for a tiny-poe2smoother update",
                 patch_label(patch)
             );
         }
@@ -300,8 +298,12 @@ mod tests {
         let mut index =
             BundleIndex::for_test_paths(&[("metadata/environmentsettings/test.env", "env", 12)]);
 
-        let candidates =
-            collect_patch_targets(&mut index, &[PatchId::Fog, PatchId::Fog], None).unwrap();
+        let candidates = collect_patch_targets(
+            &mut index,
+            &[PatchId::Atmosphere, PatchId::Atmosphere],
+            None,
+        )
+        .unwrap();
         let candidates = dedup_candidates(candidates);
 
         assert_eq!(candidates.len(), 1);
@@ -317,14 +319,7 @@ mod tests {
 
         let candidates = collect_patch_targets(
             &mut index,
-            &[
-                PatchId::Fog,
-                PatchId::Rain,
-                PatchId::Clouds,
-                PatchId::EnvParticles,
-                PatchId::Shadow,
-                PatchId::Light,
-            ],
+            &[PatchId::Atmosphere, PatchId::Shadow, PatchId::Light],
             None,
         )
         .unwrap();
@@ -370,9 +365,10 @@ mod tests {
 
         let err = collect_patch_targets(&mut index, &[PatchId::Minimap], None).unwrap_err();
 
-        assert!(err
-            .to_string()
-            .contains("patch 'minimap' has no matching files"));
+        assert!(
+            err.to_string()
+                .contains("patch 'minimap' has no matching files")
+        );
     }
 
     #[test]
@@ -394,7 +390,7 @@ mod tests {
                 12,
             ),
             ("metadata/monsters/foo/bar.ot", "monster", 12),
-            // particle data under a skill dir: NOT a sound target.
+            // Particle data under a skill dir isn't a sound target.
             (
                 "metadata/effects/spells/fireball/fireball.pet",
                 "effects",
@@ -421,10 +417,11 @@ mod tests {
         assert!(
             paths.contains(&"metadata/effects/spells/monsters_effects/boss/roar.aoc".to_string())
         );
-        assert!(paths.contains(&"metadata/effects/microtransactions/portal/portal.pet".to_string()));
+        assert!(
+            paths.contains(&"metadata/effects/microtransactions/portal/portal.pet".to_string())
+        );
         assert!(paths.contains(&"metadata/monsters/foo/bar.ot".to_string()));
-        // sound patches must not grab particle .pet files (that is the particles
-        // patch's job); only .ao/.aoc/.ot/.otc are sound targets.
+        // Sound patches take .ao, .aoc, .ot, and .otc files, never particle .pet files.
         assert!(!paths.contains(&"metadata/effects/spells/fireball/fireball.pet".to_string()));
     }
 
@@ -482,8 +479,7 @@ mod tests {
             &"metadata/effects/spells/cold_herald_of_ice/ao/ice_explosion.ao".to_string()
         ));
         assert!(paths.contains(&"metadata/effects/spells/arc_02/arc.aoc".to_string()));
-        // Full folders are never even read; unlisted folders keep the
-        // .ao/.aoc-only rule.
+        // Full folders are never read. Unlisted folders keep the .ao/.aoc rule.
         assert!(!paths.contains(&"metadata/effects/spells/fireball/fireball.ao".to_string()));
         assert!(
             !paths.contains(&"metadata/effects/spells/cold_herald_of_ice/epk/buff.epk".to_string())
@@ -527,14 +523,15 @@ mod tests {
             all_paths.push(path);
         }
 
-        // The kept monster path drops out of Effects targeting but still
-        // flows to MonsterSounds; sibling and unrelated paths stay targeted.
+        // The kept monster drops out of Effects but still flows to MonsterSounds.
         assert!(!effects_paths.contains(&kept.to_string()));
         assert!(all_paths.contains(&kept.to_string()));
         assert!(effects_paths.contains(
             &"metadata/effects/spells/monsters_effects/act3/anchoritemother/death.ao".to_string()
         ));
-        assert!(effects_paths.contains(&"metadata/effects/spells/fireball/fireball.ao".to_string()));
+        assert!(
+            effects_paths.contains(&"metadata/effects/spells/fireball/fireball.ao".to_string())
+        );
     }
 
     #[test]
@@ -569,9 +566,7 @@ mod tests {
             .map(|(path, _)| path)
             .collect::<Vec<_>>();
 
-        // The Full folder's .ao is still collected via SkillSounds; the
-        // Effects transform itself passes it through unchanged (covered in
-        // transform.rs).
+        // SkillSounds still collects the Full folder's .ao. The Effects transform passes it through.
         assert!(paths.contains(&"metadata/effects/spells/fireball/fireball.ao".to_string()));
         assert!(paths.contains(&"metadata/effects/spells/arc_02/arc.ao".to_string()));
     }
@@ -626,8 +621,7 @@ mod tests {
 
     #[test]
     fn sound_patch_skips_character_selection_assets() {
-        let startup_scene =
-            "Metadata/Terrain/CharacterSelection/CharacterSelectionGallows/Gallows_MainBuilding_fx.ao";
+        let startup_scene = "Metadata/Terrain/CharacterSelection/CharacterSelectionGallows/Gallows_MainBuilding_fx.ao";
         let mut index = BundleIndex::for_test_paths(&[
             (startup_scene, "startup", 12),
             ("metadata/terrain/trees/tree.ao", "terrain", 12),
@@ -737,16 +731,14 @@ mod tests {
                 ])
             );
         }
-        // Full protection also holds when Effects is deselected but Particles
-        // is enabled, and does not depend on which patch appears first.
+        // Protection also holds with only Particles selected.
         let result = compute_patch_set(&store, &mut index, &[PatchId::Particles], &params).unwrap();
         assert_eq!(result.changes.len(), 1);
         assert_eq!(
             result.changes[0].path,
             "metadata/particles/unrelated/flames.pet"
         );
-        // Removing the ground override restores reduction of both the ground
-        // effect and its particles; the unrelated Oil Grenade override stays.
+        // Removing the ground override reduces it again. The Oil Grenade override stays.
         let reduced = PatchParams {
             effect_skills: vec![params.effect_skills[1].clone()],
             ..Default::default()

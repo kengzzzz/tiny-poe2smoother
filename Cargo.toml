@@ -1,34 +1,36 @@
 [package]
 name = "tiny-poe2smoother"
-version = "0.6.2"
-edition = "2021"
+version = "0.7.0"
+edition = "2024"
+rust-version = "1.99"
 default-run = "tiny-poe2smoother"
 
 [dependencies]
 aho-corasick = "1.1.5"
 anyhow = "1.0.104"
 byteorder = "1.5.0"
-dirs = "6.0.0"
-memmap2 = "0.9.11"
+dirs = "7.0.0"
+memmap2 = "0.9.12"
 regex = "1.13.1"
 rayon = "1.12"
 serde = { version = "1.0.229", features = ["derive"] }
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 tempfile = "3.27"
-thiserror = "2.0.20"
+thiserror = "2.0.21"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt"] }
 
 [target.'cfg(windows)'.dependencies]
-eframe = { version = "0.36.1", default-features = false, features = [
+eframe = { version = "0.37.0", default-features = false, features = [
     "default_fonts",
     "glow",
     "persistence",
 ] }
 rfd = { version = "0.17.2", default-features = false }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Registry"] }
 
 [target.'cfg(not(windows))'.dependencies]
-eframe = { version = "0.36.1", default-features = false, features = [
+eframe = { version = "0.37.0", default-features = false, features = [
     "accesskit",
     "default_fonts",
     "glow",
@@ -39,7 +41,13 @@ eframe = { version = "0.36.1", default-features = false, features = [
 rfd = "0.17.2"
 
 [build-dependencies]
-cc = { version = "1.4.4", features = ["parallel"] }
+cc = { version = "1.10.0", features = ["parallel"] }
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = 0
 
 [profile.release]
 opt-level = 3

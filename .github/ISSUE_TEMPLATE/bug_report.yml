@@ -66,7 +66,7 @@ body:
     id: reproduction
     attributes:
       label: Steps to reproduce
-      description: Include the preset or individual patches selected and whether you clicked Apply or Restore.
+      description: Include the profile or individual patches selected (with any sub-options you turned off) and whether you clicked Apply or Restore.
       placeholder: |
         1. Select ...
         2. Click ...

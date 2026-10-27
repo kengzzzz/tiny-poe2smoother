@@ -1,5 +1,4 @@
-use anyhow::{bail, Result};
-use regex::Regex;
+use anyhow::{Result, bail};
 use std::collections::HashSet;
 
 pub(super) fn replace_utf16(bytes: &[u8], replacements: &[(&str, &str)]) -> Result<Vec<u8>> {
@@ -10,17 +9,14 @@ pub(super) fn replace_utf16(bytes: &[u8], replacements: &[(&str, &str)]) -> Resu
     Ok(encode_utf16_bom(&text))
 }
 
-pub(super) fn regex_utf16(bytes: &[u8], regex: &Regex, replacement: &str) -> Result<Vec<u8>> {
-    let text = decode_utf16(bytes)?;
-    Ok(encode_utf16_bom(&regex.replace_all(&text, replacement)))
-}
-
 pub(crate) fn decode_utf16(bytes: &[u8]) -> Result<String> {
     if !bytes.len().is_multiple_of(2) {
         bail!("UTF-16 file has odd byte length");
     }
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
         .collect();
     let text = String::from_utf16(&units)?;
@@ -65,12 +61,12 @@ pub(super) fn replace_array_property(mut data: String, property: &str) -> String
         }
         end += 1;
     }
-    if depth == 0 {
-        if let Some(comma_rel) = data[end - 1..].find(',') {
-            let comma = end - 1 + comma_rel;
-            if comma < end + 5 {
-                data.replace_range(index..=comma, &format!("\"{property}\": [],"));
-            }
+    if depth == 0
+        && let Some(comma_rel) = data[end - 1..].find(',')
+    {
+        let comma = end - 1 + comma_rel;
+        if comma < end + 5 {
+            data.replace_range(index..=comma, &format!("\"{property}\": [],"));
         }
     }
     data
@@ -271,9 +267,7 @@ pub(super) fn strip_client_blocks(data: &str, keep: &HashSet<&str>) -> String {
     )
 }
 
-/// Replace the body of every block whose name is in `names` with `{}`, in place,
-/// at any nesting depth, leaving all surrounding bytes untouched. Used for sound
-/// removal: `SoundEvents { ... }` -> `SoundEvents {}`.
+/// Empties each named block in place, at any depth, like `SoundEvents {}`.
 pub(super) fn empty_named_blocks(data: &str, names: &HashSet<&str>) -> String {
     let mut out = data.to_string();
     let mut pos = 0;
@@ -281,13 +275,12 @@ pub(super) fn empty_named_blocks(data: &str, names: &HashSet<&str>) -> String {
         let Some(close) = find_matching_brace(&out, open) else {
             break;
         };
-        // Only collapse blocks that actually carry content; leave already-empty
-        // (whitespace-only) bodies verbatim, matching the captured output.
+        // Whitespace-only bodies stay verbatim, matching the captured output.
         if names.contains(name.as_str()) && !out[open + 1..close].trim().is_empty() {
             let replacement = format!("{name} {{}}");
             let advance = name_start + replacement.len();
             out.replace_range(name_start..close + 1, &replacement);
-            // Resume past the emptied block so we never re-match it (infinite loop).
+            // Skip past the emptied block so it never matches again.
             pos = advance;
         } else {
             pos = open + 1;
@@ -302,8 +295,7 @@ mod tests {
 
     #[test]
     fn replace_array_property_survives_non_ascii_prefix() {
-        // Non-ASCII before the property must not skew the bracket scan
-        // (byte vs char indices) or panic on a non-boundary slice.
+        // Non-ASCII text before the property must not break the byte-based scan.
         let input = "// gráph…\n{\"values\": [[1, 2], [3]],\"other\": 1}".to_string();
         let out = replace_array_property(input, "values");
         assert_eq!(out, "// gráph…\n{\"values\": [],\"other\": 1}");

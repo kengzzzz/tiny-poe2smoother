@@ -1,13 +1,12 @@
 //! Shared ground visuals and spell-effect folders without a skill owner.
 
 use super::effect_skills::{
-    effect_skill_folder, is_shared_effect_folder, EffectSkillCatalogEntry, SPELLS_PREFIX,
+    EffectSkillCatalogEntry, SPELLS_PREFIX, effect_skill_folder, is_shared_effect_folder,
 };
 use super::targeting::{ends_with_path_ci, normalize_path};
 use std::collections::BTreeSet;
 
-/// One independently controlled scope under `metadata/effects/spells/`.
-/// Normally a directory; a loose file directly under spells uses its filename.
+/// A directory, or the filename of a loose file directly under spells.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OtherEffectCatalogEntry {
     pub folder: String,
@@ -31,8 +30,7 @@ pub fn build_other_effect_catalog(
         let Some(relative) = normalized.strip_prefix(SPELLS_PREFIX) else {
             continue;
         };
-        // Monster-specific assets remain in the Monsters tab. Shared assets
-        // referenced by monsters live outside this reserved subtree.
+        // Monster-specific assets stay in the Monsters tab.
         if relative.starts_with("monsters_effects/") {
             continue;
         }

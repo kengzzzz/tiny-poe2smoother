@@ -1,12 +1,11 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use rayon::prelude::*;
 use std::io::Cursor;
 use std::os::raw::{c_int, c_void};
 
-// Symbols from vendor/ooz, compiled by build.rs; the compression entry points
-// are unmangled wrappers from vendor/ooz/ooz_shim.cpp.
-extern "C" {
+// Provided by vendor/ooz, built in build.rs.
+unsafe extern "C" {
     fn Ooz_Decompress(src_buf: *const u8, src_len: u32, dst: *mut u8, dst_size: usize) -> i32;
     fn Ooz_CompressBlock(
         codec_id: c_int,
@@ -26,8 +25,7 @@ const BUNDLE_FIXED_HEAD_SIZE_AFTER_PREFIX: usize = 48;
 const OODLE_MERMAID_COMPRESSOR: u32 = 9;
 const OODLE_COMPRESS_LEVEL: c_int = 1;
 
-// Oodle decoders may write up to 64 bytes past the destination end; every
-// buffer chunks decompress into must carry this slack past the last byte.
+// Oodle decoders may write up to 64 bytes past the output end.
 const OOZ_SAFE_SPACE: usize = 64;
 
 struct BundleHead {
@@ -38,7 +36,6 @@ struct BundleHead {
 }
 
 impl BundleHead {
-    /// Uncompressed size of chunk `index` (the last chunk is usually short).
     fn chunk_dst_size(&self, index: usize) -> usize {
         let start = index * self.chunk_unpacked_size;
         self.chunk_unpacked_size
@@ -82,8 +79,7 @@ fn parse_bundle_head(src: &[u8]) -> Result<BundleHead> {
 fn decompress_chunk_into(chunk: &[u8], dst: *mut u8, dst_size: usize) -> Result<()> {
     let wrote =
         unsafe { Ooz_Decompress(chunk.as_ptr(), u32::try_from(chunk.len())?, dst, dst_size) };
-    // Anything short of the expected size would leave stale bytes in a shared
-    // output buffer, so treat it as corruption rather than tolerating it.
+    // A short write would leave stale bytes in the shared buffer.
     if wrote != i32::try_from(dst_size)? {
         bail!("Oodle decompression wrote {wrote} bytes, expected {dst_size}");
     }
@@ -95,9 +91,7 @@ pub fn decompress_bundle(src: &[u8]) -> Result<Vec<u8>> {
     let mut out = vec![0u8; head.uncompressed_size + OOZ_SAFE_SPACE];
     let mut offset = head.data_offset;
     let mut covered = 0usize;
-    // Chunks must decompress in order: each may spill up to OOZ_SAFE_SPACE
-    // bytes past its end into the next chunk's region, which the next
-    // iteration then overwrites. Do not parallelize within this buffer.
+    // Sequential only: each chunk may spill into the next chunk's region.
     for (i, &size) in head.chunk_sizes.iter().enumerate() {
         if offset + size > src.len() {
             bail!("bundle chunk exceeds source length");
@@ -122,10 +116,6 @@ pub fn decompress_bundle(src: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Decompress only the chunks of `src` (a compressed bundle) that cover the
-/// requested `(offset, size)` spans in uncompressed space, returning the bytes
-/// of each span in input order. Peak memory is proportional to the covered
-/// chunks rather than the whole bundle.
 pub fn decompress_bundle_slices(src: &[u8], spans: &[(u32, u32)]) -> Result<Vec<Vec<u8>>> {
     let head = parse_bundle_head(src)?;
 
@@ -138,7 +128,6 @@ pub fn decompress_bundle_slices(src: &[u8], spans: &[(u32, u32)]) -> Result<Vec<
         }
     }
 
-    // Absolute source offset of each chunk, bounds-checked once.
     let mut chunk_offsets = Vec::with_capacity(head.chunk_sizes.len());
     let mut src_offset = head.data_offset;
     for &size in &head.chunk_sizes {
@@ -161,8 +150,7 @@ pub fn decompress_bundle_slices(src: &[u8], spans: &[(u32, u32)]) -> Result<Vec<
         }
     }
 
-    // Decompress each maximal run of contiguous needed chunks into one buffer.
-    // Chunks within a run must stay sequential (see decompress_bundle).
+    // Contiguous chunks share one buffer and must decode in order.
     let mut runs: Vec<(usize, Vec<u8>)> = Vec::new(); // (first uncompressed byte, bytes)
     let mut chunk = 0;
     while chunk < needed.len() {
@@ -198,7 +186,6 @@ pub fn decompress_bundle_slices(src: &[u8], spans: &[(u32, u32)]) -> Result<Vec<
                 return Ok(Vec::new());
             }
             let (offset, size) = (offset as usize, size as usize);
-            // A span's chunks are contiguous, so it lies within a single run.
             let (run_start, buf) = runs
                 .iter()
                 .find(|(start, buf)| offset >= *start && offset + size <= start + buf.len())
@@ -280,7 +267,6 @@ mod tests {
         assert_eq!(unpacked, data);
     }
 
-    /// Varied, poorly-compressible bytes spanning a bit over two chunks.
     fn multi_chunk_data() -> Vec<u8> {
         let len = 2 * BUNDLE_CHUNK_SIZE + 12_345;
         let mut state = 0x2545F491_u32;

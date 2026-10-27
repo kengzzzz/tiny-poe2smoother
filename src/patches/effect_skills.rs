@@ -1,8 +1,8 @@
 use super::datc64::{parse_table, utf16le_string_at};
 use super::targeting::{is_metadata_effect_ext, starts_with_path_ci};
 use serde::{
-    de::{self, Visitor},
     Deserialize, Deserializer, Serialize,
+    de::{self, Visitor},
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -10,15 +10,10 @@ use std::fmt;
 pub(super) const SPELLS_PREFIX: &str = "metadata/effects/spells/";
 const MIN_LABEL_ALIAS_LEN: usize = 4;
 
-/// How the `Effects` patch treats one skill effect directory under
-/// `metadata/effects/spells/`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EffectLevel {
-    /// Leave every file of the skill untouched (original visuals).
     Full,
-    /// Strip nonessential client blocks from `.ao`/`.aoc` (the patch's
-    /// long-standing behavior).
     #[default]
     Reduced,
 }
@@ -55,19 +50,14 @@ impl<'de> Visitor<'de> for EffectLevelVisitor {
 
 const OLD_EFFECT_LEVEL: &str = concat!("hid", "den");
 
-/// One persisted non-default skill or Others setting. `folder` is a lowercase
-/// relative scope under `metadata/effects/spells/`, usually its top-level
-/// segment (e.g. "cold_herald_of_ice"). Shared support containers retain the
-/// skill-specific suffix (e.g. "supports/runicsupports/bitterdead"). Folders
-/// without an override are `Reduced`. Others also uses individual ground
-/// subdirectories and exact paths for loose effect files.
+/// `folder` is a lowercase scope under `metadata/effects/spells/`, like
+/// "cold_herald_of_ice" or "supports/runicsupports/bitterdead".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EffectSkillOverride {
     pub folder: String,
     pub level: EffectLevel,
 }
 
-/// One live ActiveSkills-backed row in the per-skill effects editor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectSkillCatalogEntry {
     pub active_skill_id: String,
@@ -76,10 +66,7 @@ pub struct EffectSkillCatalogEntry {
     pub folders: Vec<String>,
 }
 
-/// Per-request view over the overrides. `None` (no overrides at all) keeps
-/// target collection and transforms byte-identical to the unfiltered
-/// behavior. `full_paths` holds per-monster exclusions and the references of
-/// kept visuals, including particle files outside the selected folder.
+/// `full_paths` holds per-monster exclusions and the references of kept visuals.
 #[derive(Debug)]
 pub(super) struct EffectsFilter {
     full_folders: BTreeSet<String>,
@@ -105,8 +92,7 @@ impl EffectsFilter {
     pub(super) fn level_for(&self, path: &str) -> EffectLevel {
         let normalized = super::targeting::normalize_path(path);
         if let Some(relative) = normalized.strip_prefix(SPELLS_PREFIX) {
-            // Check every directory ancestor so old persisted top-level keys
-            // such as `supports` still keep the whole subtree original.
+            // Ancestors count so old top-level keys like `supports` keep the whole subtree.
             if self.full_folders.contains(relative)
                 || relative
                     .match_indices('/')
@@ -115,8 +101,6 @@ impl EffectsFilter {
                 return EffectLevel::Full;
             }
         }
-        // Monster exclusions and visual dependencies are exact paths and
-        // compose with the directory-prefix checks above. Full always wins.
         if !self.full_paths.is_empty() && self.full_paths.contains(&normalized) {
             return EffectLevel::Full;
         }
@@ -132,10 +116,7 @@ impl EffectsFilter {
     }
 }
 
-/// The top-level folder segment after `metadata/effects/spells/`
-/// (case/backslash-insensitive), or `None` for paths outside the prefix and
-/// for files sitting directly in `spells/` — those always behave as
-/// `Reduced` and are not overridable.
+/// Files directly in `spells/` have no folder and can't be overridden.
 pub(super) fn spells_folder(path: &str) -> Option<&str> {
     if !starts_with_path_ci(path, SPELLS_PREFIX) {
         return None;
@@ -145,9 +126,8 @@ pub(super) fn spells_folder(path: &str) -> Option<&str> {
     (end > 0).then(|| &rest[..end])
 }
 
-/// The independently overridable effect directory for a skill path. Most
-/// skills own one top-level directory. Ground effects and `supports/` use
-/// child directories; Runic supports share one more container level.
+/// Ground effects and `supports/` use child directories. Runic supports go one
+/// level deeper.
 pub(super) fn effect_skill_folder(path: &str) -> Option<String> {
     if !starts_with_path_ci(path, SPELLS_PREFIX) {
         return None;
@@ -176,8 +156,7 @@ pub(super) fn effect_skill_folder(path: &str) -> Option<String> {
     }
 }
 
-/// Ground visuals are shared by many skills and monsters. A reference from
-/// one skill's table row is not evidence that the skill owns the container.
+/// Ground visuals are shared, so a skill referencing one doesn't own it.
 pub(super) fn is_shared_effect_folder(folder: &str) -> bool {
     matches!(
         folder
@@ -190,8 +169,6 @@ pub(super) fn is_shared_effect_folder(folder: &str) -> bool {
     )
 }
 
-/// Distinct sorted lowercase skill effect directories that contain at least
-/// one effect data file — the catalog behind the per-skill editor.
 pub fn effect_skill_folders(paths: &[String]) -> Vec<String> {
     let mut folders: Vec<String> = paths
         .iter()
@@ -203,9 +180,6 @@ pub fn effect_skill_folders(paths: &[String]) -> Vec<String> {
     folders
 }
 
-/// Build the per-skill effects catalog from the game's own skill tables.
-/// Folder paths are used only to validate that a resolved folder exists and
-/// contains effect files the patch can target.
 pub fn build_effect_skill_catalog(
     activeskills_bytes: &[u8],
     actiontypes_bytes: &[u8],
@@ -299,10 +273,10 @@ impl ActiveSkillEffectRow {
             normalize_label_key(&self.active_skill_id),
             AliasRank::Id,
         );
-        if self.action_type.ends_with("New") {
-            if let Some(stripped) = self.action_key.strip_suffix("new") {
-                push_min_len_alias(&mut aliases, stripped.to_string(), AliasRank::Action);
-            }
+        if self.action_type.ends_with("New")
+            && let Some(stripped) = self.action_key.strip_suffix("new")
+        {
+            push_min_len_alias(&mut aliases, stripped.to_string(), AliasRank::Action);
         }
         aliases
     }
@@ -723,8 +697,6 @@ fn parse_activeskill_rows(bytes: &[u8]) -> Option<ActiveSkillRows> {
     let mut map = HashMap::with_capacity(table.row_count);
     let mut action_refs = Vec::with_capacity(table.row_count);
     for row in table.rows() {
-        // `row.len() == row_len >= 16` (chunks_exact + the check above), so
-        // these 8-byte slices always convert.
         let id_off = u64::from_le_bytes(row[0..8].try_into().unwrap()) as usize;
         let name_off = u64::from_le_bytes(row[8..16].try_into().unwrap()) as usize;
         let Some(id) = utf16le_string_at(heap, id_off).filter(|s| is_plausible_skill_id(s)) else {
@@ -735,15 +707,14 @@ fn parse_activeskill_rows(bytes: &[u8]) -> Option<ActiveSkillRows> {
             continue;
         };
         let id = id.to_ascii_lowercase();
-        if row_len >= 28 {
-            if let Some(action_idx) = row
+        if row_len >= 28
+            && let Some(action_idx) = row
                 .get(24..28)
                 .and_then(|b| b.try_into().ok())
                 .map(u32::from_le_bytes)
                 .map(|n| n as usize)
-            {
-                action_refs.push((id.clone(), action_idx));
-            }
+        {
+            action_refs.push((id.clone(), action_idx));
         }
         map.insert(id, name);
     }
@@ -808,11 +779,8 @@ fn is_plausible_display_name(s: &str) -> bool {
     !s.is_empty() && s.len() <= 100 && s.chars().all(|c| !c.is_control())
 }
 
-/// Leading bracketed tags (`[DNT]`, `[DNT-UNUSED]`, `[UNUSED]`) are not a
-/// reliability signal: live skills like Smite carry them. Strip the tag and
-/// trust the remainder unless it reads as a dead/placeholder marker — of
-/// 113 tagged rows on a live install, only 4 matched such markers
-/// ("DISCONTINUED", "(NOT CURRENTLY USED)", "A placeholder self-buff").
+/// Tags like `[DNT]` don't mean a skill is unused (Smite has one). Only dead
+/// markers like "DISCONTINUED" drop a row.
 pub(super) fn clean_display_name(name: &str) -> Option<String> {
     let stripped = match name.strip_prefix('[') {
         Some(rest) => rest.split_once(']')?.1.trim_start(),
@@ -867,14 +835,16 @@ mod tests {
     fn filter_resolves_levels_case_insensitively_and_defaults_to_reduced() {
         assert!(EffectsFilter::new(&[], BTreeSet::new()).is_none());
         // Explicit Reduced entries are meaningless and collapse to None.
-        assert!(EffectsFilter::new(
-            &[EffectSkillOverride {
-                folder: "arc_02".to_string(),
-                level: EffectLevel::Reduced,
-            }],
-            BTreeSet::new()
-        )
-        .is_none());
+        assert!(
+            EffectsFilter::new(
+                &[EffectSkillOverride {
+                    folder: "arc_02".to_string(),
+                    level: EffectLevel::Reduced,
+                }],
+                BTreeSet::new()
+            )
+            .is_none()
+        );
 
         let filter = EffectsFilter::new(
             &[EffectSkillOverride {
@@ -921,8 +891,7 @@ mod tests {
             EffectLevel::Reduced
         );
 
-        // Compatibility with v0.6 preferences, where every support effect
-        // was represented by one top-level `supports` override.
+        // v0.6 prefs used one top-level `supports` override.
         let legacy = EffectsFilter::new(
             &[EffectSkillOverride {
                 folder: "supports".to_string(),
@@ -1210,8 +1179,7 @@ mod tests {
                 1,
             ),
         ]);
-        // Bitter Dead really reuses Volatile Dead's action type in the live
-        // table, so its animation label has to resolve through its skill ID.
+        // Bitter Dead reuses Volatile Dead's action type, so it resolves by skill ID.
         let actiontypes =
             build_actiontypes_bytes(&["VolatileDead", "TriggeredLightningDetonateDead"]);
         let miscanimated = build_miscanimated_bytes(&[
@@ -1277,8 +1245,7 @@ mod tests {
 
     #[test]
     fn malformed_action_type_does_not_make_folders_ambiguous() {
-        // "ice_shot" resolves normally; "broken" has action type "_" which
-        // normalizes to "" and must not match every label.
+        // "broken" has action type "_", which normalizes to "" and must not match every label.
         let activeskills = build_activeskills_with_actions(&[
             ("ice_shot", "Ice Shot", 0),
             ("broken", "Broken Skill", 1),
@@ -1299,8 +1266,6 @@ mod tests {
         )
         .unwrap();
 
-        // Without the fix, "broken" (empty action_key) also matches "IceShotCone",
-        // making bow_ice_shot ambiguous and the result empty.
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].active_skill_id, "ice_shot");
     }
@@ -1356,9 +1321,11 @@ mod tests {
             row(&rows, "tornado_shot").folders,
             vec!["bow_tornado_shot".to_string()]
         );
-        assert!(!rows
-            .iter()
-            .any(|row| row.active_skill_id == "elemental_storm"));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.active_skill_id == "elemental_storm")
+        );
     }
 
     #[test]
@@ -1449,9 +1416,11 @@ mod tests {
             row(&rows, "tempest_flurry").folders,
             vec!["flurry".to_string()]
         );
-        assert!(!rows
-            .iter()
-            .any(|row| row.active_skill_id == "charged_attack_channel"));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.active_skill_id == "charged_attack_channel")
+        );
     }
 
     #[test]
@@ -1480,9 +1449,11 @@ mod tests {
             row(&rows, "twister").folders,
             vec!["spear_tornadoes".to_string()]
         );
-        assert!(!rows
-            .iter()
-            .any(|row| row.active_skill_id == "avian_tornado"));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.active_skill_id == "avian_tornado")
+        );
         let twister_rows: Vec<_> = rows
             .iter()
             .filter(|row| row.display == "Twister")
@@ -1517,9 +1488,11 @@ mod tests {
             row(&rows, "earthquake").folders,
             vec!["quake_slam".to_string()]
         );
-        assert!(!rows
-            .iter()
-            .any(|row| row.active_skill_id == "companion_bear_slam"));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.active_skill_id == "companion_bear_slam")
+        );
     }
 
     #[test]
@@ -1554,9 +1527,11 @@ mod tests {
             row(&rows, "lightning_strike").folders,
             vec!["lightning_strike".to_string()]
         );
-        assert!(!rows
-            .iter()
-            .any(|row| row.active_skill_id == "new_lightning_strike"));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.active_skill_id == "new_lightning_strike")
+        );
     }
 
     #[test]
@@ -1737,10 +1712,8 @@ mod tests {
 
     #[test]
     fn parse_table_skips_false_marker_inside_row_data() {
-        // 3 rows x 16 bytes. Row 0's second field is the heap marker's own
-        // bytes (0xBB x8) -- a decoy a naive first-match scan would mistake for
-        // the heap boundary. It sits at file offset 12, giving block_len 8 and
-        // 8 % 3 != 0, so it's rejected; the real marker is at 4 + 3*16 = 52.
+        // Row 0 holds a decoy 0xBB x8 at offset 12. 8 % 3 != 0 rejects it, so the real
+        // marker is at 52.
         let mut heap = TEST_ROW_MARKER.to_vec();
         let hello_off = push_utf16(&mut heap, "Hello");
 

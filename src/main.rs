@@ -1,4 +1,4 @@
-#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+#![cfg_attr(all(target_os = "windows", not(test)), windows_subsystem = "windows")]
 
 mod gui;
 
@@ -6,33 +6,41 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use tiny_poe2smoother::app::{
-    apply_patches, load_effect_skill_catalog, load_monster_effect_catalog,
-    load_other_effect_catalog, load_stat_catalog, load_status, restore_backup, AppStatus,
-    ApplyReport, PatchRequest, RestoreReport,
+    AppStatus, ApplyReport, PatchRequest, RestoreReport, apply_patches, load_effect_skill_catalog,
+    load_monster_effect_catalog, load_other_effect_catalog, load_stat_catalog, load_status,
+    restore_backup,
 };
 use tiny_poe2smoother::install::display_path;
 use tiny_poe2smoother::patches::{
-    all_patches, default_color_mods, display_stat_text, merge_with_defaults, parse_patch,
-    ColorModEntry, EffectLevel, EffectSkillCatalogEntry, EffectSkillOverride,
+    ColorModEntry, EffectLevel, EffectSkillCatalogEntry, EffectSkillOverride, MinimapStyle,
     MonsterEffectCatalogEntry, MonsterEffectOverride, OtherEffectCatalogEntry, PatchId,
-    PatchParams,
+    PatchOptions, PatchParams, ProfileInfo, all_patches, all_profiles, default_color_mods,
+    display_stat_text, merge_with_defaults, parse_saved_patches, patch_info,
 };
 
 const PREFS_KEY: &str = "tiny-poe2smoother.gui.v1";
+const MIN_INNER_SIZE: [f32; 2] = [840.0, 620.0];
+/// Taskbar, title bar, and cascade offset.
+const SCREEN_MARGIN: f32 = 110.0;
+/// Taskbar height plus a small gap.
+const TASKBAR_ROOM: f32 = 56.0;
 
 fn main() -> eframe::Result {
     tiny_poe2smoother::init_tracing();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([980.0, 720.0])
-            .with_min_inner_size([840.0, 620.0])
+            // Fits 1280x800 with a taskbar.
+            .with_inner_size([980.0, 680.0])
+            .with_min_inner_size(MIN_INNER_SIZE)
             .with_icon(gui::icon::app_icon()),
         ..Default::default()
     };
-    eframe::run_native(
+    let result = eframe::run_native(
         "tiny-poe2smoother",
         options,
         Box::new(|cc| {
@@ -40,7 +48,19 @@ fn main() -> eframe::Result {
             gui::theme::install_style(&cc.egui_ctx);
             Ok(Box::new(GuiApp::new(cc.storage)))
         }),
-    )
+    );
+    // The Windows exe has no console to show the error.
+    if let Err(err) = &result {
+        rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Error)
+            .set_title("tiny-poe2smoother")
+            .set_description(format!(
+                "The window could not open. Make sure your graphics driver is installed and supports OpenGL 2.0 or newer.\n\nDetails: {err}"
+            ))
+            .set_buttons(rfd::MessageButtons::Ok)
+            .show();
+    }
+    result
 }
 
 #[derive(Clone, Copy)]
@@ -50,8 +70,6 @@ enum MessageKind {
     Error,
 }
 
-/// Which tab of the effects editor modal is showing. Remembered across
-/// open/close for the session so the editor reopens where the user left off.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EffectsEditorTab {
     Skills,
@@ -62,12 +80,16 @@ enum EffectsEditorTab {
 struct GuiApp {
     game_dir_input: String,
     selected_patches: HashSet<PatchId>,
+    options: PatchOptions,
     zoom: f64,
+    minimap: MinimapStyle,
+    active_category: usize,
     color_mods: Vec<ColorModEntry>,
     show_color_editor: bool,
     color_search: String,
     stat_catalog: Option<Vec<CatalogRow>>,
     catalog_task: Option<Receiver<Result<Vec<CatalogRow>, String>>>,
+    catalog_threads: Arc<AtomicUsize>,
     catalog_error: Option<String>,
     stat_catalog_dir: Option<PathBuf>,
     color_filter_key: Option<ColorFilterKey>,
@@ -108,11 +130,10 @@ struct GuiApp {
     confirm_restore: bool,
     show_game_running_dialog: bool,
     initialized: bool,
+    window_fitted: bool,
 }
 
-/// A stat catalog entry. `text` is the human-readable form (markup already
-/// collapsed via `display_stat_text`); the lowercase caches mean
-/// per-keystroke filtering never re-lowercases the ~20k-entry catalog.
+/// Lowercase copies keep per-keystroke filtering off the ~20k-entry catalog.
 struct CatalogRow {
     stat_id: String,
     text: String,
@@ -120,23 +141,16 @@ struct CatalogRow {
     text_lower: String,
 }
 
-/// One visible row of the color editor list: either a configured entry
-/// (index into `color_mods`) or a not-yet-configured catalog suggestion
-/// (index into `stat_catalog`).
 #[derive(Clone, Copy)]
 enum ColorRowRef {
     Config(usize),
     Catalog(usize),
 }
 
-/// Filter cache key: query + config length + catalog length. Any of them
-/// changing (typing, promoting a catalog row, catalog finishing its load)
-/// invalidates the cached row list; color/enabled edits don't.
+/// Query, config length, catalog length. Color and enabled edits don't invalidate it.
 type ColorFilterKey = (String, usize, usize);
 
-/// One visible skill row in the per-skill effects editor. A row may own
-/// several underlying effect folders when the game splits one skill's visuals
-/// across buff/explosion/etc. folders.
+/// One row may own several folders when the game splits a skill's visuals.
 struct EffectFolderRow {
     folders: Vec<String>,
     active_skill_id: String,
@@ -146,12 +160,8 @@ struct EffectFolderRow {
     search_lower: String,
 }
 
-/// One visible monster row in the per-monster effects editor. A row owns
-/// every monster variant (runemarked etc.) sharing its display name.
-/// `context` is the muted suffix shown after fallback names from the catalog's
-/// nearest derived ancestry and is `None` for table-named rows. `named`
-/// mirrors the catalog entry's bit; fallback rows are hidden by default
-/// behind the "Show unnamed entities" checkbox.
+/// One row owns every variant sharing a display name. Unnamed rows hide behind
+/// "Show unnamed entities".
 struct MonsterCatalogRow {
     monster_keys: Vec<String>,
     display: String,
@@ -161,8 +171,6 @@ struct MonsterCatalogRow {
     named: bool,
 }
 
-/// One Others-tab row: a single shared/unmapped folder under
-/// `metadata/effects/spells/` (a directory, or an exact `.ao`/`.aoc` file).
 struct OtherEffectRow {
     folder: String,
     display: String,
@@ -170,11 +178,17 @@ struct OtherEffectRow {
     search_lower: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct GuiPrefs {
     game_dir_input: String,
     selected_patches: Vec<String>,
+    #[serde(default)]
+    options: PatchOptions,
     zoom: f64,
+    #[serde(default)]
+    minimap: MinimapStyle,
+    #[serde(default)]
+    active_category: usize,
     #[serde(default)]
     color_mods: Vec<ColorModEntry>,
     #[serde(default)]
@@ -185,7 +199,10 @@ struct GuiPrefs {
 
 enum TaskResult {
     Status(Result<AppStatus, String>),
-    Apply(Result<ApplyReport, String>),
+    Apply {
+        result: Result<ApplyReport, String>,
+        status: Result<AppStatus, String>,
+    },
     Restore {
         result: Result<RestoreReport, String>,
         status: Result<AppStatus, String>,
@@ -194,18 +211,20 @@ enum TaskResult {
 
 impl Default for GuiApp {
     fn default() -> Self {
-        let selected_patches = [PatchId::Minimap, PatchId::Fog, PatchId::Rain]
-            .into_iter()
-            .collect();
+        let default_profile = &all_profiles()[0];
         Self {
             game_dir_input: String::new(),
-            selected_patches,
+            selected_patches: default_profile.patches.iter().copied().collect(),
+            options: default_profile.options(),
             zoom: 2.4,
+            minimap: MinimapStyle::DEFAULT,
+            active_category: 0,
             color_mods: default_color_mods(),
             show_color_editor: false,
             color_search: String::new(),
             stat_catalog: None,
             catalog_task: None,
+            catalog_threads: Arc::default(),
             catalog_error: None,
             stat_catalog_dir: None,
             color_filter_key: None,
@@ -246,6 +265,7 @@ impl Default for GuiApp {
             confirm_restore: false,
             show_game_running_dialog: false,
             initialized: false,
+            window_fitted: false,
         }
     }
 }
@@ -260,7 +280,13 @@ impl eframe::App for GuiApp {
             self.initialized = true;
             self.spawn_status();
         }
+        if !self.window_fitted {
+            self.window_fitted = fit_window_to_monitor(ctx);
+        }
 
+        if self.catalogs_loading() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
         self.poll_task(ctx);
         self.poll_catalog(ctx);
         self.poll_effect_catalog(ctx);
@@ -273,6 +299,65 @@ impl eframe::App for GuiApp {
     }
 }
 
+/// Counts live catalog threads, since a path change drops their task handles.
+struct CatalogThread(Arc<AtomicUsize>);
+
+impl CatalogThread {
+    fn start(count: &Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(count))
+    }
+}
+
+impl Drop for CatalogThread {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Returns false until the monitor size is known.
+fn fit_window_to_monitor(ctx: &egui::Context) -> bool {
+    // inner_rect is None on Wayland.
+    let (monitor, inner, outer, maximized) = ctx.input(|i| {
+        let viewport = i.viewport();
+        (
+            viewport.monitor_size,
+            i.viewport_rect().size(),
+            viewport.outer_rect,
+            viewport.maximized == Some(true) || viewport.fullscreen == Some(true),
+        )
+    });
+    let Some(monitor) = monitor else {
+        return false;
+    };
+    // Resizing would un-maximize it on Windows.
+    if maximized {
+        return true;
+    }
+    let max_height = (monitor.y - SCREEN_MARGIN).max(MIN_INNER_SIZE[1]);
+    let shrink = (inner.y - max_height).max(0.0);
+    if shrink > 0.0 {
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+            inner.x, max_height,
+        )));
+    }
+    // Windows cascades new windows down under the taskbar.
+    if let Some(outer) = outer {
+        let top = (monitor.y - TASKBAR_ROOM - (outer.height() - shrink)).max(0.0);
+        let on_origin_monitor = outer.min.x >= 0.0
+            && outer.min.y >= 0.0
+            && outer.min.x < monitor.x
+            && outer.min.y < monitor.y;
+        if on_origin_monitor && outer.min.y > top {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                outer.min.x,
+                top,
+            )));
+        }
+    }
+    true
+}
+
 impl GuiApp {
     fn new(storage: Option<&dyn eframe::Storage>) -> Self {
         storage
@@ -282,36 +367,29 @@ impl GuiApp {
     }
 
     fn from_prefs(prefs: GuiPrefs) -> Self {
-        let selected_patches = prefs
-            .selected_patches
-            .iter()
-            .filter_map(|patch| parse_patch(patch))
-            .collect::<HashSet<_>>();
-        let selected_patches = if selected_patches.is_empty() {
-            [PatchId::Minimap, PatchId::Fog, PatchId::Rain]
-                .into_iter()
-                .collect()
-        } else {
-            selected_patches
-        };
-        // An empty saved list is never a legitimate state (disabling is done
-        // via the flag, entries are never removed), so it means "no saved
-        // color config yet"; otherwise saved edits win and new defaults from
-        // app updates are appended.
+        let mut options = prefs.options;
+        let selected_patches = parse_saved_patches(&prefs.selected_patches, &mut options);
+        let (selected_patches, options) =
+            if selected_patches.is_empty() && !prefs.selected_patches.is_empty() {
+                let defaults = Self::default();
+                (defaults.selected_patches, defaults.options)
+            } else {
+                (selected_patches, options)
+            };
+        // An empty list means no saved color config yet. Otherwise saved edits win.
         let color_mods = if prefs.color_mods.is_empty() {
             default_color_mods()
         } else {
             merge_with_defaults(prefs.color_mods)
         };
-        // Only non-default levels are ever saved; stale folders from older
-        // game versions are kept silently (they simply match no path).
+        // Stale folders from older game versions stay and simply match no path.
         let effect_overrides = prefs
             .effect_skills
             .into_iter()
             .filter(|entry| entry.level != EffectLevel::Reduced)
             .map(|entry| (entry.folder.to_ascii_lowercase(), entry.level))
             .collect();
-        // Same policy for monsters: stale keys resolve to no paths at apply.
+        // Stale monster keys likewise resolve to no paths.
         let monster_overrides = prefs
             .monster_effects
             .into_iter()
@@ -321,7 +399,10 @@ impl GuiApp {
         Self {
             game_dir_input: prefs.game_dir_input,
             selected_patches,
+            options,
             zoom: prefs.zoom.clamp(1.2, 2.4),
+            minimap: prefs.minimap.clamped(),
+            active_category: prefs.active_category.min(gui::views::CATEGORIES.len() - 1),
             color_mods,
             effect_overrides,
             monster_overrides,
@@ -338,15 +419,17 @@ impl GuiApp {
         GuiPrefs {
             game_dir_input: self.game_dir_input.clone(),
             selected_patches,
+            options: self.options.clone(),
             zoom: self.zoom,
+            minimap: self.minimap,
+            active_category: self.active_category,
             color_mods: self.color_mods.clone(),
             effect_skills: self.effect_skill_overrides(),
             monster_effects: self.monster_effect_overrides(),
         }
     }
 
-    /// The non-default per-skill levels as a folder-sorted list (stable
-    /// serialization order for prefs and `PatchParams`).
+    /// Sorted for a stable prefs and request order.
     fn effect_skill_overrides(&self) -> Vec<EffectSkillOverride> {
         let mut overrides: Vec<EffectSkillOverride> = self
             .effect_overrides
@@ -360,8 +443,7 @@ impl GuiApp {
         overrides
     }
 
-    /// The non-default per-monster levels as a key-sorted list (stable
-    /// serialization order for prefs and `PatchParams`).
+    /// Sorted for a stable prefs and request order.
     fn monster_effect_overrides(&self) -> Vec<MonsterEffectOverride> {
         let mut overrides: Vec<MonsterEffectOverride> = self
             .monster_overrides
@@ -375,8 +457,24 @@ impl GuiApp {
         overrides
     }
 
+    fn active_profile(&self) -> Option<usize> {
+        all_profiles()
+            .iter()
+            .position(|profile| profile.matches(&self.selected_patches, &self.options))
+    }
+
+    fn apply_profile(&mut self, profile: &ProfileInfo) {
+        self.selected_patches = profile.patches.iter().copied().collect();
+        self.options = profile.options();
+    }
+
     fn is_busy(&self) -> bool {
         self.task.is_some()
+    }
+
+    /// Catalog loads map Content.ggpk, which blocks Restore on Windows.
+    fn catalogs_loading(&self) -> bool {
+        self.catalog_threads.load(Ordering::SeqCst) > 0
     }
 
     fn set_message(&mut self, message: impl Into<String>, kind: MessageKind) {
@@ -401,14 +499,26 @@ impl GuiApp {
             && !self.color_mods.iter().any(|entry| entry.enabled)
         {
             return Err(
-                "Color mods is selected but no mods are enabled — use Edit colors…".to_string(),
+                "Color mods is selected but no mods are enabled. Use Edit colors… to pick some."
+                    .to_string(),
             );
+        }
+        if let Some(patch) = patches
+            .iter()
+            .find(|patch| !self.options.any_enabled(**patch))
+        {
+            return Err(format!(
+                "{} is selected but all of its options are off.",
+                patch_info(*patch).title
+            ));
         }
         Ok(PatchRequest {
             game_dir: self.game_dir(),
             patches,
             params: PatchParams {
                 zoom: self.zoom,
+                minimap: self.minimap,
+                options: self.options.clone(),
                 color_mods: self.color_mods.clone(),
                 effect_skills: self.effect_skill_overrides(),
                 monster_effects: self.monster_effect_overrides(),
@@ -430,7 +540,7 @@ impl GuiApp {
         let loader = self.status_loader;
         self.status = None;
         self.spawn("Detecting install...", move || {
-            TaskResult::Status(loader(game_dir).map_err(|err| err.to_string()))
+            TaskResult::Status(loader(game_dir).map_err(|err| format!("{err:#}")))
         });
     }
 
@@ -443,21 +553,25 @@ impl GuiApp {
         let loader = self.status_loader;
         self.status = None;
         self.spawn("Detecting install...", move || {
-            TaskResult::Status(loader(None).map_err(|err| err.to_string()))
+            TaskResult::Status(loader(None).map_err(|err| format!("{err:#}")))
         });
     }
 
     fn spawn_apply(&mut self, request: PatchRequest) {
+        let game_dir = request.game_dir.clone();
+        // Refresh even on failure, which can leave a backup to Restore.
         self.spawn("Applying patches...", move || {
-            TaskResult::Apply(apply_patches(request).map_err(|err| err.to_string()))
+            let result = apply_patches(request).map_err(|err| format!("{err:#}"));
+            let status = load_status(game_dir).map_err(|err| format!("{err:#}"));
+            TaskResult::Apply { result, status }
         });
     }
 
     fn spawn_restore(&mut self) {
         let game_dir = self.game_dir();
         self.spawn("Restoring backup...", move || {
-            let result = restore_backup(game_dir.clone()).map_err(|err| err.to_string());
-            let status = load_status(game_dir).map_err(|err| err.to_string());
+            let result = restore_backup(game_dir.clone()).map_err(|err| format!("{err:#}"));
+            let status = load_status(game_dir).map_err(|err| format!("{err:#}"));
             TaskResult::Restore { result, status }
         });
     }
@@ -501,9 +615,13 @@ impl GuiApp {
                 }
                 Err(err) => self.set_message(err, MessageKind::Error),
             },
-            TaskResult::Apply(result) => match result {
-                Ok(report) => {
-                    self.set_message(
+            TaskResult::Apply { result, status } => {
+                match status {
+                    Ok(status) => self.apply_status(status),
+                    Err(_) => self.status = None,
+                }
+                match result {
+                    Ok(report) => self.set_message(
                         format!(
                             "Applied {} file(s). Touched {} bundle/index file(s). Backup: {}",
                             report.changed_files,
@@ -511,11 +629,10 @@ impl GuiApp {
                             display_path(&report.backup_path)
                         ),
                         MessageKind::Success,
-                    );
-                    self.spawn_status();
+                    ),
+                    Err(err) => self.set_message(err, MessageKind::Error),
                 }
-                Err(err) => self.set_message(err, MessageKind::Error),
-            },
+            }
             TaskResult::Restore { result, status } => {
                 match status {
                     Ok(status) => self.apply_status(status),
@@ -543,9 +660,7 @@ impl GuiApp {
         self.status = Some(status);
     }
 
-    /// Discard a stale stat catalog (and its in-flight load / filter cache)
-    /// when the target game dir no longer matches the one it was loaded for.
-    /// Overrides/config are left alone — only the display/derived layer resets.
+    /// Overrides survive. Only the catalog and its caches reset.
     fn invalidate_stat_catalog_if_stale(&mut self, game_dir: &Option<PathBuf>) {
         if self.stat_catalog_dir.as_deref() != game_dir.as_deref() {
             self.stat_catalog = None;
@@ -556,9 +671,7 @@ impl GuiApp {
         }
     }
 
-    /// Kick off the background stat-catalog load for the color editor if it
-    /// hasn't run yet. Deliberately NOT `spawn`: that would set `is_busy()`
-    /// and lock the whole UI while the editor should stay usable.
+    /// Not `spawn`, which would lock the whole UI while the editor should stay usable.
     fn ensure_catalog_loading(&mut self) {
         let game_dir = self.game_dir();
         self.invalidate_stat_catalog_if_stale(&game_dir);
@@ -569,7 +682,9 @@ impl GuiApp {
         let (tx, rx) = mpsc::channel();
         self.catalog_task = Some(rx);
         self.stat_catalog_dir = game_dir.clone();
+        let busy = CatalogThread::start(&self.catalog_threads);
         thread::spawn(move || {
+            let _busy = busy;
             let result = load_stat_catalog(game_dir)
                 .map(|entries| {
                     entries
@@ -585,7 +700,7 @@ impl GuiApp {
                         })
                         .collect()
                 })
-                .map_err(|err| err.to_string());
+                .map_err(|err| format!("{err:#}"));
             let _ = tx.send(result);
         });
     }
@@ -615,7 +730,6 @@ impl GuiApp {
         }
     }
 
-    /// English display text for a configured stat id, if the catalog knows it.
     fn catalog_text(&self, stat_id: &str) -> Option<&str> {
         let catalog = self.stat_catalog.as_ref()?;
         let idx = catalog
@@ -625,9 +739,8 @@ impl GuiApp {
         (!text.is_empty()).then_some(text)
     }
 
-    /// Rebuild `color_filter_rows` (the editor's visible rows: configured
-    /// entries first, then catalog suggestions not yet configured) if stale.
-    /// Cached; rebuilt only when the query, config set, or catalog changes.
+    /// Configured entries first, then catalog suggestions. Cached until the query,
+    /// config, or catalog changes.
     fn refresh_color_filter(&mut self) {
         let catalog_len = self.stat_catalog.as_ref().map_or(0, Vec::len);
         let fresh = self
@@ -676,10 +789,7 @@ impl GuiApp {
         }
     }
 
-    /// Discard a stale effect catalog (and its in-flight load / filter cache)
-    /// when the target game dir no longer matches the one it was loaded for.
-    /// `effect_overrides` intentionally survive — they're folder-keyed and stale
-    /// folders simply match no path (see `from_prefs`).
+    /// Overrides survive because stale folders simply match no path.
     fn invalidate_effect_catalog_if_stale(&mut self, game_dir: &Option<PathBuf>) {
         if self.effect_catalog_dir.as_deref() != game_dir.as_deref() {
             self.effect_catalog = None;
@@ -690,9 +800,7 @@ impl GuiApp {
         }
     }
 
-    /// Kick off the background skill-folder load for the effects editor if it
-    /// hasn't run yet. Like `ensure_catalog_loading`, deliberately NOT
-    /// `spawn`: the editor should stay usable while it loads.
+    /// Not `spawn`, so the editor stays usable while it loads.
     fn ensure_effect_catalog_loading(&mut self) {
         let game_dir = self.game_dir();
         self.invalidate_effect_catalog_if_stale(&game_dir);
@@ -703,10 +811,12 @@ impl GuiApp {
         let (tx, rx) = mpsc::channel();
         self.effect_catalog_task = Some(rx);
         self.effect_catalog_dir = game_dir.clone();
+        let busy = CatalogThread::start(&self.catalog_threads);
         thread::spawn(move || {
+            let _busy = busy;
             let result = load_effect_skill_catalog(game_dir)
                 .map(effect_skill_catalog_rows)
-                .map_err(|err| err.to_string());
+                .map_err(|err| format!("{err:#}"));
             let _ = tx.send(result);
         });
     }
@@ -736,9 +846,7 @@ impl GuiApp {
         }
     }
 
-    /// Rebuild `effects_filter_rows` (indices into `effect_catalog` matching
-    /// the query) if stale. Level edits never invalidate the cache — the
-    /// visible set only depends on the query and the catalog.
+    /// Level edits never invalidate the cache.
     fn refresh_effects_filter(&mut self) {
         let catalog_len = self.effect_catalog.as_ref().map_or(0, Vec::len);
         let fresh = self
@@ -818,15 +926,13 @@ impl GuiApp {
         EffectLevel::Reduced
     }
 
-    /// The Skills/Others editor stays reachable for Particles-only selections,
-    /// whose referenced particles are still protected by Full scopes.
+    /// Particles alone needs the editor too, since Full scopes protect particles.
     fn effects_editor_accessible(&self) -> bool {
         use tiny_poe2smoother::patches::PatchId;
         self.selected_patches.contains(&PatchId::Effects)
             || self.selected_patches.contains(&PatchId::Particles)
     }
 
-    /// Stored broad Full parents covering any folder in `removal`.
     fn effect_ancestors_for_removal(&self, removal: &[String]) -> Vec<String> {
         self.effect_overrides
             .iter()
@@ -841,9 +947,7 @@ impl GuiApp {
             .collect()
     }
 
-    /// True when reducing `removal` is safe with the loaded catalogs.
-    /// Only broad-Ancestor migration needs catalogs: both tabs, except
-    /// ground-only ancestors which need just Others.
+    /// Only broad-ancestor migration needs catalogs. Ground-only ancestors need just Others.
     fn can_reduce_effect_folders(&mut self, removal: &[String]) -> bool {
         if removal.is_empty() {
             return true;
@@ -871,13 +975,10 @@ impl GuiApp {
         true
     }
 
-    /// Runs on every repaint of the main view, so it stays linear in
-    /// catalog + overrides.
+    /// Runs every repaint, so it stays linear.
     fn kept_original_effect_skill_count(&self) -> usize {
         let catalog = self.effect_catalog.as_deref().unwrap_or(&[]);
-        // A row counts as kept when any of its folders is overridden to Full —
-        // a mixed row (stale prefs after the game regrouped folders) still
-        // renders original visuals for part of the skill.
+        // A mixed row from stale prefs still renders some original visuals, so it counts.
         let catalog_kept = catalog
             .iter()
             .filter(|row| {
@@ -890,8 +991,7 @@ impl GuiApp {
             .iter()
             .flat_map(|row| row.folders.iter().map(String::as_str))
             .collect();
-        // Others folders share this map; once the Others catalog is known they
-        // (and broad parents covering them) count under Others, not Skills.
+        // Once the Others catalog loads, its folders count under Others.
         let other_folders: Vec<&str> = self
             .other_catalog
             .as_deref()
@@ -899,9 +999,7 @@ impl GuiApp {
             .iter()
             .map(|row| row.folder.as_str())
             .collect();
-        // Stale folders absent from the catalog count once each: their
-        // grouping is unknowable, and dropping them would hide skills the
-        // user really kept original.
+        // Uncataloged stale folders count once each so kept skills never drop from the count.
         let uncataloged_full = self
             .effect_overrides
             .iter()
@@ -917,8 +1015,7 @@ impl GuiApp {
         catalog_kept + uncataloged_full
     }
 
-    /// Drop a stale Others catalog + filter cache on game-dir change.
-    /// `effect_overrides` survive; stale folders simply match no path.
+    /// Overrides survive because stale folders simply match no path.
     fn invalidate_other_effect_catalog_if_stale(&mut self, game_dir: &Option<PathBuf>) {
         if self.other_catalog_dir.as_deref() != game_dir.as_deref() {
             self.other_catalog = None;
@@ -929,8 +1026,6 @@ impl GuiApp {
         }
     }
 
-    /// Start the background Others-catalog load if needed; the editor stays
-    /// usable while it loads, like `ensure_effect_catalog_loading`.
     fn ensure_other_effect_catalog_loading(&mut self) {
         let game_dir = self.game_dir();
         self.invalidate_other_effect_catalog_if_stale(&game_dir);
@@ -941,10 +1036,12 @@ impl GuiApp {
         let (tx, rx) = mpsc::channel();
         self.other_catalog_task = Some(rx);
         self.other_catalog_dir = game_dir.clone();
+        let busy = CatalogThread::start(&self.catalog_threads);
         thread::spawn(move || {
+            let _busy = busy;
             let result = load_other_effect_catalog(game_dir)
                 .map(other_effect_catalog_rows)
-                .map_err(|err| err.to_string());
+                .map_err(|err| format!("{err:#}"));
             let _ = tx.send(result);
         });
     }
@@ -974,7 +1071,6 @@ impl GuiApp {
         }
     }
 
-    /// Rebuild cached Others-filter rows if the query or catalog changed.
     fn refresh_others_filter(&mut self) {
         let catalog_len = self.other_catalog.as_ref().map_or(0, Vec::len);
         let fresh = self
@@ -998,15 +1094,13 @@ impl GuiApp {
         }
     }
 
-    /// Effective level for one Others folder: Full via an exact entry or any
-    /// covering broad parent; missing entries are Reduced.
+    /// Full via an exact entry or any covering parent.
     fn other_effect_level(&self, folder: &str) -> EffectLevel {
         self.effective_effect_level(folder)
     }
 
-    /// Set one Others folder. Reducing under an inherited Full parent first
-    /// expands it into explicit Full siblings (both catalogs); with a required
-    /// catalog missing nothing changes.
+    /// Reducing under an inherited Full parent first expands it into explicit siblings.
+    /// Nothing changes while a required catalog is missing.
     fn set_other_effect_level(&mut self, folder: &str, level: EffectLevel) -> bool {
         let folder = folder.to_ascii_lowercase();
         if level == EffectLevel::Full {
@@ -1020,8 +1114,7 @@ impl GuiApp {
         true
     }
 
-    /// Bulk `set_other_effect_level` over the tab's filtered rows. Reduced
-    /// returns false unchanged when a required catalog is missing.
+    /// Returns false without changes when Reduced needs a missing catalog.
     fn apply_other_effect_level_to_filtered_rows(&mut self, level: EffectLevel) -> bool {
         self.refresh_others_filter();
         let catalog = self.other_catalog.as_deref().unwrap_or_default();
@@ -1046,10 +1139,8 @@ impl GuiApp {
         }
     }
 
-    /// Expand covering broad Full parents into explicit Full entries for
-    /// catalog descendants outside `removal`, then drop them. Spans the union
-    /// of Skills + Others folders (`supports` can cover both); ground-only
-    /// ancestors need just Others. False + unchanged if a catalog is missing.
+    /// Spans Skills and Others folders, since `supports` can cover both. Returns false
+    /// without changes when a catalog is missing.
     fn expand_effect_ancestors_for_removal(&mut self, removal: &[String]) -> bool {
         if removal.is_empty() {
             return true;
@@ -1124,8 +1215,7 @@ impl GuiApp {
         true
     }
 
-    /// Count Others rows at effective Full. Broad parents count through their
-    /// rows, not extra; folders unknown to both catalogs count under Skills.
+    /// Folders unknown to both catalogs count under Skills.
     fn kept_original_other_effect_count(&self) -> usize {
         let catalog = self.other_catalog.as_deref().unwrap_or(&[]);
         if catalog.is_empty() {
@@ -1137,10 +1227,7 @@ impl GuiApp {
             .count()
     }
 
-    /// Discard a stale monster catalog (and its in-flight load / filter
-    /// cache) when the target game dir no longer matches the one it was
-    /// loaded for. `monster_overrides` intentionally survive — stale keys
-    /// simply resolve to no paths at apply (see `from_prefs`).
+    /// Overrides survive because stale keys resolve to no paths.
     fn invalidate_monster_catalog_if_stale(&mut self, game_dir: &Option<PathBuf>) {
         if self.monster_catalog_dir.as_deref() != game_dir.as_deref() {
             self.monster_catalog = None;
@@ -1151,9 +1238,7 @@ impl GuiApp {
         }
     }
 
-    /// Kick off the catalog load backing the active effects-editor tab.
-    /// Called on editor open and on every tab switch, so it also revalidates
-    /// a catalog loaded for a different game dir.
+    /// Runs on open and on every tab switch, so it also revalidates after a game dir change.
     fn ensure_active_effects_tab_loading(&mut self) {
         match self.effects_editor_tab {
             EffectsEditorTab::Skills | EffectsEditorTab::Others => {
@@ -1164,11 +1249,7 @@ impl GuiApp {
         }
     }
 
-    /// Kick off the background monster-catalog load for the monsters tab
-    /// if it hasn't run yet. Like the other catalog loads, deliberately NOT
-    /// `spawn`: the editor should stay usable while it loads. Unlike the
-    /// skill catalog this reads every monster metadata file, so it is only
-    /// started when its tab is actually shown.
+    /// Reads every monster metadata file, so it starts only when its tab is shown.
     fn ensure_monster_catalog_loading(&mut self) {
         let game_dir = self.game_dir();
         self.invalidate_monster_catalog_if_stale(&game_dir);
@@ -1179,10 +1260,12 @@ impl GuiApp {
         let (tx, rx) = mpsc::channel();
         self.monster_catalog_task = Some(rx);
         self.monster_catalog_dir = game_dir.clone();
+        let busy = CatalogThread::start(&self.catalog_threads);
         thread::spawn(move || {
+            let _busy = busy;
             let result = load_monster_effect_catalog(game_dir)
                 .map(monster_effect_catalog_rows)
-                .map_err(|err| err.to_string());
+                .map_err(|err| format!("{err:#}"));
             let _ = tx.send(result);
         });
     }
@@ -1201,9 +1284,7 @@ impl GuiApp {
                 self.monster_catalog_error = Some(err);
             }
             Err(mpsc::TryRecvError::Empty) => {
-                // Gated on the whole editor, not just the monsters tab: a
-                // load left in flight by a tab switch should still finish
-                // animating its spinner when the user switches back.
+                // Gated on the whole editor so a load started before a tab switch still repaints.
                 if self.show_effects_editor {
                     ctx.request_repaint_after(std::time::Duration::from_millis(33));
                 }
@@ -1215,11 +1296,8 @@ impl GuiApp {
         }
     }
 
-    /// Rebuild `monsters_filter_rows` (indices into `monster_catalog`
-    /// matching the query) if stale. Level edits never invalidate the cache —
-    /// the visible set only depends on the query, the catalog, and the
-    /// "Show unnamed entities" checkbox (fallback rows are hidden while it
-    /// is off; overridden hidden rows are surfaced by a hint, not the list).
+    /// Depends only on the query, the catalog, and the unnamed checkbox. Hidden
+    /// overridden rows surface through a hint instead.
     fn refresh_monsters_filter(&mut self) {
         let catalog_len = self.monster_catalog.as_ref().map_or(0, Vec::len);
         let fresh =
@@ -1252,8 +1330,6 @@ impl GuiApp {
         }
     }
 
-    /// Fallback (unnamed) rows in the catalog — what the "Show unnamed
-    /// entities" checkbox governs and counts.
     fn unnamed_monster_row_count(&self) -> usize {
         self.monster_catalog
             .as_deref()
@@ -1263,9 +1339,7 @@ impl GuiApp {
             .count()
     }
 
-    /// Unnamed rows with any variant keeping original visuals. While the
-    /// checkbox hides unnamed rows these are still active settings, so the
-    /// monsters tab flags them with a hint instead of hiding them silently.
+    /// Hidden rows that still keep originals. The tab flags them with a hint.
     fn overridden_unnamed_monster_row_count(&self) -> usize {
         self.monster_catalog
             .as_deref()
@@ -1306,10 +1380,8 @@ impl GuiApp {
         levels.all(|level| level == first).then_some(first)
     }
 
-    /// Runs on every repaint of the main view, so it stays linear in
-    /// catalog + overrides. Same counting policy as the skill caption: a row
-    /// counts once however many of its variants are kept, and overridden
-    /// keys absent from the catalog count once each.
+    /// Runs every repaint, so it stays linear. A row counts once, and uncataloged keys
+    /// count once each.
     fn kept_original_monster_count(&self) -> usize {
         let catalog = self.monster_catalog.as_deref().unwrap_or(&[]);
         let catalog_kept = catalog
@@ -1336,9 +1408,7 @@ impl GuiApp {
 }
 
 fn monster_effect_catalog_rows(entries: Vec<MonsterEffectCatalogEntry>) -> Vec<MonsterCatalogRow> {
-    // Rows are grouped per (display, family): when several families share a
-    // display name ("Daemon"), suffix the family so the rows stay tellable
-    // apart in the list.
+    // Several families can share a name like "Daemon", so suffix the family.
     let mut display_counts: HashMap<String, usize> = HashMap::new();
     for entry in &entries {
         *display_counts
@@ -1376,8 +1446,7 @@ fn monster_effect_catalog_rows(entries: Vec<MonsterEffectCatalogEntry>) -> Vec<M
         .collect()
 }
 
-/// Visible fallback context is capped, while the complete derived set remains
-/// in `search_lower` for local ambiguous identities.
+/// Caps the visible context. The full set stays searchable.
 fn monster_context_suffix(context: &[String]) -> Option<String> {
     if context.is_empty() {
         return None;
@@ -1412,9 +1481,7 @@ fn effect_skill_catalog_rows(entries: Vec<EffectSkillCatalogEntry>) -> Vec<Effec
         .collect()
 }
 
-/// True when `ancestor` is a strict `/`-separated prefix of `path`
-/// (`ground_effects` vs `ground_effects/fire`). Folders are lowercase
-/// relative paths, so a plain byte comparison is enough.
+/// Folders are lowercase relative paths, so a byte comparison is enough.
 fn is_folder_ancestor(ancestor: &str, path: &str) -> bool {
     path.len() > ancestor.len()
         && path.starts_with(ancestor)
@@ -1425,8 +1492,7 @@ fn is_folder_equal_or_descendant(path: &str, ancestor: &str) -> bool {
     path == ancestor || is_folder_ancestor(ancestor, path)
 }
 
-/// True for ground-effect scopes whose containers backend never assigns to
-/// skills, so cross-tab expansion for them needs only the Others catalog.
+/// Never assigned to skills, so expanding these needs only the Others catalog.
 fn is_ground_effects_scope(folder: &str) -> bool {
     matches!(
         folder
@@ -1439,8 +1505,7 @@ fn is_ground_effects_scope(folder: &str) -> bool {
     )
 }
 
-/// True when an override belongs to Others: equal to, above, or below an
-/// Others folder. Empty lists claim nothing, preserving the skill fallback.
+/// Equal to, above, or below an Others folder. Empty lists claim nothing.
 fn is_other_related_override(folder: &str, other_folders: &[&str]) -> bool {
     !other_folders.is_empty()
         && other_folders.iter().any(|other| {
@@ -1480,6 +1545,7 @@ mod tests {
             backup_path: PathBuf::from("test-backup.bak"),
             has_backup: true,
             patch_state: tiny_poe2smoother::app::PatchState::Patched,
+            backup_owner: None,
         }
     }
 
@@ -1541,6 +1607,16 @@ mod tests {
     }
 
     #[test]
+    fn dropped_catalog_task_keeps_the_gate_until_its_thread_ends() {
+        let mut app = GuiApp::default();
+        let busy = CatalogThread::start(&app.catalog_threads);
+        app.catalog_task = None;
+        assert!(app.catalogs_loading());
+        drop(busy);
+        assert!(!app.catalogs_loading());
+    }
+
+    #[test]
     fn browse_loads_custom_install_status_needed_for_restore() {
         let mut app = GuiApp {
             status_loader: |path| {
@@ -1587,17 +1663,105 @@ mod tests {
             color_mods: Vec::new(),
             effect_skills: Vec::new(),
             monster_effects: Vec::new(),
+            ..GuiPrefs::default()
         });
 
         assert_eq!(
             app.game_dir_input,
             r"D:\SteamLibrary\steamapps\common\Path of Exile 2"
         );
-        assert!(app.selected_patches.contains(&PatchId::Fog));
-        assert_eq!(app.selected_patches.len(), 1);
+        assert_eq!(
+            app.selected_patches,
+            [PatchId::Atmosphere].into_iter().collect()
+        );
+        assert!(app.options.enabled(PatchId::Atmosphere, "fog"));
+        assert!(!app.options.enabled(PatchId::Atmosphere, "rain"));
         assert_eq!(app.zoom, 2.4);
         // No saved color config -> defaults, all enabled.
         assert_eq!(app.color_mods, default_color_mods());
+    }
+
+    #[test]
+    fn prefs_with_only_removed_patch_names_keep_the_migrated_selection() {
+        let app = GuiApp::from_prefs(GuiPrefs {
+            selected_patches: vec!["env-particles".to_string(), "clouds".to_string()],
+            zoom: 2.4,
+            ..GuiPrefs::default()
+        });
+        assert_eq!(
+            app.selected_patches,
+            [PatchId::Atmosphere].into_iter().collect()
+        );
+        assert!(app.options.any_enabled(PatchId::Atmosphere));
+        assert!(app.options.enabled(PatchId::Atmosphere, "bloom"));
+    }
+
+    #[test]
+    fn cleared_selection_and_options_survive_a_restart() {
+        let mut options = PatchOptions::default();
+        options.set(PatchId::Light, "player_light", false);
+        let app = GuiApp::from_prefs(GuiPrefs {
+            options: options.clone(),
+            zoom: 2.4,
+            ..GuiPrefs::default()
+        });
+        assert!(app.selected_patches.is_empty());
+        assert_eq!(app.options, options);
+    }
+
+    #[test]
+    fn unknown_only_saved_names_fall_back_to_the_first_profile() {
+        let app = GuiApp::from_prefs(GuiPrefs {
+            selected_patches: vec!["zero-effects".to_string()],
+            zoom: 2.4,
+            ..GuiPrefs::default()
+        });
+        assert_eq!(app.active_profile(), Some(0));
+    }
+
+    #[test]
+    fn prefs_round_trip_options_minimap_and_category() {
+        let mut app = GuiApp::default();
+        app.options.set(PatchId::Light, "player_light", false);
+        app.minimap.reveal = 0.5;
+        app.active_category = 3;
+        let restored = GuiApp::from_prefs(app.prefs());
+        assert_eq!(restored.options, app.options);
+        assert_eq!(restored.minimap, app.minimap);
+        assert_eq!(restored.active_category, 3);
+        assert_eq!(restored.selected_patches, app.selected_patches);
+    }
+
+    #[test]
+    fn applying_a_profile_replaces_selection_and_options() {
+        let mut app = GuiApp::default();
+        app.selected_patches.insert(PatchId::Camera);
+        app.options.set(PatchId::Atmosphere, "bloom", true);
+        assert_eq!(app.active_profile(), None);
+
+        let performance = &all_profiles()[2];
+        app.apply_profile(performance);
+        assert_eq!(app.active_profile(), Some(2));
+        assert!(!app.selected_patches.contains(&PatchId::Camera));
+        assert!(app.options.enabled(PatchId::Atmosphere, "bloom"));
+    }
+
+    #[test]
+    fn patch_request_rejects_patches_with_every_option_off() {
+        let mut app = GuiApp {
+            selected_patches: [PatchId::PostProcess].into_iter().collect(),
+            ..GuiApp::default()
+        };
+        for key in ["vignette", "depth_of_field", "desaturation"] {
+            app.options.set(PatchId::PostProcess, key, false);
+        }
+        let err = app.patch_request().unwrap_err();
+        assert!(err.contains("Screen filters"), "{err}");
+
+        app.options.set(PatchId::PostProcess, "vignette", true);
+        let request = app.patch_request().unwrap();
+        assert_eq!(request.params.options, app.options);
+        assert_eq!(request.params.minimap, app.minimap);
     }
 
     #[test]
@@ -1614,6 +1778,7 @@ mod tests {
             color_mods: saved,
             effect_skills: Vec::new(),
             monster_effects: Vec::new(),
+            ..GuiPrefs::default()
         });
 
         let edited = app
@@ -1645,6 +1810,7 @@ mod tests {
                 },
             ],
             monster_effects: Vec::new(),
+            ..GuiPrefs::default()
         });
 
         assert_eq!(
@@ -1702,6 +1868,7 @@ mod tests {
                     level: EffectLevel::Reduced,
                 }],
                 monster_effects: Vec::new(),
+                ..GuiPrefs::default()
             },
         );
         let saved = storage.values.get_mut(PREFS_KEY).unwrap();
@@ -1720,9 +1887,7 @@ mod tests {
             selected_patches: [PatchId::Effects].into_iter().collect(),
             ..GuiApp::default()
         };
-        // All-Full is no longer rejected at the GUI layer — the apply-side
-        // bail is the single source of truth. The Full override is still
-        // embedded verbatim.
+        // All-Full is left to the apply-side check. The override is embedded verbatim.
         app.effect_overrides
             .insert("fireball".to_string(), EffectLevel::Full);
         let request = app.patch_request().unwrap();
@@ -1778,13 +1943,15 @@ mod tests {
                     level: EffectLevel::Full,
                 },
             ],
+            ..GuiPrefs::default()
         });
 
         assert_eq!(app.monster_overrides.get(mother), Some(&EffectLevel::Full));
         // Explicit Reduced entries are meaningless and dropped on load.
-        assert!(!app
-            .monster_overrides
-            .contains_key("metadata/monsters/boghulk/boghulk"));
+        assert!(
+            !app.monster_overrides
+                .contains_key("metadata/monsters/boghulk/boghulk")
+        );
 
         // Saved back key-sorted, non-default only.
         assert_eq!(
@@ -1860,9 +2027,10 @@ mod tests {
             app.monster_overrides.get(runemarked),
             Some(&EffectLevel::Full)
         );
-        assert!(!app
-            .monster_overrides
-            .contains_key("metadata/monsters/boghulk/boghulk"));
+        assert!(
+            !app.monster_overrides
+                .contains_key("metadata/monsters/boghulk/boghulk")
+        );
 
         app.apply_monster_level_to_filtered_rows(EffectLevel::Reduced);
         assert!(app.monster_overrides.is_empty());
@@ -1881,8 +2049,7 @@ mod tests {
         // Without a catalog every overridden key counts once.
         assert_eq!(app.kept_original_monster_count(), 2);
 
-        // With the catalog the two variants collapse into one row; a stale
-        // key absent from the catalog still counts.
+        // With the catalog the variants collapse into one row. A stale key still counts.
         app.monster_catalog = Some(vec![monster_row(
             "Filthy First-born",
             &[mother, runemarked],
@@ -2006,9 +2173,11 @@ mod tests {
         app.monsters_search = "\"Alpha Monster\"".to_string();
         app.refresh_monsters_filter();
         assert_eq!(app.monsters_filter_rows, vec![0]);
-        assert!(!app.monster_catalog.as_ref().unwrap()[2]
-            .search_lower
-            .contains("alpha monster"));
+        assert!(
+            !app.monster_catalog.as_ref().unwrap()[2]
+                .search_lower
+                .contains("alpha monster")
+        );
     }
 
     #[test]
@@ -2088,14 +2257,12 @@ mod tests {
         app.monster_overrides
             .insert(wolf.to_string(), EffectLevel::Full);
 
-        // The active override on the hidden row is surfaced by the hint
-        // count rather than the row list.
+        // The hidden override surfaces through the hint count.
         app.refresh_monsters_filter();
         assert_eq!(app.monsters_filter_rows, vec![0]);
         assert_eq!(app.overridden_unnamed_monster_row_count(), 1);
 
-        // "Check all" with unnamed rows hidden touches only visible rows:
-        // the hidden override survives.
+        // "Check all" with unnamed rows hidden only touches visible rows.
         app.apply_monster_level_to_filtered_rows(EffectLevel::Reduced);
         assert_eq!(app.monster_overrides.get(wolf), Some(&EffectLevel::Full));
 
@@ -2165,8 +2332,7 @@ mod tests {
             ),
         ]);
 
-        // Named rows have no suffix; fallback rows use the catalog-derived
-        // nearest context, capped at two visible names.
+        // Named rows have no suffix. Fallback rows show at most two context names.
         assert!(rows.iter().take(3).all(|row| row.context.is_none()));
         assert_eq!(
             rows[3].context.as_deref(),
@@ -2195,7 +2361,7 @@ mod tests {
             entry("Bog Hulk", "boghulk", "metadata/monsters/boghulk/boghulk"),
         ]);
 
-        // Duplicate display names get the family suffix; unique ones do not.
+        // Duplicate display names get the family suffix, unique ones don't.
         assert_eq!(rows[0].display, "Daemon (daemon)");
         assert_eq!(rows[1].display, "Daemon (leaguedelirium)");
         assert_eq!(rows[2].display, "Bog Hulk");
@@ -2350,8 +2516,7 @@ mod tests {
             .insert("fireball".to_string(), EffectLevel::Full);
         assert_eq!(app.kept_original_effect_skill_count(), 2);
 
-        // A mixed row (only one of the skill's folders still Full) keeps
-        // rendering original visuals, so it stays counted.
+        // A mixed row still renders some original visuals, so it stays counted.
         app.effect_overrides.remove("herald_of_thunder");
         assert_eq!(app.kept_original_effect_skill_count(), 2);
     }
@@ -2690,9 +2855,10 @@ mod tests {
         assert!(app.set_other_effect_level("supports/runicsupports/unknown", EffectLevel::Reduced));
 
         assert!(!app.effect_overrides.contains_key("supports"));
-        assert!(!app
-            .effect_overrides
-            .contains_key("supports/runicsupports/unknown"));
+        assert!(
+            !app.effect_overrides
+                .contains_key("supports/runicsupports/unknown")
+        );
         assert_eq!(
             app.effect_overrides
                 .get("supports/runicsupports/bitterdead"),
@@ -2730,9 +2896,10 @@ mod tests {
         ));
 
         assert!(!app.effect_overrides.contains_key("supports"));
-        assert!(!app
-            .effect_overrides
-            .contains_key("supports/runicsupports/bitterdead"));
+        assert!(
+            !app.effect_overrides
+                .contains_key("supports/runicsupports/bitterdead")
+        );
         assert_eq!(
             app.effect_overrides.get("supports/runicsupports/unknown"),
             Some(&EffectLevel::Full)
@@ -2769,7 +2936,9 @@ mod tests {
         );
 
         // The skill sibling is unknowable without its catalog: all intact.
-        assert!(!app.set_other_effect_level("supports/runicsupports/unknown", EffectLevel::Reduced));
+        assert!(
+            !app.set_other_effect_level("supports/runicsupports/unknown", EffectLevel::Reduced)
+        );
         assert_eq!(
             app.effect_overrides.get("supports"),
             Some(&EffectLevel::Full)
@@ -2912,6 +3081,7 @@ mod tests {
                 },
             ],
             monster_effects: Vec::new(),
+            ..GuiPrefs::default()
         });
 
         assert_eq!(
@@ -2987,6 +3157,7 @@ mod tests {
             color_mods: Vec::new(),
             effect_skills: Vec::new(),
             monster_effects: Vec::new(),
+            ..GuiPrefs::default()
         });
         app.stat_catalog = Some(vec![
             catalog_row(
@@ -3015,11 +3186,12 @@ mod tests {
         app.color_search = "more damage monster".to_string();
         app.color_filter_key = None;
         app.refresh_color_filter();
-        assert!(app
-            .color_filter_rows
-            .iter()
-            .any(|row| matches!(row, ColorRowRef::Config(idx)
-                if app.color_mods[*idx].stat_id == "map_monsters_damage_+%")));
+        assert!(
+            app.color_filter_rows
+                .iter()
+                .any(|row| matches!(row, ColorRowRef::Config(idx)
+                if app.color_mods[*idx].stat_id == "map_monsters_damage_+%"))
+        );
 
         // PoE2-style regex: alternation, quoted phrases, and `!` exclusion.
         app.color_search = "omen|monster".to_string();

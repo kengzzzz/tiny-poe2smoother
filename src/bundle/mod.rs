@@ -9,5 +9,5 @@ pub use compression::{decompress_bundle, decompress_bundle_slices, pack_uncompre
 pub use ggpk::GgpkArchive;
 pub use hashing::filepath_hash;
 pub use index::{BundleFile, BundleIndex, IndexedPath};
-pub use replacements::{apply_bundle_replacements, slice_file, BundleWriteReport};
+pub use replacements::{BundleWriteReport, apply_bundle_replacements, slice_file};
 pub use store::BundleStore;

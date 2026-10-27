@@ -37,16 +37,15 @@ fn murmur_hash64a(data: &[u8]) -> u64 {
     const M: u64 = 0xC6A4A7935BD1E995;
     const R: u32 = 47;
     let mut hash = 0x1337B33Fu64 ^ ((data.len() as u64).wrapping_mul(M));
-    let mut chunks = data.chunks_exact(8);
-    for chunk in &mut chunks {
-        let mut k = u64::from_le_bytes(chunk.try_into().expect("chunk size"));
+    let (chunks, rem) = data.as_chunks::<8>();
+    for chunk in chunks {
+        let mut k = u64::from_le_bytes(*chunk);
         k = k.wrapping_mul(M);
         k ^= k >> R;
         k = k.wrapping_mul(M);
         hash ^= k;
         hash = hash.wrapping_mul(M);
     }
-    let rem = chunks.remainder();
     if !rem.is_empty() {
         let mut tail = 0u64;
         for (i, byte) in rem.iter().enumerate() {
@@ -65,11 +64,10 @@ pub(super) fn murmur2_32(data: &[u8]) -> u32 {
     let r = 24u32;
     let len = data.len() as u32;
     let mut h = len;
-    let chunks = data.chunks_exact(4);
-    let rem = chunks.remainder();
+    let (chunks, rem) = data.as_chunks::<4>();
 
     for chunk in chunks {
-        let mut k = u32::from_le_bytes(chunk.try_into().expect("chunk size"));
+        let mut k = u32::from_le_bytes(*chunk);
         k = k.wrapping_mul(m);
         k ^= k >> r;
         k = k.wrapping_mul(m);

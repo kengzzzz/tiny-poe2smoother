@@ -11,6 +11,7 @@ fn main() {
         println!("cargo:rustc-link-lib=static=stdc++");
         println!("cargo:rustc-link-arg=-static-libstdc++");
         println!("cargo:rustc-link-arg=-static-libgcc");
+        embed_windows_icon();
     } else {
         println!("cargo:rustc-link-lib=dylib=stdc++");
     }
@@ -28,29 +29,17 @@ fn build_ooz() {
         // OOZ_BUILD_DLL must carry a value: kraken.cpp guards main() with `#if !OOZ_BUILD_DLL`.
         .define("OOZ_BUILD_DLL", "1")
         .define("NDEBUG", None)
-        // Always optimize: cargo passes OPT_LEVEL=0 in dev builds, which would make
-        // test/dev decompression drastically slower than the previous cmake
-        // RelWithDebInfo build. debug(true) matches that profile; the release
-        // binary is stripped anyway.
+        // Always optimize: dev and test decoding is far slower at OPT_LEVEL=0.
         .opt_level(2)
         .debug(true)
         .include("vendor/ooz");
-    // Opt-in LTO for the vendored codec. Requires a clang-family compiler
-    // (CXX=clang++) plus an LTO-capable final link (clang + lld via RUSTFLAGS)
-    // and AR=llvm-ar so the archive index covers bitcode members. Unset means
-    // no change, so the Windows/mingw Docker cross-build is unaffected.
+    // Opt-in LTO (OOZ_LTO). Needs CXX=clang++, clang + lld linking, and AR=llvm-ar.
     //
-    // WARNING: clang/LLVM 22.1.6 miscompiles Leviathan_ProcessLz in kraken.cpp
-    // at -O2: the SLP vectorizer fuses the two COPY_64s of the matchlen==9
-    // match copy into one 16-byte load/store without an overlap guard, so LZ
-    // matches at distance 8..15 copy stale bytes and real PoE2 bundles decode
-    // corrupted (Mermaid roundtrip tests still pass; only real Leviathan
-    // streams hit it). -fno-slp-vectorize fixes plain -O2 builds, but under
-    // (Thin)LTO the linker's backend reruns SLP, so that flag alone is NOT
-    // sufficient for OOZ_LTO builds. Verify any clang-built binary against a
-    // g++ baseline using the same real game data before trusting it:
+    // WARNING: clang/LLVM miscompiles Leviathan_ProcessLz at -O2 (SLP fuses an overlapping
+    // match copy) and corrupts real PoE2 bundles. Seen in 22.1.6 and still in 23.1.4
+    // (2026-10-27). -fno-slp-vectorize fixes plain builds but not thin or full LTO.
+    // Verify clang builds against a g++ baseline on real data:
     // `cargo run --release --bin ooz-bench -- digest --game-dir <game-dir>`.
-    // A synthetic round trip is insufficient to expose this Leviathan failure.
     match std::env::var("OOZ_LTO").as_deref() {
         Ok("thin") => {
             assert_clang_for_lto(&build);
@@ -80,6 +69,26 @@ fn build_ooz() {
         build.file(format!("vendor/ooz/{file}"));
     }
     build.compile("ooz");
+}
+
+fn embed_windows_icon() {
+    println!("cargo:rerun-if-changed=assets/icons/app-icon.rc");
+    println!("cargo:rerun-if-changed=assets/icons/app-icon.ico");
+    println!("cargo:rerun-if-env-changed=WINDRES");
+    let windres = std::env::var("WINDRES").unwrap_or_else(|_| "x86_64-w64-mingw32-windres".into());
+    let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR is set"));
+    let object = out_dir.join("app-icon.o");
+    let status = std::process::Command::new(&windres)
+        .args(["-I", "assets/icons", "-O", "coff", "-o"])
+        .arg(&object)
+        .arg("assets/icons/app-icon.rc")
+        .status()
+        .unwrap_or_else(|err| panic!("failed to run {windres}: {err}"));
+    assert!(
+        status.success(),
+        "{windres} failed on assets/icons/app-icon.rc"
+    );
+    println!("cargo:rustc-link-arg-bins={}", object.display());
 }
 
 fn assert_clang_for_lto(build: &cc::Build) {

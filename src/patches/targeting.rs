@@ -1,4 +1,5 @@
 use super::catalog::PatchId;
+use super::client_strings::CLIENT_STRINGS_PATH;
 use super::effect_skills::{EffectLevel, EffectsFilter};
 
 pub(super) static PARTICLE_PROTECTED_PREFIXES: &[&str] = &[
@@ -62,9 +63,9 @@ pub(super) fn exact_patch_targets(patch: PatchId) -> &'static [&'static str] {
             "shaders/minimap_blending_pixel.hlsl",
         ],
         PatchId::AtlasFog => &["metadata/materials/environment/worldmap/worldmap_fogofwar.fxgraph"],
+        PatchId::PostProcess => &["shaders/postprocessuber.hlsl"],
+        PatchId::CompactModLines => &[CLIENT_STRINGS_PATH],
         PatchId::MonsterHpBar => &["metadata/monsters/monster.ot"],
-        // stubs out; killing lighting + the post chain renders the world black
-        // while the UI (drawn after post-processing) stays visible.
         PatchId::BlackScreen => &[
             "shaders/postprocessuber.hlsl",
             "shaders/bloomcutoff.hlsl",
@@ -88,18 +89,16 @@ pub(super) fn patch_targets_path(patch: PatchId, path: &str) -> bool {
             starts_with_path_ci(path, "metadata/")
                 && (ends_with_path_ci(path, ".ot") || ends_with_path_ci(path, ".otc"))
         }
-        PatchId::Minimap | PatchId::AtlasFog | PatchId::MonsterHpBar | PatchId::BlackScreen => {
-            exact_patch_targets(patch)
-                .iter()
-                .any(|target| eq_path_ci(path, target))
-        }
+        PatchId::Minimap
+        | PatchId::AtlasFog
+        | PatchId::PostProcess
+        | PatchId::CompactModLines
+        | PatchId::MonsterHpBar
+        | PatchId::BlackScreen => exact_patch_targets(patch)
+            .iter()
+            .any(|target| eq_path_ci(path, target)),
         PatchId::ColorMods => is_stat_description_target(path),
-        PatchId::Fog
-        | PatchId::Rain
-        | PatchId::Clouds
-        | PatchId::EnvParticles
-        | PatchId::Shadow
-        | PatchId::Light => {
+        PatchId::Atmosphere | PatchId::Shadow | PatchId::Light => {
             starts_with_path_ci(path, "metadata/environmentsettings")
                 && ends_with_path_ci(path, ".env")
         }
@@ -130,9 +129,6 @@ pub(super) fn patch_targets_path(patch: PatchId, path: &str) -> bool {
     }
 }
 
-/// Filter-aware target predicate for `Effects`. Without a filter this is the
-/// long-standing rule (`.ao`/`.aoc` under spells). With one, `Full` folders
-/// drop out entirely.
 pub(super) fn effects_targets_path(path: &str, filter: Option<&EffectsFilter>) -> bool {
     if !starts_with_path_ci(path, "metadata/effects/spells") {
         return false;
@@ -159,12 +155,7 @@ pub(super) fn patch_applies_path(patch: PatchId, path: &str) -> bool {
             "metadata/materials/environment/worldmap/worldmap_fogofwar.fxgraph",
         ),
         PatchId::ColorMods => is_stat_description_target(path),
-        PatchId::Fog
-        | PatchId::Rain
-        | PatchId::Clouds
-        | PatchId::EnvParticles
-        | PatchId::Shadow
-        | PatchId::Light => {
+        PatchId::Atmosphere | PatchId::Shadow | PatchId::Light => {
             starts_with_path_ci(path, "metadata/environmentsettings")
                 && ends_with_path_ci(path, ".env")
         }
@@ -193,9 +184,11 @@ pub(super) fn patch_applies_path(patch: PatchId, path: &str) -> bool {
                 && is_metadata_effect_ext(path)
         }
         PatchId::MonsterHpBar => eq_path_ci(path, "metadata/monsters/monster.ot"),
-        PatchId::BlackScreen => exact_patch_targets(PatchId::BlackScreen)
-            .iter()
-            .any(|target| eq_path_ci(path, target)),
+        PatchId::PostProcess | PatchId::CompactModLines | PatchId::BlackScreen => {
+            exact_patch_targets(patch)
+                .iter()
+                .any(|target| eq_path_ci(path, target))
+        }
     }
 }
 
@@ -211,9 +204,6 @@ pub(super) fn is_metadata_effect_ext(path: &str) -> bool {
         || ends_with_path_ci(path, ".trl")
 }
 
-/// Animation/script files that can carry `SoundEvents`/`SoundParams` blocks.
-/// Sound removal only ever touches these (never `.pet`/`.epk`/`.trl`, which are
-/// particle/effect data emptied by other patches).
 fn is_metadata_anim_ext(path: &str) -> bool {
     ends_with_path_ci(path, ".ao")
         || ends_with_path_ci(path, ".aoc")
@@ -236,15 +226,8 @@ fn is_sound_target(path: &str) -> bool {
 
 pub(super) fn is_startup_scene_protected(path: &str) -> bool {
     let normalized = normalize_path(path);
-    // Character-selection / startup-scene assets appear under several spellings in
-    // the real index, confirmed by diffing the game's `_.index.bin`:
-    //   - `metadata/terrain/characterselection/...` (concatenated, prefix form)
-    //   - `.../gallowscharacterselection/...` and `.../characterselectiongallows/...`
-    //     (concatenated, embedded mid-path)
-    //   - `metadata/effects/misc/char_selection/...` (underscore form, e.g.
-    //     `dexintfour_fxtest.ao`, which previously slipped through and crashed)
-    // Match both spellings as substrings so no variant is missed; this is a pure
-    // safety net (it can only leave a startup asset untouched, never corrupt one).
+    // Startup-scene assets appear as "characterselection" (as a prefix or mid-path)
+    // and as "char_selection". Missing the latter crashed the game.
     normalized.contains("characterselection")
         || normalized.contains("char_selection")
         || STARTUP_SCENE_PROTECTED_PREFIXES
@@ -299,9 +282,7 @@ mod tests {
 
     #[test]
     fn startup_scene_protection_covers_underscore_char_selection_variant() {
-        // Confirmed present in the real game index; previously slipped through the
-        // `/characterselection` substring check and crashed ("Skin mesh not found"
-        // / "Unexpected token 0") because it has the underscore spelling.
+        // Underscore spelling from the real index. It used to crash the game.
         for path in [
             "metadata/effects/misc/char_selection/dexintfour_fxtest.ao",
             "metadata/effects/misc/char_selection/epk/char_body.epk",
