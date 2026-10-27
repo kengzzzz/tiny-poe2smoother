@@ -1,7 +1,8 @@
 use crate::backup::{BackupEntry, BackupStore, ggpk_backup_meta};
 use crate::bundle::{BundleIndex, BundleStore, apply_bundle_replacements};
 use crate::install::{
-    InstallLayout, detect_install_layout, ensure_game_not_running, resolve_game_dir,
+    InstallLayout, detect_install_layout, display_path, ensure_game_not_running,
+    normalized_game_dir, resolve_game_dir,
 };
 use crate::patches::{
     ACTIONTYPES_DATC64_PATH, ACTIVESKILLS_DATC64_PATH, EffectSkillCatalogEntry,
@@ -21,6 +22,7 @@ pub enum PatchState {
     Patched,
     StaleBackup,
     PatchedMissingBackup,
+    OtherInstallBackup,
 }
 
 impl PatchState {
@@ -28,8 +30,9 @@ impl PatchState {
         matches!(self, Self::Patched | Self::PatchedMissingBackup)
     }
 
+    /// Restoring a stale backup cleans up after a failed Apply or Restore.
     pub fn can_restore(self) -> bool {
-        matches!(self, Self::Patched)
+        matches!(self, Self::Patched | Self::StaleBackup)
     }
 
     pub fn has_stale_backup(self) -> bool {
@@ -47,6 +50,7 @@ pub struct AppStatus {
     pub backup_path: PathBuf,
     pub has_backup: bool,
     pub patch_state: PatchState,
+    pub backup_owner: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -100,7 +104,8 @@ pub fn load_status(game_dir: Option<PathBuf>) -> Result<AppStatus> {
     let indexed_paths = index.ensure_paths_built()?.len();
     let backup = BackupStore::from_default_location()?;
     let has_backup = backup.has_backup();
-    let patch_state = classify_patch_state(has_backup, index_is_patched(&index));
+    let (patch_state, backup_owner) =
+        install_patch_state(&backup, &game_dir, index_is_patched(&index));
     let index_display_path = store.index_display_path();
 
     Ok(AppStatus {
@@ -112,6 +117,7 @@ pub fn load_status(game_dir: Option<PathBuf>) -> Result<AppStatus> {
         backup_path: backup.path().to_path_buf(),
         has_backup,
         patch_state,
+        backup_owner,
     })
 }
 
@@ -152,8 +158,17 @@ pub fn apply_patches(request: PatchRequest) -> Result<ApplyReport> {
             e
         ),
     };
+    ensure_backup_is_for(&backup, &game_dir)?;
     let patch_state = classify_patch_state(backup.has_backup(), index_is_patched(&index));
     ensure_can_apply(patch_state, backup.path())?;
+    if patch_state.has_stale_backup()
+        && matches!(store.layout, InstallLayout::ContentGgpk)
+        && let Ok(entries) = backup.entries()
+        && trim_stale_ggpk_tail(&mut store, &entries)?
+    {
+        store = BundleStore::new(&game_dir);
+        index = store.open_index()?;
+    }
 
     let patch_set = compute_patch_set(&store, &mut index, &request.patches, &request.params)?;
 
@@ -209,9 +224,9 @@ pub fn apply_patches(request: PatchRequest) -> Result<ApplyReport> {
     };
     let write_report =
         apply_bundle_replacements(&store, &mut index, &patch_set.replacements, Some(&backup))
-            .with_context(|| {
-                format!(
-                    "failed to write generated bundle to {write_target}.\n  Restore first if partially applied"
+            .map_err(|err| {
+                anyhow!(
+                    "failed to write generated bundle to {write_target}.\n  Cause: {err:#}\n  Restore to clean up"
                 )
             })?;
 
@@ -231,8 +246,11 @@ pub fn restore_backup(game_dir: Option<PathBuf>) -> Result<RestoreReport> {
 }
 
 fn restore_backup_with_store(game_dir: PathBuf, backup: BackupStore) -> Result<RestoreReport> {
+    ensure_backup_is_for(&backup, &game_dir)?;
     let restored_files = if backup.has_backup() {
-        let entries = backup.entries()?;
+        let entries = backup
+            .entries()
+            .with_context(|| format!("failed to read backup {}", backup.path().display()))?;
         if entries.is_empty() {
             bail!(
                 "backup exists but is empty at {}.\n  Check file integrity",
@@ -247,6 +265,8 @@ fn restore_backup_with_store(game_dir: PathBuf, backup: BackupStore) -> Result<R
             )
         })?;
         if !index_is_patched(&index) {
+            trim_stale_ggpk_tail(&mut store, &entries)?;
+            crate::backup::remove_generated_bundles(&game_dir)?;
             backup.remove().with_context(|| {
                 format!(
                     "failed to remove obsolete backup at {}",
@@ -265,22 +285,15 @@ fn restore_backup_with_store(game_dir: PathBuf, backup: BackupStore) -> Result<R
             InstallLayout::ContentGgpk
         );
         if overlay_restore && let Some(meta) = ggpk_backup_meta(&entries)? {
-            store.restore_ggpk_backup(meta).with_context(|| {
-                format!(
-                    "failed to restore {}.\n  Backup may be corrupt",
-                    store.index_display_path()
-                )
+            let index_display_path = store.index_display_path();
+            store.restore_ggpk_backup(meta).map_err(|err| {
+                anyhow!("failed to restore {index_display_path}.\n  Cause: {err:#}")
             })?;
             store.remove_legacy_overlay_files()?;
         }
         backup
             .restore(&entries, &game_dir, overlay_restore)
-            .with_context(|| {
-                format!(
-                    "restore from {} failed.\n  Backup may be corrupt",
-                    backup.path().display()
-                )
-            })?
+            .with_context(|| format!("restore from {} failed", backup.path().display()))?
     } else {
         eprintln!("No backup found at {}", backup.path().display());
         0
@@ -292,6 +305,71 @@ fn restore_backup_with_store(game_dir: PathBuf, backup: BackupStore) -> Result<R
         restored_files,
         backup_removed: restored_files > 0,
     })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BackupOwner {
+    ThisInstall,
+    OtherInstall(PathBuf),
+    Unknown,
+}
+
+/// The single backup file stays with the install that wrote it.
+fn backup_owner(recorded: Option<&Path>, game_dir: &Path) -> BackupOwner {
+    let Some(recorded) = recorded else {
+        return BackupOwner::Unknown;
+    };
+    if detect_install_layout(recorded).is_err() {
+        return BackupOwner::Unknown;
+    }
+    if normalized_game_dir(recorded) == normalized_game_dir(game_dir) {
+        BackupOwner::ThisInstall
+    } else {
+        BackupOwner::OtherInstall(recorded.to_path_buf())
+    }
+}
+
+fn install_patch_state(
+    backup: &BackupStore,
+    game_dir: &Path,
+    index_is_patched: bool,
+) -> (PatchState, Option<PathBuf>) {
+    let has_backup = backup.has_backup();
+    if has_backup {
+        let recorded = backup.recorded_game_dir().ok().flatten();
+        if let BackupOwner::OtherInstall(owner) = backup_owner(recorded.as_deref(), game_dir) {
+            return (PatchState::OtherInstallBackup, Some(owner));
+        }
+    }
+    (classify_patch_state(has_backup, index_is_patched), None)
+}
+
+fn ensure_backup_is_for(backup: &BackupStore, game_dir: &Path) -> Result<()> {
+    if !backup.has_backup() {
+        return Ok(());
+    }
+    // A damaged header must not block replacing the backup.
+    let recorded = backup.recorded_game_dir().ok().flatten();
+    if let BackupOwner::OtherInstall(other) = backup_owner(recorded.as_deref(), game_dir) {
+        bail!(
+            "the backup at {} belongs to another install: {}.\n\
+             Select that install and Restore it first",
+            backup.path().display(),
+            display_path(&other)
+        );
+    }
+    Ok(())
+}
+
+/// Finishes a Restore that could not shrink Content.ggpk.
+fn trim_stale_ggpk_tail(store: &mut BundleStore, entries: &[BackupEntry]) -> Result<bool> {
+    if !matches!(store.layout, InstallLayout::ContentGgpk) {
+        return Ok(false);
+    }
+    let Some(meta) = ggpk_backup_meta(entries)? else {
+        return Ok(false);
+    };
+    store.trim_restored_ggpk_tail(meta)
 }
 
 fn classify_patch_state(has_backup: bool, index_is_patched: bool) -> PatchState {
@@ -321,6 +399,10 @@ fn ensure_can_apply(patch_state: PatchState, backup_path: &Path) -> Result<()> {
         PatchState::PatchedMissingBackup => bail!(
             "game index is already patched by tiny-poe2smoother, but no backup was found.\n\
              Verify game files with Steam or the standalone launcher before applying again"
+        ),
+        PatchState::OtherInstallBackup => bail!(
+            "the backup belongs to another install.\n\
+             Select that install and Restore it first"
         ),
     }
 }
@@ -564,6 +646,158 @@ mod tests {
         ] {
             assert_eq!(parse_patch(name), None, "{name}");
         }
+    }
+
+    fn fake_install(root: &Path, name: &str) -> PathBuf {
+        let dir = root.join(name);
+        fs::create_dir_all(dir.join("Bundles2")).unwrap();
+        fs::write(dir.join("Bundles2/_.index.bin"), test_index_bytes(&[])).unwrap();
+        dir
+    }
+
+    #[test]
+    fn backup_owner_tells_installs_apart() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = fake_install(temp.path(), "a");
+        let b = fake_install(temp.path(), "b");
+
+        assert_eq!(backup_owner(Some(&a), &a), BackupOwner::ThisInstall);
+        assert_eq!(
+            backup_owner(Some(&a), &b),
+            BackupOwner::OtherInstall(a.clone())
+        );
+        assert_eq!(backup_owner(None, &b), BackupOwner::Unknown);
+        assert_eq!(
+            backup_owner(Some(&temp.path().join("gone")), &b),
+            BackupOwner::Unknown
+        );
+        #[cfg(unix)]
+        {
+            let alias = temp.path().join("alias");
+            std::os::unix::fs::symlink(&a, &alias).unwrap();
+            assert_eq!(backup_owner(Some(&a), &alias), BackupOwner::ThisInstall);
+        }
+    }
+
+    #[test]
+    fn status_names_the_install_that_owns_the_backup() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = fake_install(temp.path(), "a");
+        let b = fake_install(temp.path(), "b");
+        let backup = BackupStore::for_path(temp.path().join("poe2.bak"));
+        assert_eq!(
+            install_patch_state(&backup, &b, false),
+            (PatchState::Clean, None)
+        );
+        backup
+            .ensure_original_bytes(
+                &a,
+                &[(PathBuf::from("Bundles2/_.index.bin"), b"index".to_vec())],
+            )
+            .unwrap();
+
+        assert_eq!(
+            install_patch_state(&backup, &a, true),
+            (PatchState::Patched, None)
+        );
+        assert_eq!(
+            install_patch_state(&backup, &a, false),
+            (PatchState::StaleBackup, None)
+        );
+        assert_eq!(
+            install_patch_state(&backup, &b, false),
+            (PatchState::OtherInstallBackup, Some(a.clone()))
+        );
+        fs::remove_dir_all(&a).unwrap();
+        assert_eq!(
+            install_patch_state(&backup, &b, false),
+            (PatchState::StaleBackup, None)
+        );
+    }
+
+    #[test]
+    fn stale_restore_removes_leftover_generated_bundles() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = fake_install(temp.path(), "game");
+        let leftover = game.join("Bundles2/TinyPoe2Smoother");
+        fs::create_dir_all(&leftover).unwrap();
+        fs::write(leftover.join("0.bundle.bin"), b"partial").unwrap();
+        let backup = BackupStore::for_path(temp.path().join("poe2.bak"));
+        backup
+            .ensure_original_bytes(
+                &game,
+                &[(PathBuf::from("Bundles2/_.index.bin"), b"index".to_vec())],
+            )
+            .unwrap();
+
+        let report = restore_backup_with_store(game, backup.clone()).unwrap();
+        assert!(report.backup_removed);
+        assert!(!leftover.exists());
+        assert!(!backup.has_backup());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_made_through_a_symlink_stays_owned_after_the_link_is_gone() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = fake_install(temp.path(), "a");
+        let b = fake_install(temp.path(), "b");
+        let alias = temp.path().join("a-alias");
+        std::os::unix::fs::symlink(&a, &alias).unwrap();
+        let backup = BackupStore::for_path(temp.path().join("poe2.bak"));
+        backup
+            .ensure_original_bytes(
+                &alias,
+                &[(PathBuf::from("Bundles2/_.index.bin"), b"index".to_vec())],
+            )
+            .unwrap();
+        fs::remove_file(&alias).unwrap();
+
+        assert_eq!(
+            install_patch_state(&backup, &b, false),
+            (
+                PatchState::OtherInstallBackup,
+                Some(fs::canonicalize(&a).unwrap())
+            )
+        );
+    }
+
+    #[test]
+    fn damaged_backup_header_does_not_block_apply() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = fake_install(temp.path(), "game");
+        let backup = BackupStore::for_path(temp.path().join("poe2.bak"));
+        fs::write(backup.path(), [0x32, 0x53]).unwrap();
+        ensure_backup_is_for(&backup, &game).unwrap();
+    }
+
+    #[test]
+    fn backup_from_another_install_is_kept_until_that_install_is_gone() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = fake_install(temp.path(), "a");
+        let b = fake_install(temp.path(), "b");
+        let backup = BackupStore::for_path(temp.path().join("poe2.bak"));
+        backup
+            .ensure_original_bytes(
+                &a,
+                &[(
+                    PathBuf::from("Bundles2/_.index.bin"),
+                    b"a-original".to_vec(),
+                )],
+            )
+            .unwrap();
+
+        let err = restore_backup_with_store(b.clone(), backup.clone()).unwrap_err();
+        assert!(
+            err.to_string().contains("belongs to another install"),
+            "{err}"
+        );
+        assert!(backup.has_backup());
+
+        fs::remove_dir_all(&a).unwrap();
+        let report = restore_backup_with_store(b, backup.clone()).unwrap();
+        assert!(report.backup_removed);
+        assert!(!backup.has_backup());
     }
 
     fn test_index_bytes(bundle_names: &[&str]) -> Vec<u8> {

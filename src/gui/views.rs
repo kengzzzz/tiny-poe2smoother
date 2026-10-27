@@ -168,7 +168,7 @@ fn install_summary(status: &AppStatus) -> (String, egui::Color32) {
         ),
         PatchState::StaleBackup => (
             format!(
-                "{layout} · the game updated since the last apply. The old backup will be replaced"
+                "{layout} · not patched, but an old backup is left over. Apply replaces it and Restore removes it"
             ),
             palette::WARNING,
         ),
@@ -177,6 +177,17 @@ fn install_summary(status: &AppStatus) -> (String, egui::Color32) {
                 "{layout} · patched but the backup is missing. Verify the game files in Steam or the launcher"
             ),
             palette::ERROR,
+        ),
+        PatchState::OtherInstallBackup => (
+            format!(
+                "{layout} · the backup belongs to {}. Restore that install first",
+                status
+                    .backup_owner
+                    .as_deref()
+                    .map(display_path)
+                    .unwrap_or_else(|| "another install".to_string())
+            ),
+            palette::WARNING,
         ),
     }
 }
@@ -471,12 +482,24 @@ fn draw_footer(app: &mut GuiApp, ui: &mut egui::Ui) {
                     .is_some_and(|status| status.patch_state.can_restore());
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let loading = app.catalogs_loading();
+                    let other_install = app
+                        .status
+                        .as_ref()
+                        .is_some_and(|status| status.patch_state == PatchState::OtherInstallBackup);
                     let apply = ui
-                        .add_enabled(!patched && !busy, widgets::primary_button("Apply"))
+                        .add_enabled(
+                            !patched && !other_install && !busy && !loading,
+                            widgets::primary_button("Apply"),
+                        )
                         .on_disabled_hover_text(if patched {
                             "Restore first to apply a different selection."
-                        } else {
+                        } else if other_install {
+                            "Restore the install that owns the backup first."
+                        } else if busy {
                             "Working…"
+                        } else {
+                            "Loading game data…"
                         });
                     if apply.clicked() {
                         match app.patch_request() {
@@ -484,10 +507,16 @@ fn draw_footer(app: &mut GuiApp, ui: &mut egui::Ui) {
                             Err(err) => app.set_message(err, MessageKind::Error),
                         }
                     }
-                    if ui
-                        .add_enabled(can_restore && !busy, widgets::secondary_button("Restore"))
-                        .clicked()
-                    {
+                    let restore = ui.add_enabled(
+                        can_restore && !busy && !loading,
+                        widgets::secondary_button("Restore"),
+                    );
+                    let restore = if can_restore && loading {
+                        restore.on_disabled_hover_text("Loading game data…")
+                    } else {
+                        restore
+                    };
+                    if restore.clicked() {
                         app.confirm_restore = true;
                     }
 
@@ -510,8 +539,7 @@ fn draw_footer(app: &mut GuiApp, ui: &mut egui::Ui) {
                                     .color(message_color(app.message_kind)),
                             )
                             .truncate(),
-                        )
-                        .on_hover_text(&app.message);
+                        );
                     });
                 });
             });
@@ -665,8 +693,9 @@ fn patch_state_pill(state: PatchState) -> (&'static str, egui::Color32) {
     match state {
         PatchState::Clean => ("Not patched", palette::NEUTRAL),
         PatchState::Patched => ("Patched", palette::SUCCESS),
-        PatchState::StaleBackup => ("Game updated", palette::WARNING),
+        PatchState::StaleBackup => ("Old backup", palette::WARNING),
         PatchState::PatchedMissingBackup => ("Backup missing", palette::ERROR),
+        PatchState::OtherInstallBackup => ("Other install", palette::WARNING),
     }
 }
 

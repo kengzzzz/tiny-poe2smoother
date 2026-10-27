@@ -6,7 +6,7 @@ use super::ggpk::{
 use super::hashing::{HashMode, hash_fnv1a};
 use super::index::{BundleFile, BundleIndex, BundleInfo, DirectoryRecord};
 use crate::backup::GgpkBackupMeta;
-use crate::install::{InstallLayout, detect_install_layout};
+use crate::install::{InstallLayout, detect_install_layout, normalized_game_dir};
 use anyhow::{Context, Result, anyhow, bail};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use rayon::prelude::*;
@@ -47,15 +47,8 @@ fn default_cache_dir() -> PathBuf {
         .join("tiny-poe2smoother")
 }
 
-fn normalized_cache_game_dir(game_dir: &std::path::Path) -> PathBuf {
-    // Cache-only: Windows canonical paths may carry a `\\?\` prefix.
-    fs::canonicalize(game_dir)
-        .or_else(|_| std::path::absolute(game_dir))
-        .unwrap_or_else(|_| game_dir.to_path_buf())
-}
-
 fn cache_source(game_dir: &std::path::Path, layout: InstallLayout) -> String {
-    let game_dir = normalized_cache_game_dir(game_dir);
+    let game_dir = normalized_game_dir(game_dir);
     match layout {
         InstallLayout::LooseBundles => game_dir
             .join("Bundles2")
@@ -746,12 +739,38 @@ impl BundleStore {
         file.write_u64::<LittleEndian>(meta.original_bundles2_offset)?;
         file.flush()?;
         file.sync_all()?;
+        drop(file);
 
-        if file.metadata()?.len() == meta.appended_end {
-            file.set_len(meta.appended_start)?;
-            file.sync_all()?;
-        }
+        self.trim_restored_ggpk_tail(meta)?;
         Ok(())
+    }
+
+    /// Trims appended records once the Bundles2 pointer is original again.
+    pub fn trim_restored_ggpk_tail(&mut self, meta: GgpkBackupMeta) -> Result<bool> {
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.content_path)
+            .with_context(|| format!("failed to open {}", self.content_path.display()))?;
+        // An interrupted Apply can leave a partial append.
+        let len = file.metadata()?.len();
+        if len <= meta.appended_start || len > meta.appended_end {
+            return Ok(false);
+        }
+        file.seek(SeekFrom::Start(meta.bundles2_offset_pos))?;
+        if file.read_u64::<LittleEndian>()? != meta.original_bundles2_offset {
+            return Ok(false);
+        }
+        // Fails on Windows while any process maps the file.
+        self.ggpk = None;
+        file.set_len(meta.appended_start).with_context(|| {
+            format!(
+                "failed to shrink {}.\n  Close programs that use it and retry",
+                self.content_path.display()
+            )
+        })?;
+        file.sync_all()?;
+        Ok(true)
     }
 
     pub fn remove_legacy_overlay_files(&self) -> Result<()> {
@@ -1025,15 +1044,18 @@ mod tests {
             "index-cache-0123456789abcdef.bin",
             "index-cache-v2-0123456789abcdef.bin",
         ];
-        let preserved = [
+        let mut preserved = vec![
             "index-cache-v3-0123456789abcdef.bin",
             "index-cache-v2.migrated",
             "index-cache-v2-0123456789abcdef.tmp42",
-            "index-cache-0123456789ABCDEf.bin",
             "index-cache-0123.bin",
             "unrelated.bin",
         ];
-        for name in legacy.into_iter().chain(preserved) {
+        // Same file as a legacy name on case-insensitive filesystems.
+        if !cfg!(windows) {
+            preserved.push("index-cache-0123456789ABCDEf.bin");
+        }
+        for name in legacy.into_iter().chain(preserved.iter().copied()) {
             fs::write(cache_dir.join(name), b"keep-or-remove").unwrap();
         }
         let cache_like_dir = cache_dir.join("index-cache-fedcba9876543210.bin");
@@ -1044,7 +1066,7 @@ mod tests {
         for name in legacy {
             assert!(!cache_dir.join(name).exists());
         }
-        for name in preserved {
+        for name in &preserved {
             assert_eq!(fs::read(cache_dir.join(name)).unwrap(), b"keep-or-remove");
         }
         assert!(cache_dir.join(CACHE_MIGRATION_MARKER).exists());
@@ -1053,7 +1075,7 @@ mod tests {
         let post_migration_legacy = cache_dir.join("index-cache-ffffffffffffffff.bin");
         fs::write(&post_migration_legacy, b"created by an older version").unwrap();
         retire_legacy_caches(&cache_dir);
-        for name in preserved {
+        for name in &preserved {
             assert_eq!(fs::read(cache_dir.join(name)).unwrap(), b"keep-or-remove");
         }
         assert_eq!(
@@ -1233,6 +1255,8 @@ mod tests {
             .unwrap();
         assert_eq!(plan.backup.appended_start, original_len);
         store.apply_ggpk_patch(&plan).unwrap();
+        // Windows can't truncate a mapped file.
+        drop(store);
 
         let mut patched = BundleStore::new(&game);
         assert_eq!(patched.read_index_bytes().unwrap(), b"new-index");
@@ -1249,6 +1273,59 @@ mod tests {
         let restored = BundleStore::new(&game);
         assert_eq!(restored.read_index_bytes().unwrap(), b"old-index");
         assert_eq!(fs::metadata(&content).unwrap().len(), original_len);
+    }
+
+    #[test]
+    fn trim_restored_ggpk_tail_cuts_only_a_tail_left_by_a_failed_restore() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game");
+        fs::create_dir_all(&game).unwrap();
+        let content = game.join("Content.ggpk");
+        write_test_ggpk_files(
+            &content,
+            "Bundles2",
+            &[
+                ("_.index.bin", b"old-index".as_slice()),
+                ("Base.bundle.bin", b"old-bundle".as_slice()),
+            ],
+        );
+        let original_len = fs::metadata(&content).unwrap().len();
+        let store = BundleStore::new(&game);
+        let plan = store
+            .prepare_ggpk_patch("TinyPoe2Smoother_0", b"new-bundle", b"new-index")
+            .unwrap();
+        store.apply_ggpk_patch(&plan).unwrap();
+        drop(store);
+        let meta = plan.backup;
+
+        let mut patched = BundleStore::new(&game);
+        assert!(!patched.trim_restored_ggpk_tail(meta).unwrap());
+        assert_eq!(fs::metadata(&content).unwrap().len(), meta.appended_end);
+        assert_eq!(patched.read_index_bytes().unwrap(), b"new-index");
+        drop(patched);
+
+        let mut file = fs::OpenOptions::new().write(true).open(&content).unwrap();
+        file.seek(SeekFrom::Start(meta.bundles2_offset_pos))
+            .unwrap();
+        file.write_u64::<LittleEndian>(meta.original_bundles2_offset)
+            .unwrap();
+        drop(file);
+
+        let mut half_restored = BundleStore::new(&game);
+        assert!(half_restored.trim_restored_ggpk_tail(meta).unwrap());
+        assert_eq!(fs::metadata(&content).unwrap().len(), original_len);
+        assert!(!half_restored.trim_restored_ggpk_tail(meta).unwrap());
+
+        let partial = (meta.appended_start + meta.appended_end) / 2;
+        let file = fs::OpenOptions::new().write(true).open(&content).unwrap();
+        file.set_len(partial).unwrap();
+        drop(file);
+        assert!(half_restored.trim_restored_ggpk_tail(meta).unwrap());
+        assert_eq!(fs::metadata(&content).unwrap().len(), original_len);
+        assert_eq!(
+            BundleStore::new(&game).read_index_bytes().unwrap(),
+            b"old-index"
+        );
     }
 
     fn write_test_ggpk(path: &Path, file_path: &str, data: &[u8]) {

@@ -1,14 +1,14 @@
 use super::compression::pack_uncompressed_bundle;
 use super::index::{BundleFile, BundleIndex};
 use super::store::BundleStore;
+use crate::atomic_write;
 use crate::backup::BackupStore;
 use crate::install::InstallLayout;
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fs;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct BundleWriteReport {
@@ -106,19 +106,6 @@ pub fn slice_file(bundle: &[u8], file: &BundleFile) -> Result<Vec<u8>> {
         );
     }
     Ok(bundle[start..end].to_vec())
-}
-
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-    temp.write_all(bytes)?;
-    temp.flush()?;
-    temp.as_file().sync_all()?;
-    temp.persist(path)
-        .map_err(|err| anyhow!("failed to replace {}: {}", path.display(), err.error))?;
-    Ok(())
 }
 
 #[cfg(test)]

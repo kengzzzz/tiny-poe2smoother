@@ -65,6 +65,28 @@ impl BackupStore {
         }
     }
 
+    /// `None` for version 1 backups.
+    pub fn recorded_game_dir(&self) -> Result<Option<PathBuf>> {
+        let mut file = fs::File::open(&self.path)
+            .with_context(|| format!("failed to read {}", self.path.display()))?;
+        if file.read_u32::<LittleEndian>()? != MAGIC {
+            bail!("{} is not a tiny-poe2smoother backup", self.path.display());
+        }
+        if file.read_u32::<LittleEndian>()? < 2 {
+            return Ok(None);
+        }
+        let manifest_len = file.read_u32::<LittleEndian>()?;
+        if u64::from(manifest_len) > file.metadata()?.len() {
+            bail!("corrupt backup {}", self.path.display());
+        }
+        let mut manifest = vec![0; manifest_len as usize];
+        file.read_exact(&mut manifest)?;
+        let manifest = String::from_utf8_lossy(&manifest);
+        Ok(manifest
+            .split_once(" game=")
+            .map(|(_, game_dir)| PathBuf::from(game_dir)))
+    }
+
     pub fn entries(&self) -> Result<Vec<BackupEntry>> {
         if !self.path.exists() {
             return Ok(Vec::new());
@@ -109,10 +131,12 @@ impl BackupStore {
             let mut out = Vec::new();
             out.write_u32::<LittleEndian>(MAGIC)?;
             out.write_u32::<LittleEndian>(VERSION)?;
+            // Canonical, so a removed symlink can't hide the owner.
+            let game_dir = crate::install::normalized_game_dir(game_dir);
             let manifest = format!("{APP_NAME} v{APP_VERSION} game={}", game_dir.display());
             out.write_u32::<LittleEndian>(manifest.len() as u32)?;
             out.extend_from_slice(manifest.as_bytes());
-            fs::write(&self.path, out)?;
+            crate::atomic_write(&self.path, &out)?;
         }
 
         let mut file = fs::OpenOptions::new()
@@ -163,26 +187,28 @@ impl BackupStore {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::write(&path, &entry.bytes)
+            crate::atomic_write(&path, &entry.bytes)
                 .with_context(|| format!("failed to restore {}", path.display()))?;
         }
-        let custom_bundle_dir = game_dir.join("Bundles2/TinyPoe2Smoother");
-        match fs::remove_dir_all(&custom_bundle_dir) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!(
-                        "failed to remove generated bundle directory {}",
-                        custom_bundle_dir.display()
-                    )
-                });
-            }
-        }
+        remove_generated_bundles(game_dir)?;
         if self.path.exists() {
             fs::remove_file(&self.path)?;
         }
         Ok(restored)
+    }
+}
+
+pub(crate) fn remove_generated_bundles(game_dir: &Path) -> Result<()> {
+    let custom_bundle_dir = game_dir.join("Bundles2/TinyPoe2Smoother");
+    match fs::remove_dir_all(&custom_bundle_dir) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "failed to remove generated bundle directory {}",
+                custom_bundle_dir.display()
+            )
+        }),
     }
 }
 
@@ -333,6 +359,24 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].rel_path, PathBuf::from("Bundles2/_.index.bin"));
         assert_eq!(entries[0].bytes, data);
+        assert_eq!(
+            BackupStore::for_path(path).recorded_game_dir().unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn recorded_game_dir_reads_the_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("Path of Exile 2");
+        let store = BackupStore::for_path(temp.path().join("poe2.bak"));
+        store
+            .ensure_original_bytes(
+                &game,
+                &[(PathBuf::from("Bundles2/_.index.bin"), b"index".to_vec())],
+            )
+            .unwrap();
+        assert_eq!(store.recorded_game_dir().unwrap(), Some(game));
     }
 
     #[test]

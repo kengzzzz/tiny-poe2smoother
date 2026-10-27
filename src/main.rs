@@ -1,4 +1,4 @@
-#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+#![cfg_attr(all(target_os = "windows", not(test)), windows_subsystem = "windows")]
 
 mod gui;
 
@@ -6,6 +6,8 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use tiny_poe2smoother::app::{
@@ -22,17 +24,23 @@ use tiny_poe2smoother::patches::{
 };
 
 const PREFS_KEY: &str = "tiny-poe2smoother.gui.v1";
+const MIN_INNER_SIZE: [f32; 2] = [840.0, 620.0];
+/// Taskbar, title bar, and cascade offset.
+const SCREEN_MARGIN: f32 = 110.0;
+/// Taskbar height plus a small gap.
+const TASKBAR_ROOM: f32 = 56.0;
 
 fn main() -> eframe::Result {
     tiny_poe2smoother::init_tracing();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([980.0, 720.0])
-            .with_min_inner_size([840.0, 620.0])
+            // Fits 1280x800 with a taskbar.
+            .with_inner_size([980.0, 680.0])
+            .with_min_inner_size(MIN_INNER_SIZE)
             .with_icon(gui::icon::app_icon()),
         ..Default::default()
     };
-    eframe::run_native(
+    let result = eframe::run_native(
         "tiny-poe2smoother",
         options,
         Box::new(|cc| {
@@ -40,7 +48,19 @@ fn main() -> eframe::Result {
             gui::theme::install_style(&cc.egui_ctx);
             Ok(Box::new(GuiApp::new(cc.storage)))
         }),
-    )
+    );
+    // The Windows exe has no console to show the error.
+    if let Err(err) = &result {
+        rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Error)
+            .set_title("tiny-poe2smoother")
+            .set_description(format!(
+                "The window could not open. Make sure your graphics driver is installed and supports OpenGL 2.0 or newer.\n\nDetails: {err}"
+            ))
+            .set_buttons(rfd::MessageButtons::Ok)
+            .show();
+    }
+    result
 }
 
 #[derive(Clone, Copy)]
@@ -69,6 +89,7 @@ struct GuiApp {
     color_search: String,
     stat_catalog: Option<Vec<CatalogRow>>,
     catalog_task: Option<Receiver<Result<Vec<CatalogRow>, String>>>,
+    catalog_threads: Arc<AtomicUsize>,
     catalog_error: Option<String>,
     stat_catalog_dir: Option<PathBuf>,
     color_filter_key: Option<ColorFilterKey>,
@@ -109,6 +130,7 @@ struct GuiApp {
     confirm_restore: bool,
     show_game_running_dialog: bool,
     initialized: bool,
+    window_fitted: bool,
 }
 
 /// Lowercase copies keep per-keystroke filtering off the ~20k-entry catalog.
@@ -177,7 +199,10 @@ struct GuiPrefs {
 
 enum TaskResult {
     Status(Result<AppStatus, String>),
-    Apply(Result<ApplyReport, String>),
+    Apply {
+        result: Result<ApplyReport, String>,
+        status: Result<AppStatus, String>,
+    },
     Restore {
         result: Result<RestoreReport, String>,
         status: Result<AppStatus, String>,
@@ -199,6 +224,7 @@ impl Default for GuiApp {
             color_search: String::new(),
             stat_catalog: None,
             catalog_task: None,
+            catalog_threads: Arc::default(),
             catalog_error: None,
             stat_catalog_dir: None,
             color_filter_key: None,
@@ -239,6 +265,7 @@ impl Default for GuiApp {
             confirm_restore: false,
             show_game_running_dialog: false,
             initialized: false,
+            window_fitted: false,
         }
     }
 }
@@ -253,7 +280,13 @@ impl eframe::App for GuiApp {
             self.initialized = true;
             self.spawn_status();
         }
+        if !self.window_fitted {
+            self.window_fitted = fit_window_to_monitor(ctx);
+        }
 
+        if self.catalogs_loading() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
         self.poll_task(ctx);
         self.poll_catalog(ctx);
         self.poll_effect_catalog(ctx);
@@ -264,6 +297,65 @@ impl eframe::App for GuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         gui::views::draw(self, ui);
     }
+}
+
+/// Counts live catalog threads, since a path change drops their task handles.
+struct CatalogThread(Arc<AtomicUsize>);
+
+impl CatalogThread {
+    fn start(count: &Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(count))
+    }
+}
+
+impl Drop for CatalogThread {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Returns false until the monitor size is known.
+fn fit_window_to_monitor(ctx: &egui::Context) -> bool {
+    // inner_rect is None on Wayland.
+    let (monitor, inner, outer, maximized) = ctx.input(|i| {
+        let viewport = i.viewport();
+        (
+            viewport.monitor_size,
+            i.viewport_rect().size(),
+            viewport.outer_rect,
+            viewport.maximized == Some(true) || viewport.fullscreen == Some(true),
+        )
+    });
+    let Some(monitor) = monitor else {
+        return false;
+    };
+    // Resizing would un-maximize it on Windows.
+    if maximized {
+        return true;
+    }
+    let max_height = (monitor.y - SCREEN_MARGIN).max(MIN_INNER_SIZE[1]);
+    let shrink = (inner.y - max_height).max(0.0);
+    if shrink > 0.0 {
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+            inner.x, max_height,
+        )));
+    }
+    // Windows cascades new windows down under the taskbar.
+    if let Some(outer) = outer {
+        let top = (monitor.y - TASKBAR_ROOM - (outer.height() - shrink)).max(0.0);
+        let on_origin_monitor = outer.min.x >= 0.0
+            && outer.min.y >= 0.0
+            && outer.min.x < monitor.x
+            && outer.min.y < monitor.y;
+        if on_origin_monitor && outer.min.y > top {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                outer.min.x,
+                top,
+            )));
+        }
+    }
+    true
 }
 
 impl GuiApp {
@@ -380,6 +472,11 @@ impl GuiApp {
         self.task.is_some()
     }
 
+    /// Catalog loads map Content.ggpk, which blocks Restore on Windows.
+    fn catalogs_loading(&self) -> bool {
+        self.catalog_threads.load(Ordering::SeqCst) > 0
+    }
+
     fn set_message(&mut self, message: impl Into<String>, kind: MessageKind) {
         self.message = message.into();
         self.message_kind = kind;
@@ -443,7 +540,7 @@ impl GuiApp {
         let loader = self.status_loader;
         self.status = None;
         self.spawn("Detecting install...", move || {
-            TaskResult::Status(loader(game_dir).map_err(|err| err.to_string()))
+            TaskResult::Status(loader(game_dir).map_err(|err| format!("{err:#}")))
         });
     }
 
@@ -456,21 +553,25 @@ impl GuiApp {
         let loader = self.status_loader;
         self.status = None;
         self.spawn("Detecting install...", move || {
-            TaskResult::Status(loader(None).map_err(|err| err.to_string()))
+            TaskResult::Status(loader(None).map_err(|err| format!("{err:#}")))
         });
     }
 
     fn spawn_apply(&mut self, request: PatchRequest) {
+        let game_dir = request.game_dir.clone();
+        // Refresh even on failure, which can leave a backup to Restore.
         self.spawn("Applying patches...", move || {
-            TaskResult::Apply(apply_patches(request).map_err(|err| err.to_string()))
+            let result = apply_patches(request).map_err(|err| format!("{err:#}"));
+            let status = load_status(game_dir).map_err(|err| format!("{err:#}"));
+            TaskResult::Apply { result, status }
         });
     }
 
     fn spawn_restore(&mut self) {
         let game_dir = self.game_dir();
         self.spawn("Restoring backup...", move || {
-            let result = restore_backup(game_dir.clone()).map_err(|err| err.to_string());
-            let status = load_status(game_dir).map_err(|err| err.to_string());
+            let result = restore_backup(game_dir.clone()).map_err(|err| format!("{err:#}"));
+            let status = load_status(game_dir).map_err(|err| format!("{err:#}"));
             TaskResult::Restore { result, status }
         });
     }
@@ -514,9 +615,13 @@ impl GuiApp {
                 }
                 Err(err) => self.set_message(err, MessageKind::Error),
             },
-            TaskResult::Apply(result) => match result {
-                Ok(report) => {
-                    self.set_message(
+            TaskResult::Apply { result, status } => {
+                match status {
+                    Ok(status) => self.apply_status(status),
+                    Err(_) => self.status = None,
+                }
+                match result {
+                    Ok(report) => self.set_message(
                         format!(
                             "Applied {} file(s). Touched {} bundle/index file(s). Backup: {}",
                             report.changed_files,
@@ -524,11 +629,10 @@ impl GuiApp {
                             display_path(&report.backup_path)
                         ),
                         MessageKind::Success,
-                    );
-                    self.spawn_status();
+                    ),
+                    Err(err) => self.set_message(err, MessageKind::Error),
                 }
-                Err(err) => self.set_message(err, MessageKind::Error),
-            },
+            }
             TaskResult::Restore { result, status } => {
                 match status {
                     Ok(status) => self.apply_status(status),
@@ -578,7 +682,9 @@ impl GuiApp {
         let (tx, rx) = mpsc::channel();
         self.catalog_task = Some(rx);
         self.stat_catalog_dir = game_dir.clone();
+        let busy = CatalogThread::start(&self.catalog_threads);
         thread::spawn(move || {
+            let _busy = busy;
             let result = load_stat_catalog(game_dir)
                 .map(|entries| {
                     entries
@@ -594,7 +700,7 @@ impl GuiApp {
                         })
                         .collect()
                 })
-                .map_err(|err| err.to_string());
+                .map_err(|err| format!("{err:#}"));
             let _ = tx.send(result);
         });
     }
@@ -705,10 +811,12 @@ impl GuiApp {
         let (tx, rx) = mpsc::channel();
         self.effect_catalog_task = Some(rx);
         self.effect_catalog_dir = game_dir.clone();
+        let busy = CatalogThread::start(&self.catalog_threads);
         thread::spawn(move || {
+            let _busy = busy;
             let result = load_effect_skill_catalog(game_dir)
                 .map(effect_skill_catalog_rows)
-                .map_err(|err| err.to_string());
+                .map_err(|err| format!("{err:#}"));
             let _ = tx.send(result);
         });
     }
@@ -928,10 +1036,12 @@ impl GuiApp {
         let (tx, rx) = mpsc::channel();
         self.other_catalog_task = Some(rx);
         self.other_catalog_dir = game_dir.clone();
+        let busy = CatalogThread::start(&self.catalog_threads);
         thread::spawn(move || {
+            let _busy = busy;
             let result = load_other_effect_catalog(game_dir)
                 .map(other_effect_catalog_rows)
-                .map_err(|err| err.to_string());
+                .map_err(|err| format!("{err:#}"));
             let _ = tx.send(result);
         });
     }
@@ -1150,10 +1260,12 @@ impl GuiApp {
         let (tx, rx) = mpsc::channel();
         self.monster_catalog_task = Some(rx);
         self.monster_catalog_dir = game_dir.clone();
+        let busy = CatalogThread::start(&self.catalog_threads);
         thread::spawn(move || {
+            let _busy = busy;
             let result = load_monster_effect_catalog(game_dir)
                 .map(monster_effect_catalog_rows)
-                .map_err(|err| err.to_string());
+                .map_err(|err| format!("{err:#}"));
             let _ = tx.send(result);
         });
     }
@@ -1433,6 +1545,7 @@ mod tests {
             backup_path: PathBuf::from("test-backup.bak"),
             has_backup: true,
             patch_state: tiny_poe2smoother::app::PatchState::Patched,
+            backup_owner: None,
         }
     }
 
@@ -1491,6 +1604,16 @@ mod tests {
         assert!(app.status.is_none());
         assert_eq!(app.message, "could not autodetect install");
         assert_eq!(app.game_dir_input, "deleted-install");
+    }
+
+    #[test]
+    fn dropped_catalog_task_keeps_the_gate_until_its_thread_ends() {
+        let mut app = GuiApp::default();
+        let busy = CatalogThread::start(&app.catalog_threads);
+        app.catalog_task = None;
+        assert!(app.catalogs_loading());
+        drop(busy);
+        assert!(!app.catalogs_loading());
     }
 
     #[test]

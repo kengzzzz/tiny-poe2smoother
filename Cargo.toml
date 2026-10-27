@@ -27,6 +27,7 @@ eframe = { version = "0.37.0", default-features = false, features = [
     "persistence",
 ] }
 rfd = { version = "0.17.2", default-features = false }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Registry"] }
 
 [target.'cfg(not(windows))'.dependencies]
 eframe = { version = "0.37.0", default-features = false, features = [

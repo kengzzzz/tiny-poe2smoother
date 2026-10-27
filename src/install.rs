@@ -60,6 +60,13 @@ fn resolve_from_candidates(
     );
 }
 
+/// For comparing installs only, since Windows adds a `\\?\` prefix.
+pub(crate) fn normalized_game_dir(game_dir: &Path) -> PathBuf {
+    std::fs::canonicalize(game_dir)
+        .or_else(|_| std::path::absolute(game_dir))
+        .unwrap_or_else(|_| game_dir.to_path_buf())
+}
+
 pub fn validate_game_dir(path: PathBuf) -> Result<PathBuf> {
     detect_install_layout(&path)?;
     Ok(path)
@@ -99,7 +106,19 @@ pub fn is_game_running() -> bool {
         RefreshKind::nothing()
             .with_processes(ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always)),
     );
-    system.processes().values().any(|process| {
+    // The app, its threads, and its launchers match when it sits in the game folder.
+    let mut ours = HashSet::new();
+    let mut next = sysinfo::get_current_pid().ok();
+    while let Some(pid) = next {
+        if !ours.insert(pid) {
+            break;
+        }
+        next = system.process(pid).and_then(|process| process.parent());
+    }
+    system.processes().iter().any(|(pid, process)| {
+        if ours.contains(pid) || process.thread_kind().is_some() {
+            return false;
+        }
         let name = process.name().to_string_lossy().to_ascii_lowercase();
         if name.contains("pathofexile") || name.contains("path of exile") {
             return true;
@@ -121,6 +140,7 @@ fn steam_candidates() -> Vec<PathBuf> {
     }
     #[cfg(target_os = "windows")]
     {
+        out.extend(registry_steam_roots());
         if let Some(program_files_x86) = std::env::var_os("ProgramFiles(x86)") {
             out.push(PathBuf::from(program_files_x86).join("Steam"));
         }
@@ -129,6 +149,53 @@ fn steam_candidates() -> Vec<PathBuf> {
         }
     }
     expand_steam_libraries(out)
+}
+
+/// Steam may be installed outside Program Files.
+#[cfg(target_os = "windows")]
+fn registry_steam_roots() -> Vec<PathBuf> {
+    use windows_sys::Win32::System::Registry::{
+        HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6432KEY,
+        RegGetValueW,
+    };
+
+    fn read(root: HKEY, key: &str, value: &str, flags: u32) -> Option<PathBuf> {
+        use std::os::windows::ffi::OsStringExt;
+        let key: Vec<u16> = key.encode_utf16().chain(std::iter::once(0)).collect();
+        let value: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut buf = vec![0u16; 1024];
+        let mut bytes = (buf.len() * 2) as u32;
+        let status = unsafe {
+            RegGetValueW(
+                root,
+                key.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_SZ | flags,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr().cast(),
+                &mut bytes,
+            )
+        };
+        if status != 0 {
+            return None;
+        }
+        let len = (bytes as usize / 2).saturating_sub(1);
+        let path = PathBuf::from(std::ffi::OsString::from_wide(&buf[..len]));
+        (!path.as_os_str().is_empty()).then_some(path)
+    }
+
+    [
+        read(HKEY_CURRENT_USER, "Software\\Valve\\Steam", "SteamPath", 0),
+        read(
+            HKEY_LOCAL_MACHINE,
+            "SOFTWARE\\Valve\\Steam",
+            "InstallPath",
+            RRF_SUBKEY_WOW6432KEY,
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 fn standalone_candidates() -> Vec<PathBuf> {
@@ -309,13 +376,37 @@ fn quoted_fields(line: &str) -> Vec<String> {
 }
 
 pub fn display_path(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
+    let text = path.to_string_lossy();
+    // Hide the `\\?\` prefix of canonical Windows paths.
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        text.into_owned()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn display_path_hides_windows_verbatim_prefixes() {
+        assert_eq!(
+            display_path(Path::new(r"\\?\C:\Games\PoE2")),
+            r"C:\Games\PoE2"
+        );
+        assert_eq!(
+            display_path(Path::new(r"\\?\UNC\server\share\PoE2")),
+            r"\\server\share\PoE2"
+        );
+        assert_eq!(
+            display_path(Path::new("/home/deck/PoE2")),
+            "/home/deck/PoE2"
+        );
+    }
 
     #[test]
     fn autodetect_skips_invalid_steam_install_and_prefers_next_library() {
