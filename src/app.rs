@@ -706,7 +706,10 @@ mod tests {
         );
         assert_eq!(
             install_patch_state(&backup, &b, false),
-            (PatchState::OtherInstallBackup, Some(a.clone()))
+            (
+                PatchState::OtherInstallBackup,
+                Some(fs::canonicalize(&a).unwrap())
+            )
         );
         fs::remove_dir_all(&a).unwrap();
         assert_eq!(
