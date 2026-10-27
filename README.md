@@ -6,31 +6,29 @@ tiny-poe2smoother is a desktop app that turns down visual and sound effects in P
 
 ## Features
 
-Pick a profile or choose patches yourself. A patch with sub-options expands when you check it, so you can turn off only the parts you want.
+Pick a profile or choose patches yourself. Patches with sub-options expand when checked, so you can keep the parts you like.
 
-| Area | What you can change |
+| Area | Patches |
 | --- | --- |
-| Camera & Map | Zoom the camera out from 1.2× to 2.4×. Reveal the minimap with adjustable strength and floor and wall colors. Remove the Atlas fog of war. |
-| Environment | Atmosphere covers fog, screen fog, rain, clouds, ground and weather particles, ambient effects, and bloom, each with its own toggle. Shadows and lighting (sun and moon, player light, reflections, global illumination) are separate patches. |
-| Screen | Turn off vignette, depth of field, and the desaturation filter for chill and low life. Black screen stops drawing the world but keeps the UI, item labels, health bars, and minimap. |
-| Effects | Reduce nonessential skill and monster effects, particles, and Delirium. Remove microtransaction effects. Town portals stay visible by default. |
-| Audio | Silence supported effect sounds, or only skill or monster sounds. |
-| Interface | Color modifier text. Shorten the affix and tier lines on Alt tooltips (English client only). Keep monster health bars visible. |
+| Camera & Map | Camera zoom (1.2× to 2.4×), minimap reveal with custom colors, no Atlas fog of war |
+| Environment | Fog, rain, clouds, weather particles, bloom, shadows, lighting |
+| Screen | No vignette, depth of field, or chill and low life filters. Black screen mode that keeps the UI |
+| Effects | Fewer skill and monster effects, particles, and Delirium. No MTX effects |
+| Audio | Mute effect sounds, or only skill or monster sounds |
+| Interface | Colored mod text, compact Alt tooltips (English client), always visible health bars |
 
-More features:
+Also:
 
-- Clarity, Balanced, and Performance profiles each set the whole selection, including sub-options. Any change after that shows as Custom.
-- The effects editor keeps chosen visuals original. It has Skills, Monsters, and Others tabs, and Others covers shared ground effects and unmapped effect folders. Checked rows are reduced and unchecked rows stay original. An effect you keep original also keeps the particles it uses, even with the Particles patch on, and shared files stay original for everything that uses them. Bulk actions only touch the search results on the current tab.
-- The color mods editor picks which modifier text gets colored on waystones, items, and tablets. Search supports alternatives like `fire|cold`, quoted phrases, and exclusions like `!monster`. Each modifier can use a preset or a custom color.
-- The app finds Steam and standalone installs, including Steam libraries on other drives.
-- It remembers the game folder, your patches and their options, zoom, minimap style, colors, and effect exceptions.
-- It makes a backup before patching.
+- Clarity, Balanced, and Performance profiles.
+- An effects editor to keep chosen skills and monsters looking original.
+- A color editor for mod text on waystones, items, and tablets. Search supports `fire|cold`, `"quoted phrases"`, and `!monster`.
+- Finds Steam and standalone installs, and remembers your settings.
+- Makes a backup before patching.
 
 ## Trust and privacy
 
 - No telemetry, no analytics, and no auto-updater. The app makes no network calls and sends no data anywhere.
 - [GitHub Actions](.github/workflows/release.yml) builds every release from tagged source, and published releases are [immutable on GitHub](https://github.com/kengzzzz/tiny-poe2smoother/releases).
-- Sound and MTX patches change only the data they target, with replacements the game parser accepts.
 
 ## Download
 
@@ -69,18 +67,18 @@ Then run `poe2smoother`.
 ## Safety notes
 
 - Apply and Restore are blocked while Path of Exile 2 is running.
-- The app shows where the backup is. It lives in `tiny-poe2smoother/poe2.bak` under your system's local app data folder.
-- If the game crashes after using an older tiny-poe2smoother release, verify the game files in Steam or the standalone launcher before you patch again.
+- The backup lives in `tiny-poe2smoother/poe2.bak` under your local app data folder.
+- If the game crashes or won't start, click **Restore**, then verify the game files in Steam or the standalone launcher.
 - If a game update changes the bundle layout, the app may refuse to patch until tiny-poe2smoother is updated.
 
 ## How it works
 
-The app reads the game's Oodle-compressed bundle index (`Bundles2/_.index.bin`), finds the files the selected patches target, and changes them based on file type. It writes the new bundles and index updates atomically, and it saves the original data in the backup that **Restore** uses.
+The app edits the game's bundle files in place and saves the original data to a backup. **Restore** puts it back.
 
 ## Build from source
 
 ```sh
-cargo build --release --bin tiny-poe2smoother
+cargo build --release
 ```
 
 Run `cargo run --release` to start the GUI from source. The Rust version is pinned in [rust-toolchain.toml](rust-toolchain.toml), and rustup installs it for you.
@@ -91,4 +89,4 @@ Linux builds need the GTK3, XCB, and Wayland development libraries. The [Dockerf
 
 The GUI embeds the [Inter](https://github.com/rsms/inter) typeface, licensed under the [SIL Open Font License 1.1](assets/fonts/OFL.txt).
 
-Oodle-compatible compression and decompression comes from [Powzix's ooz](https://github.com/powzix/ooz) (GPL-3). It's vendored under `vendor/ooz/` and statically linked into release binaries. See [vendor/ooz/ATTRIBUTION](vendor/ooz/ATTRIBUTION).
+Oodle-compatible compression and decompression comes from [Powzix's ooz](https://github.com/powzix/ooz) (GPL-3). See [vendor/ooz/ATTRIBUTION](vendor/ooz/ATTRIBUTION).
