@@ -347,7 +347,7 @@ fn draw_minimap_controls(app: &mut GuiApp, ui: &mut egui::Ui) {
                     .step_by(0.01)
                     .show_value(false),
             )
-            .on_hover_text("How strongly unexplored terrain is drawn.");
+            .on_hover_text("How strongly unexplored terrain is drawn. 100% looks fully explored.");
             ui.label(
                 egui::RichText::new(format!("{:.0}%", app.minimap.reveal * 100.0))
                     .size(12.5)

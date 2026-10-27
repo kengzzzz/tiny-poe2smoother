@@ -6,6 +6,9 @@ use std::sync::LazyLock;
 /// what makes walls stand out.
 const EDGE_GAIN: f32 = 12.0;
 
+/// The minimap shaders double visibility, so a floor of 0.5 already looks fully explored.
+const VISIBILITY_GAIN: f32 = 2.0;
+
 const FULLY_REVEALED: &str = "res_color = float4(1.0f, 0.0f, 0.0f, 1.0f);";
 
 static FLOOR_LINE: LazyLock<Regex> =
@@ -29,7 +32,7 @@ pub struct MinimapStyle {
 
 impl MinimapStyle {
     pub const DEFAULT: Self = Self {
-        reveal: 0.18,
+        reveal: 0.36,
         walkable: [0.0, 0.0, 0.0, 0.3],
         edge: [1.0, 1.0, 1.0, 0.1],
     };
@@ -53,7 +56,7 @@ impl Default for MinimapStyle {
 pub(super) fn reveal_floor(text: &str, style: &MinimapStyle) -> String {
     let line = format!(
         "\tres_color = max(res_color, {}f);",
-        hlsl_float(style.reveal)
+        hlsl_float(style.reveal / VISIBILITY_GAIN)
     );
     if let Some(existing) = FLOOR_LINE.find(text) {
         return format!(
@@ -129,6 +132,7 @@ mod tests {
                 ..MinimapStyle::DEFAULT
             },
         );
+        assert!(first.contains("max(res_color, 0.25f)"));
         let second = reveal_floor(&first, &MinimapStyle::DEFAULT);
         assert_eq!(second.matches("max(res_color").count(), 1);
         assert!(second.contains("max(res_color, 0.18f)"));
@@ -143,6 +147,15 @@ mod tests {
         assert!(recolored.contains(
             "lerp(walkable_color, float4(6.0f, 0.0f, 12.0f, 1.0f), walkable_to_edge_ratio)"
         ));
+    }
+
+    #[test]
+    fn full_reveal_writes_the_floor_the_game_shows_as_explored() {
+        let style = MinimapStyle {
+            reveal: 1.0,
+            ..MinimapStyle::DEFAULT
+        };
+        assert!(reveal_floor(VISIBILITY, &style).contains("max(res_color, 0.5f)"));
     }
 
     #[test]
