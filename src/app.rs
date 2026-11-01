@@ -101,14 +101,13 @@ pub fn load_status(game_dir: Option<PathBuf>) -> Result<AppStatus> {
     crate::timing!("load_status_total");
     let game_dir = resolve_game_dir(game_dir)?;
     let mut store = BundleStore::new(&game_dir);
-    let mut index = store.open_index()?;
-    let indexed_paths = index.ensure_paths_built()?.len();
+    let index = store.open_shared_index()?;
+    let indexed_paths = index.paths().len();
     let backup = BackupStore::from_default_location()?;
     let has_backup = backup.has_backup();
     let (patch_state, backup_owner) =
         install_patch_state(&backup, &game_dir, index_is_patched(&index));
     let index_display_path = store.index_display_path();
-    // A second index open peaks near 1.6 GB, so the rows come from this one.
     let mtx_catalog = build_mtx_catalog(index.paths());
 
     Ok(AppStatus {
@@ -129,8 +128,8 @@ pub fn preview_patches(request: PatchRequest) -> Result<PatchPreview> {
     crate::timing!("preview_patches_total");
     let game_dir = resolve_game_dir(request.game_dir)?;
     let mut store = BundleStore::new(&game_dir);
-    let mut index = store.open_index()?;
-    let patch_set = compute_patch_set(&store, &mut index, &request.patches, &request.params)?;
+    let index = store.open_shared_index()?;
+    let patch_set = compute_patch_set(&store, &index, &request.patches, &request.params)?;
 
     Ok(PatchPreview {
         game_dir,
@@ -174,7 +173,7 @@ pub fn apply_patches(request: PatchRequest) -> Result<ApplyReport> {
         index = store.open_index()?;
     }
 
-    let patch_set = compute_patch_set(&store, &mut index, &request.patches, &request.params)?;
+    let patch_set = compute_patch_set(&store, &index, &request.patches, &request.params)?;
 
     if patch_set.changes.is_empty() {
         bail!(
@@ -423,9 +422,8 @@ pub fn find_paths(
 ) -> Result<Vec<PathSearchResult>> {
     let game_dir = resolve_game_dir(game_dir)?;
     let mut store = BundleStore::new(&game_dir);
-    let mut index = store.open_index()?;
+    let index = store.open_shared_index()?;
     let query = query.to_ascii_lowercase();
-    index.ensure_paths_built()?;
 
     Ok(index
         .paths()
@@ -433,7 +431,7 @@ pub fn find_paths(
         .filter(|path| path.to_ascii_lowercase().contains(&query))
         .take(limit)
         .map(|path| PathSearchResult {
-            path: path.clone(),
+            path: path.to_string(),
             has_record: index.file_by_path(path).is_some(),
         })
         .collect())
@@ -445,13 +443,13 @@ pub fn load_stat_catalog(game_dir: Option<PathBuf>) -> Result<Vec<StatCatalogEnt
     const PREFIX: &str = "data/statdescriptions/";
     let game_dir = resolve_game_dir(game_dir)?;
     let mut store = BundleStore::new(&game_dir);
-    let mut index = store.open_index()?;
+    let index = store.open_shared_index()?;
     let entries = index.matching_paths_by(|path| {
         let normalized = path.replace('\\', "/").to_ascii_lowercase();
         normalized
             .strip_prefix(PREFIX)
             .is_some_and(|rest| rest.ends_with(".csd") && !rest.contains('/'))
-    })?;
+    });
     let files: Vec<_> = entries.iter().map(|entry| entry.file).collect();
     let by_hash = store.read_files_batch(&index, &files)?;
 
@@ -484,8 +482,7 @@ pub fn load_effect_skill_catalog(
     crate::timing!("load_effect_skill_catalog_total");
     let game_dir = resolve_game_dir(game_dir)?;
     let mut store = BundleStore::new(&game_dir);
-    let mut index = store.open_index()?;
-    index.ensure_paths_built()?;
+    let index = store.open_shared_index()?;
     skill_catalog_from_index(&store, &index)
 }
 
@@ -495,8 +492,7 @@ pub fn load_other_effect_catalog(
 ) -> Result<Vec<OtherEffectCatalogEntry>> {
     let game_dir = resolve_game_dir(game_dir)?;
     let mut store = BundleStore::new(&game_dir);
-    let mut index = store.open_index()?;
-    index.ensure_paths_built()?;
+    let index = store.open_shared_index()?;
     let skills = skill_catalog_from_index(&store, &index)?;
     Ok(build_other_effect_catalog(index.paths(), &skills))
 }
@@ -533,8 +529,8 @@ pub fn load_monster_effect_catalog(
     crate::timing!("load_monster_effect_catalog_total");
     let game_dir = resolve_game_dir(game_dir)?;
     let mut store = BundleStore::new(&game_dir);
-    let mut index = store.open_index()?;
-    build_monster_effect_catalog(&store, &mut index)
+    let index = store.open_shared_index()?;
+    build_monster_effect_catalog(&store, &index)
 }
 
 pub fn inspect_path(
@@ -544,7 +540,7 @@ pub fn inspect_path(
 ) -> Result<InspectedPath> {
     let game_dir = resolve_game_dir(game_dir)?;
     let mut store = BundleStore::new(&game_dir);
-    let index = store.open_index()?;
+    let index = store.open_shared_index()?;
     let bytes = store.read_file(&index, path)?;
     let limited = bytes.iter().take(byte_limit).copied().collect::<Vec<_>>();
     let text_preview = if bytes.starts_with(&[0xff, 0xfe]) {

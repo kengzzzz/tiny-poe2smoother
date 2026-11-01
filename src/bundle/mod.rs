@@ -8,6 +8,6 @@ mod store;
 pub use compression::{decompress_bundle, decompress_bundle_slices, pack_uncompressed_bundle};
 pub use ggpk::GgpkArchive;
 pub use hashing::filepath_hash;
-pub use index::{BundleFile, BundleIndex, IndexedPath};
+pub use index::{BundleFile, BundleIndex, IndexedPath, PathList};
 pub use replacements::{BundleWriteReport, apply_bundle_replacements, slice_file};
 pub use store::BundleStore;

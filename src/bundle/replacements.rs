@@ -35,8 +35,7 @@ pub fn apply_bundle_replacements(
         .values()
         .flat_map(|items| items.iter().cloned())
         .collect::<Vec<_>>();
-    let file_order = index.file_order_map();
-    sort_edits_by_index_order(&mut edits, &file_order);
+    sort_edits_by_index_order(&mut edits);
 
     for (file, replacement) in edits {
         let new_offset = custom_data.len();
@@ -88,11 +87,8 @@ pub fn apply_bundle_replacements(
     })
 }
 
-fn sort_edits_by_index_order(
-    edits: &mut [(BundleFile, Vec<u8>)],
-    file_order: &HashMap<u64, usize>,
-) {
-    edits.sort_by_key(|(file, _)| file_order.get(&file.hash).copied().unwrap_or(usize::MAX));
+fn sort_edits_by_index_order(edits: &mut [(BundleFile, Vec<u8>)]) {
+    edits.sort_by_key(|(file, _)| file.ordinal);
 }
 
 pub fn slice_file(bundle: &[u8], file: &BundleFile) -> Result<Vec<u8>> {
@@ -113,15 +109,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn replacement_edits_sort_by_index_order_map() {
+    fn replacement_edits_sort_by_index_order() {
+        let file = |hash, ordinal| BundleFile {
+            ordinal,
+            ..BundleFile::for_test_with_hash(hash, 1)
+        };
         let mut edits = vec![
-            (BundleFile::for_test_with_hash(30, 1), b"third".to_vec()),
-            (BundleFile::for_test_with_hash(10, 1), b"first".to_vec()),
-            (BundleFile::for_test_with_hash(20, 1), b"second".to_vec()),
+            (file(30, 2), b"third".to_vec()),
+            (file(10, 0), b"first".to_vec()),
+            (file(20, 1), b"second".to_vec()),
         ];
-        let order = HashMap::from([(10, 0), (20, 1), (30, 2)]);
 
-        sort_edits_by_index_order(&mut edits, &order);
+        sort_edits_by_index_order(&mut edits);
 
         let hashes = edits
             .into_iter()

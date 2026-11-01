@@ -1,5 +1,3 @@
-//! Listing rows reads index paths only, because it runs on every launch.
-
 use super::other_effects::humanize;
 use super::targeting::{
     ends_with_path_ci, is_metadata_effect_ext, is_startup_scene_protected, normalize_path,
@@ -44,8 +42,7 @@ struct RowFiles {
     words: BTreeSet<String>,
 }
 
-/// Compare keys exactly: `foot_prints` holds only loose files, and a prefix match
-/// would also keep `foot_prints/man`.
+/// Compare keys exactly: a prefix match on `foot_prints` also keeps `foot_prints/man`.
 fn mtx_row_key(relative: &str) -> &str {
     let Some((folders, _)) = relative.rsplit_once('/') else {
         return relative;
@@ -72,9 +69,10 @@ fn is_blankable(path: &str) -> bool {
         || ends_with_path_ci(path, ".trl")
 }
 
-pub fn build_mtx_catalog(paths: &[String]) -> Vec<MtxCatalogEntry> {
+pub fn build_mtx_catalog(paths: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<MtxCatalogEntry> {
     let mut rows: BTreeMap<String, RowFiles> = BTreeMap::new();
     for path in paths {
+        let path = path.as_ref();
         if !starts_with_path_ci(path, MTX_PREFIX)
             || !is_metadata_effect_ext(path)
             || is_startup_scene_protected(path)
@@ -124,12 +122,17 @@ fn catalog_entry(folder: String, words: &BTreeSet<String>) -> MtxCatalogEntry {
     }
 }
 
-pub(super) fn kept_mtx_paths(paths: &[String], kept: &[String]) -> BTreeSet<String> {
+pub(super) fn kept_mtx_paths(
+    paths: impl IntoIterator<Item = impl AsRef<str>>,
+    kept: &[String],
+) -> BTreeSet<String> {
     let kept: HashSet<_> = kept.iter().map(String::as_str).collect();
     paths
-        .iter()
-        .filter(|path| starts_with_path_ci(path, MTX_PREFIX) && is_metadata_effect_ext(path))
-        .map(|path| normalize_path(path))
+        .into_iter()
+        .filter(|path| {
+            starts_with_path_ci(path.as_ref(), MTX_PREFIX) && is_metadata_effect_ext(path.as_ref())
+        })
+        .map(|path| normalize_path(path.as_ref()))
         .filter(|path| kept.contains(mtx_row_key(&path[MTX_PREFIX.len()..])))
         .collect()
 }
@@ -224,7 +227,7 @@ mod tests {
 
     #[test]
     fn rows_collect_searchable_words_from_their_file_names() {
-        let rows = build_mtx_catalog(&paths(&[
+        let rows = build_mtx_catalog(paths(&[
             "misc/uniques/berekthetaming/elemental_addon_twister_01.ao",
             "misc/uniques/berekthetaming/fx/fire_addon_01_twister.pet",
             "misc/uniques/berekthetaming/fx/fire_addon_01_twister.mat",

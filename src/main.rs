@@ -728,7 +728,6 @@ impl GuiApp {
             });
         if !fresh {
             let query = gui::search::SearchQuery::parse(&self.mtx_search);
-            // File words match far more rows, so rows matching by name come first.
             let (by_name, by_file): (Vec<_>, Vec<_>) = self
                 .listed_mtx_rows()
                 .filter(|(_, row)| query.matches(&row.file_words, &row.search_lower))

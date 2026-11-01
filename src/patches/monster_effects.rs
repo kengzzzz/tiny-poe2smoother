@@ -87,13 +87,12 @@ type EdgeMap = BTreeMap<String, MonsterEdges>;
 /// Heavy. Runs on a GUI background thread, never during apply.
 pub fn build_monster_effect_catalog(
     store: &BundleStore,
-    index: &mut BundleIndex,
+    index: &BundleIndex,
 ) -> Result<Vec<MonsterEffectCatalogEntry>> {
-    index.ensure_paths_built()?;
     let mut candidates: Vec<(String, BundleFile)> = Vec::new();
     for path in index.paths() {
         if let Some(key) = monster_key_of(path)
-            && let Some(file) = index.file_by_path(path).copied()
+            && let Some(file) = index.file_by_path(path)
         {
             candidates.push((key, file));
         }
@@ -134,7 +133,7 @@ pub fn build_monster_effect_catalog(
 /// Includes low-confidence edges. Keeping an extra file original is safe, missing one is not.
 pub(super) fn resolve_full_monster_effect_paths(
     store: &BundleStore,
-    index: &mut BundleIndex,
+    index: &BundleIndex,
     overrides: &[MonsterEffectOverride],
 ) -> Result<BTreeSet<String>> {
     crate::timing!("resolve_full_monster_effect_paths");
@@ -147,18 +146,17 @@ pub(super) fn resolve_full_monster_effect_paths(
         return Ok(BTreeSet::new());
     }
 
-    index.ensure_paths_built()?;
     // Alias uniqueness needs the full monster-key population.
     let mut all_keys: BTreeSet<String> = BTreeSet::new();
     let mut candidates: Vec<(String, BundleFile)> = Vec::new();
     let mut folder_alias_paths: Vec<&str> = Vec::new();
     for path in index.paths() {
         if is_folder_alias_candidate(path) {
-            folder_alias_paths.push(path.as_str());
+            folder_alias_paths.push(path);
         }
         if let Some(key) = monster_key_of(path) {
             if full_keys.contains(&key)
-                && let Some(file) = index.file_by_path(path).copied()
+                && let Some(file) = index.file_by_path(path)
             {
                 candidates.push((key.clone(), file));
             }
@@ -582,7 +580,7 @@ fn collect_effect_ref_graph(
             if !visited.insert(path.clone()) {
                 continue;
             }
-            if let Some(file) = index.file_by_path(&path).copied() {
+            if let Some(file) = index.file_by_path(&path) {
                 candidates.push((path, file));
             }
         }
@@ -1204,7 +1202,7 @@ other = "Metadata/Effects/utility/epks/off.ao"
             .unwrap();
         }
 
-        let mut index = BundleIndex::for_test_paths(&[
+        let index = BundleIndex::for_test_paths(&[
             (
                 "metadata/monsters/boghulk/boghulk.ot",
                 "wanted",
@@ -1231,7 +1229,7 @@ other = "Metadata/Effects/utility/epks/off.ao"
             },
         ];
 
-        let kept = resolve_full_monster_effect_paths(&store, &mut index, &overrides).unwrap();
+        let kept = resolve_full_monster_effect_paths(&store, &index, &overrides).unwrap();
 
         assert_eq!(
             kept,

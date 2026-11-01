@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.8.0
+
+Choose which MTX effects to remove.
+
+### New
+- MTX editor: click "Edit MTX…" on the MTX effects patch to choose which effects to remove and which to keep. Everything is still removed by default.
+- Search the MTX list by name or by effect file. For example, `twister` finds The Taming.
+
+### Changes
+- A kept MTX effect also keeps the files it uses, even with Effects or Particles on.
+- Skills and monsters kept in the effects editor now also keep any MTX files they use.
+- MTX effects: the description now says it also removes some unique item visuals. This was already the case.
+- Uses much less memory and loads about twice as fast on slow PCs.
+
 ## 0.7.0 - 2026-10-27
 
 A redesigned window, profiles, and new patches.

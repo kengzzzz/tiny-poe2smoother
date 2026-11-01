@@ -169,11 +169,11 @@ pub(super) fn is_shared_effect_folder(folder: &str) -> bool {
     )
 }
 
-pub fn effect_skill_folders(paths: &[String]) -> Vec<String> {
+pub fn effect_skill_folders(paths: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<String> {
     let mut folders: Vec<String> = paths
-        .iter()
-        .filter(|path| is_metadata_effect_ext(path))
-        .filter_map(|path| effect_skill_folder(path))
+        .into_iter()
+        .filter(|path| is_metadata_effect_ext(path.as_ref()))
+        .filter_map(|path| effect_skill_folder(path.as_ref()))
         .collect();
     folders.sort_unstable();
     folders.dedup();
@@ -185,7 +185,7 @@ pub fn build_effect_skill_catalog(
     actiontypes_bytes: &[u8],
     item_visual_effect_bytes: Option<&[u8]>,
     miscanimated_bytes: Option<&[u8]>,
-    paths: &[String],
+    paths: impl IntoIterator<Item = impl AsRef<str>>,
 ) -> Option<Vec<EffectSkillCatalogEntry>> {
     let skills = active_skills_with_actions(activeskills_bytes, actiontypes_bytes)?;
     let valid_folders: BTreeSet<String> = effect_skill_folders(paths)

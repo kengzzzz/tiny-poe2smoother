@@ -39,14 +39,13 @@ fn references(bytes: &[u8]) -> BTreeSet<String> {
 
 pub(super) fn resolve_full_effect_dependencies(
     store: &BundleStore,
-    index: &mut BundleIndex,
+    index: &BundleIndex,
     filter: &EffectsFilter,
 ) -> Result<BTreeSet<String>> {
-    index.ensure_paths_built()?;
     let mut pending: BTreeSet<_> = index
         .paths()
         .iter()
-        .map(|path| normalize_path(path))
+        .map(normalize_path)
         .filter(|path| scannable(path) && filter.level_for(path) == EffectLevel::Full)
         .collect();
     let mut visited = BTreeSet::new();
@@ -61,7 +60,7 @@ pub(super) fn resolve_full_effect_dependencies(
             if !visited.insert(path.clone()) {
                 continue;
             }
-            if let Some(file) = index.file_by_path(&path).copied() {
+            if let Some(file) = index.file_by_path(&path) {
                 candidates.push((path, file));
             }
         }
