@@ -4,7 +4,7 @@ mod gui;
 
 use eframe::egui;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,8 +18,8 @@ use tiny_poe2smoother::app::{
 use tiny_poe2smoother::install::display_path;
 use tiny_poe2smoother::patches::{
     ColorModEntry, EffectLevel, EffectSkillCatalogEntry, EffectSkillOverride, MinimapStyle,
-    MonsterEffectCatalogEntry, MonsterEffectOverride, OtherEffectCatalogEntry, PatchId,
-    PatchOptions, PatchParams, ProfileInfo, all_patches, all_profiles, default_color_mods,
+    MonsterEffectCatalogEntry, MonsterEffectOverride, MtxCatalogEntry, OtherEffectCatalogEntry,
+    PatchId, PatchOptions, PatchParams, ProfileInfo, all_patches, all_profiles, default_color_mods,
     display_stat_text, merge_with_defaults, parse_saved_patches, patch_info,
 };
 
@@ -111,6 +111,12 @@ struct GuiApp {
     other_catalog_dir: Option<PathBuf>,
     others_filter_key: Option<(String, usize)>,
     others_filter_rows: Vec<usize>,
+    kept_mtx: BTreeSet<String>,
+    show_mtx_editor: bool,
+    mtx_search: String,
+    mtx_catalog: Vec<MtxRow>,
+    mtx_filter_key: Option<(String, usize, bool)>,
+    mtx_filter_rows: Vec<usize>,
     monster_overrides: HashMap<String, EffectLevel>,
     monsters_search: String,
     monster_catalog: Option<Vec<MonsterCatalogRow>>,
@@ -178,6 +184,15 @@ struct OtherEffectRow {
     search_lower: String,
 }
 
+struct MtxRow {
+    folder: String,
+    display: String,
+    context: String,
+    display_lower: String,
+    search_lower: String,
+    file_words: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct GuiPrefs {
     game_dir_input: String,
@@ -195,6 +210,8 @@ struct GuiPrefs {
     effect_skills: Vec<EffectSkillOverride>,
     #[serde(default)]
     monster_effects: Vec<MonsterEffectOverride>,
+    #[serde(default)]
+    kept_mtx: Vec<String>,
 }
 
 enum TaskResult {
@@ -246,6 +263,12 @@ impl Default for GuiApp {
             other_catalog_dir: None,
             others_filter_key: None,
             others_filter_rows: Vec::new(),
+            kept_mtx: BTreeSet::new(),
+            show_mtx_editor: false,
+            mtx_search: String::new(),
+            mtx_catalog: Vec::new(),
+            mtx_filter_key: None,
+            mtx_filter_rows: Vec::new(),
             monster_overrides: HashMap::new(),
             monsters_search: String::new(),
             monster_catalog: None,
@@ -406,6 +429,11 @@ impl GuiApp {
             color_mods,
             effect_overrides,
             monster_overrides,
+            kept_mtx: prefs
+                .kept_mtx
+                .into_iter()
+                .map(|folder| folder.to_ascii_lowercase())
+                .collect(),
             ..Self::default()
         }
     }
@@ -426,6 +454,7 @@ impl GuiApp {
             color_mods: self.color_mods.clone(),
             effect_skills: self.effect_skill_overrides(),
             monster_effects: self.monster_effect_overrides(),
+            kept_mtx: self.kept_mtx.iter().cloned().collect(),
         }
     }
 
@@ -503,6 +532,12 @@ impl GuiApp {
                     .to_string(),
             );
         }
+        if patches.contains(&PatchId::MtxSoft) && self.every_mtx_kept() {
+            return Err(
+                "MTX effects is selected but every effect is kept. Use Edit MTX… to check some."
+                    .to_string(),
+            );
+        }
         if let Some(patch) = patches
             .iter()
             .find(|patch| !self.options.any_enabled(**patch))
@@ -522,8 +557,19 @@ impl GuiApp {
                 color_mods: self.color_mods.clone(),
                 effect_skills: self.effect_skill_overrides(),
                 monster_effects: self.monster_effect_overrides(),
+                kept_mtx: self.requested_kept_mtx(),
             },
         })
+    }
+
+    /// A hidden portal row stays saved, but sending it would still protect its references.
+    fn requested_kept_mtx(&self) -> Vec<String> {
+        let portals = self.options.enabled(PatchId::MtxSoft, "town_portals");
+        self.kept_mtx
+            .iter()
+            .filter(|folder| mtx_folder_listed(folder, portals))
+            .cloned()
+            .collect()
     }
 
     fn game_dir(&self) -> Option<PathBuf> {
@@ -657,7 +703,66 @@ impl GuiApp {
 
     fn apply_status(&mut self, status: AppStatus) {
         self.game_dir_input = display_path(&status.game_dir);
+        self.mtx_catalog = mtx_catalog_rows(&status.mtx_catalog);
+        self.mtx_filter_key = None;
         self.status = Some(status);
+    }
+
+    fn listed_mtx_rows(&self) -> impl Iterator<Item = (usize, &MtxRow)> {
+        let portals = self.options.enabled(PatchId::MtxSoft, "town_portals");
+        self.mtx_catalog
+            .iter()
+            .enumerate()
+            .filter(move |(_, row)| mtx_folder_listed(&row.folder, portals))
+    }
+
+    fn refresh_mtx_filter(&mut self) {
+        let portals = self.options.enabled(PatchId::MtxSoft, "town_portals");
+        let fresh = self
+            .mtx_filter_key
+            .as_ref()
+            .is_some_and(|(query, catalog, listed_portals)| {
+                *query == self.mtx_search
+                    && *catalog == self.mtx_catalog.len()
+                    && *listed_portals == portals
+            });
+        if !fresh {
+            let query = gui::search::SearchQuery::parse(&self.mtx_search);
+            // File words match far more rows, so rows matching by name come first.
+            let (by_name, by_file): (Vec<_>, Vec<_>) = self
+                .listed_mtx_rows()
+                .filter(|(_, row)| query.matches(&row.file_words, &row.search_lower))
+                .partition(|(_, row)| query.matches(&row.search_lower, &row.display_lower));
+            self.mtx_filter_rows = by_name
+                .into_iter()
+                .chain(by_file)
+                .map(|(idx, _)| idx)
+                .collect();
+            self.mtx_filter_key = Some((self.mtx_search.clone(), self.mtx_catalog.len(), portals));
+        }
+    }
+
+    fn set_filtered_mtx_kept(&mut self, kept: bool) {
+        self.refresh_mtx_filter();
+        for &idx in &self.mtx_filter_rows {
+            let folder = &self.mtx_catalog[idx].folder;
+            if kept {
+                self.kept_mtx.insert(folder.clone());
+            } else {
+                self.kept_mtx.remove(folder);
+            }
+        }
+    }
+
+    fn kept_original_mtx_count(&self) -> usize {
+        self.listed_mtx_rows()
+            .filter(|(_, row)| self.kept_mtx.contains(&row.folder))
+            .count()
+    }
+
+    fn every_mtx_kept(&self) -> bool {
+        let mut listed = self.listed_mtx_rows().peekable();
+        listed.peek().is_some() && listed.all(|(_, row)| self.kept_mtx.contains(&row.folder))
     }
 
     /// Overrides survive. Only the catalog and its caches reset.
@@ -1531,6 +1636,25 @@ fn other_effect_catalog_rows(entries: Vec<OtherEffectCatalogEntry>) -> Vec<Other
         .collect()
 }
 
+fn mtx_folder_listed(folder: &str, portals: bool) -> bool {
+    portals || !folder.starts_with("town_portals/")
+}
+
+fn mtx_catalog_rows(entries: &[MtxCatalogEntry]) -> Vec<MtxRow> {
+    entries
+        .iter()
+        .map(|entry| MtxRow {
+            search_lower: format!("{} {} {}", entry.display, entry.context, entry.folder)
+                .to_lowercase(),
+            display_lower: entry.display.to_lowercase(),
+            folder: entry.folder.clone(),
+            display: entry.display.clone(),
+            context: entry.context.clone(),
+            file_words: entry.file_words.clone(),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1546,6 +1670,7 @@ mod tests {
             has_backup: true,
             patch_state: tiny_poe2smoother::app::PatchState::Patched,
             backup_owner: None,
+            mtx_catalog: Vec::new(),
         }
     }
 
@@ -1830,29 +1955,29 @@ mod tests {
         );
     }
 
+    #[derive(Default)]
+    struct TestStorage {
+        values: HashMap<String, String>,
+    }
+
+    impl eframe::Storage for TestStorage {
+        fn get_string(&self, key: &str) -> Option<String> {
+            self.values.get(key).cloned()
+        }
+
+        fn set_string(&mut self, key: &str, value: String) {
+            self.values.insert(key.to_string(), value);
+        }
+
+        fn remove_string(&mut self, key: &str) {
+            self.values.remove(key);
+        }
+
+        fn flush(&mut self) {}
+    }
+
     #[test]
     fn legacy_effect_level_pref_deserializes_to_default() {
-        #[derive(Default)]
-        struct TestStorage {
-            values: HashMap<String, String>,
-        }
-
-        impl eframe::Storage for TestStorage {
-            fn get_string(&self, key: &str) -> Option<String> {
-                self.values.get(key).cloned()
-            }
-
-            fn set_string(&mut self, key: &str, value: String) {
-                self.values.insert(key.to_string(), value);
-            }
-
-            fn remove_string(&mut self, key: &str) {
-                self.values.remove(key);
-            }
-
-            fn flush(&mut self) {}
-        }
-
         let old_level = concat!("hid", "den");
         let mut storage = TestStorage::default();
         eframe::set_value(
@@ -1879,6 +2004,201 @@ mod tests {
         let app = GuiApp::from_prefs(prefs);
         assert!(app.effect_overrides.is_empty());
         assert!(app.prefs().effect_skills.is_empty());
+    }
+
+    fn mtx_app(folders: &[&str]) -> GuiApp {
+        let entries: Vec<_> = folders
+            .iter()
+            .map(|folder| MtxCatalogEntry {
+                folder: folder.to_string(),
+                display: folder.to_string(),
+                context: String::new(),
+                file_words: String::new(),
+            })
+            .collect();
+        GuiApp {
+            mtx_catalog: mtx_catalog_rows(&entries),
+            ..GuiApp::default()
+        }
+    }
+
+    #[test]
+    fn prefs_round_trip_kept_mtx_and_load_without_the_field() {
+        let app = GuiApp::from_prefs(GuiPrefs {
+            zoom: 2.4,
+            kept_mtx: vec!["Misc/Uniques/BerekTheTaming".to_string()],
+            ..GuiPrefs::default()
+        });
+        assert_eq!(app.prefs().kept_mtx, ["misc/uniques/berekthetaming"]);
+
+        let mut storage = TestStorage::default();
+        eframe::set_value(&mut storage, PREFS_KEY, &GuiPrefs::default());
+        let saved = storage.values.get_mut(PREFS_KEY).unwrap();
+        assert!(saved.contains("kept_mtx"));
+        *saved = saved.replace(",kept_mtx:[]", "");
+        assert!(!saved.contains("kept_mtx"));
+
+        let prefs = eframe::get_value::<GuiPrefs>(&storage, PREFS_KEY).unwrap();
+        assert!(prefs.kept_mtx.is_empty());
+    }
+
+    #[test]
+    fn patch_request_embeds_kept_mtx_in_a_stable_order() {
+        let mut app = mtx_app(&["spells/b", "spells/a", "spells/c"]);
+        app.selected_patches = HashSet::from([PatchId::MtxSoft]);
+        app.kept_mtx.insert("spells/b".to_string());
+        app.kept_mtx.insert("spells/a".to_string());
+
+        let request = app.patch_request().unwrap();
+
+        assert_eq!(request.params.kept_mtx, ["spells/a", "spells/b"]);
+    }
+
+    #[test]
+    fn patch_request_rejects_mtx_with_every_listed_row_kept() {
+        let mut app = mtx_app(&["spells/a", "town_portals/blue"]);
+        app.selected_patches = HashSet::from([PatchId::MtxSoft]);
+        app.kept_mtx.insert("spells/a".to_string());
+        assert!(app.every_mtx_kept());
+        assert!(
+            app.patch_request()
+                .unwrap_err()
+                .contains("every effect is kept")
+        );
+
+        app.options.set(PatchId::MtxSoft, "town_portals", true);
+        assert!(app.patch_request().is_ok());
+
+        app.options.set(PatchId::MtxSoft, "town_portals", false);
+        app.selected_patches = HashSet::from([PatchId::Shadow]);
+        assert!(app.patch_request().is_ok());
+    }
+
+    #[test]
+    fn patch_request_does_not_block_mtx_before_the_list_loads() {
+        let app = GuiApp {
+            selected_patches: HashSet::from([PatchId::MtxSoft]),
+            ..GuiApp::default()
+        };
+        assert!(!app.every_mtx_kept());
+        assert!(app.patch_request().is_ok());
+    }
+
+    #[test]
+    fn mtx_portal_rows_are_listed_only_when_portals_are_stripped() {
+        let mut app = mtx_app(&["spells/a", "town_portals/blue"]);
+        app.kept_mtx.insert("town_portals/blue".to_string());
+        app.kept_mtx.insert("removed/by_a_patch".to_string());
+
+        app.refresh_mtx_filter();
+        assert_eq!(app.mtx_filter_rows, [0]);
+        assert_eq!(app.kept_original_mtx_count(), 0);
+
+        app.options.set(PatchId::MtxSoft, "town_portals", true);
+        app.refresh_mtx_filter();
+        assert_eq!(app.mtx_filter_rows, [0, 1]);
+        assert_eq!(app.kept_original_mtx_count(), 1);
+    }
+
+    #[test]
+    fn hidden_portal_rows_stay_saved_but_leave_the_request() {
+        let mut app = mtx_app(&["spells/a", "town_portals/blue"]);
+        app.selected_patches = HashSet::from([PatchId::MtxSoft]);
+        app.kept_mtx.insert("town_portals/blue".to_string());
+        app.kept_mtx.insert("removed/by_a_patch".to_string());
+
+        let request = app.patch_request().unwrap();
+        assert_eq!(request.params.kept_mtx, ["removed/by_a_patch"]);
+        assert_eq!(
+            app.prefs().kept_mtx,
+            ["removed/by_a_patch", "town_portals/blue"]
+        );
+
+        app.options.set(PatchId::MtxSoft, "town_portals", true);
+        let request = app.patch_request().unwrap();
+        assert_eq!(
+            request.params.kept_mtx,
+            ["removed/by_a_patch", "town_portals/blue"]
+        );
+    }
+
+    #[test]
+    fn kept_rows_stay_in_the_request_before_the_list_loads() {
+        let mut app = GuiApp {
+            selected_patches: HashSet::from([PatchId::MtxSoft]),
+            ..GuiApp::default()
+        };
+        app.kept_mtx.insert("spells/a".to_string());
+
+        assert_eq!(app.patch_request().unwrap().params.kept_mtx, ["spells/a"]);
+    }
+
+    #[test]
+    fn mtx_search_finds_file_words_and_ranks_name_matches_first() {
+        let entry = |folder: &str, file_words: &str| MtxCatalogEntry {
+            folder: folder.to_string(),
+            display: folder.to_string(),
+            context: String::new(),
+            file_words: file_words.to_string(),
+        };
+        let mut app = GuiApp {
+            mtx_catalog: mtx_catalog_rows(&[
+                entry("misc/uniques/berekthetaming", "addon fire twister"),
+                entry("spells/huntress/bodachmoth", "twister web"),
+                entry("spells/fireball/demonic", "impact"),
+            ]),
+            ..GuiApp::default()
+        };
+
+        app.mtx_search = "twister".to_string();
+        app.refresh_mtx_filter();
+        assert_eq!(app.mtx_filter_rows, [0, 1]);
+
+        app.mtx_search = "fire".to_string();
+        app.refresh_mtx_filter();
+        assert_eq!(app.mtx_filter_rows, [2, 0]);
+
+        app.mtx_search = "huntress twister".to_string();
+        app.refresh_mtx_filter();
+        assert_eq!(app.mtx_filter_rows, [1]);
+
+        app.mtx_search = "twister !fire".to_string();
+        app.refresh_mtx_filter();
+        assert_eq!(app.mtx_filter_rows, [1]);
+    }
+
+    #[test]
+    fn mtx_bulk_actions_only_touch_filtered_rows() {
+        let mut app = mtx_app(&["spells/a", "spells/b", "pets/c"]);
+        app.mtx_search = "spells".to_string();
+
+        app.set_filtered_mtx_kept(true);
+        assert_eq!(app.prefs().kept_mtx, ["spells/a", "spells/b"]);
+
+        app.mtx_search = "spells/a".to_string();
+        app.set_filtered_mtx_kept(false);
+        assert_eq!(app.prefs().kept_mtx, ["spells/b"]);
+    }
+
+    #[test]
+    fn apply_status_replaces_the_mtx_list_and_keeps_saved_rows() {
+        let mut app = mtx_app(&["spells/old"]);
+        app.kept_mtx.insert("spells/old".to_string());
+        app.refresh_mtx_filter();
+        let mut status = patched_status(PathBuf::from("install"));
+        status.mtx_catalog = vec![MtxCatalogEntry {
+            folder: "spells/new".to_string(),
+            display: "New".to_string(),
+            context: "Spells".to_string(),
+            file_words: String::new(),
+        }];
+
+        app.apply_status(status);
+        app.refresh_mtx_filter();
+
+        assert_eq!(app.mtx_catalog[0].folder, "spells/new");
+        assert_eq!(app.mtx_filter_rows, [0]);
+        assert_eq!(app.prefs().kept_mtx, ["spells/old"]);
     }
 
     #[test]

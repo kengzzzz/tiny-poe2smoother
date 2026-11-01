@@ -124,6 +124,7 @@ pub struct PatchParams {
     /// The name stays for saved preferences.
     pub effect_skills: Vec<EffectSkillOverride>,
     pub monster_effects: Vec<MonsterEffectOverride>,
+    pub kept_mtx: Vec<String>,
 }
 
 impl Default for PatchParams {
@@ -135,6 +136,7 @@ impl Default for PatchParams {
             color_mods: default_color_mods(),
             effect_skills: Vec::new(),
             monster_effects: Vec::new(),
+            kept_mtx: Vec::new(),
         }
     }
 }
@@ -211,7 +213,7 @@ pub fn all_patches() -> &'static [PatchInfo] {
             id: PatchId::MtxSoft,
             name: "mtx-soft",
             title: "MTX effects",
-            description: "Remove microtransaction effects and particles.",
+            description: "Remove microtransaction effects and particles, plus some unique item visuals.",
         },
         PatchInfo {
             id: PatchId::DisableSounds,

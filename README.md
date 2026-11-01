@@ -13,7 +13,7 @@ Pick a profile or choose patches yourself. Patches with sub-options expand when 
 | Camera & Map | Camera zoom (1.2× to 2.4×), minimap reveal with custom colors, no Atlas fog of war |
 | Environment | Fog, rain, clouds, weather particles, bloom, shadows, lighting |
 | Screen | No vignette, depth of field, or chill and low life filters. Black screen mode that keeps the UI |
-| Effects | Fewer skill and monster effects, particles, and Delirium. No MTX effects |
+| Effects | Fewer skill and monster effects, particles, and Delirium. No MTX effects, which also covers some unique item visuals |
 | Audio | Mute effect sounds, or only skill or monster sounds |
 | Interface | Colored mod text, compact Alt tooltips (English client), always visible health bars |
 
@@ -21,6 +21,7 @@ Also:
 
 - Clarity, Balanced, and Performance profiles.
 - An effects editor to keep chosen skills and monsters looking original.
+- An MTX editor to choose which effects to remove and which to keep. Search by name or effect file, for example `twister`.
 - A color editor for mod text on waystones, items, and tablets. Search supports `fire|cold`, `"quoted phrases"`, and `!monster`.
 - Finds Steam and standalone installs, and remembers your settings.
 - Makes a backup before patching.

@@ -81,7 +81,7 @@ fn display_folder(folder: &str) -> String {
     }
 }
 
-fn humanize(value: &str) -> String {
+pub(super) fn humanize(value: &str) -> String {
     value
         .split(['_', '/', '\\'])
         .filter(|word| !word.is_empty())

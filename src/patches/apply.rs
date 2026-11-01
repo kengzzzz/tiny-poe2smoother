@@ -3,6 +3,7 @@ use super::color_mods::ColorMatcher;
 use super::effect_dependencies::resolve_full_effect_dependencies;
 use super::effect_skills::EffectsFilter;
 use super::monster_effects::resolve_full_monster_effect_paths;
+use super::mtx_effects::kept_mtx_paths;
 use super::targeting::{
     effects_targets_path, exact_patch_targets, patch_applies_path, patch_targets_path,
 };
@@ -25,13 +26,22 @@ pub fn compute_patch_set(
     // Only resolved when needed so the default path skips the extra reads.
     let protects_visuals =
         patches.contains(&PatchId::Effects) || patches.contains(&PatchId::Particles);
-    let full_monster_paths = if protects_visuals {
+    let mut full_paths = if protects_visuals {
         resolve_full_monster_effect_paths(store, index, &params.monster_effects)?
     } else {
         BTreeSet::new()
     };
-    let mut effects_filter = EffectsFilter::new(&params.effect_skills, full_monster_paths);
-    if protects_visuals && let Some(filter) = effects_filter.as_mut() {
+    let keeps_mtx = patches.contains(&PatchId::MtxSoft) && !params.kept_mtx.is_empty();
+    if keeps_mtx {
+        full_paths.extend(kept_mtx_paths(
+            index.ensure_paths_built()?,
+            &params.kept_mtx,
+        ));
+    }
+    let mut effects_filter = EffectsFilter::new(&params.effect_skills, full_paths);
+    if (protects_visuals || keeps_mtx)
+        && let Some(filter) = effects_filter.as_mut()
+    {
         let dependencies = resolve_full_effect_dependencies(store, index, filter)?;
         filter.protect_paths(dependencies);
     }

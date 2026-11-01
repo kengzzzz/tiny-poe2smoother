@@ -6,10 +6,10 @@ use crate::install::{
 };
 use crate::patches::{
     ACTIONTYPES_DATC64_PATH, ACTIVESKILLS_DATC64_PATH, EffectSkillCatalogEntry,
-    ITEM_VISUAL_EFFECT_DATC64_PATH, MonsterEffectCatalogEntry, OtherEffectCatalogEntry,
-    PatchChange, PatchId, PatchParams, StatCatalogEntry, build_effect_skill_catalog,
-    build_monster_effect_catalog, build_other_effect_catalog, compute_patch_set,
-    parse_stat_catalog,
+    ITEM_VISUAL_EFFECT_DATC64_PATH, MonsterEffectCatalogEntry, MtxCatalogEntry,
+    OtherEffectCatalogEntry, PatchChange, PatchId, PatchParams, StatCatalogEntry,
+    build_effect_skill_catalog, build_monster_effect_catalog, build_mtx_catalog,
+    build_other_effect_catalog, compute_patch_set, parse_stat_catalog,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use rayon::prelude::*;
@@ -51,6 +51,7 @@ pub struct AppStatus {
     pub has_backup: bool,
     pub patch_state: PatchState,
     pub backup_owner: Option<PathBuf>,
+    pub mtx_catalog: Vec<MtxCatalogEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +108,8 @@ pub fn load_status(game_dir: Option<PathBuf>) -> Result<AppStatus> {
     let (patch_state, backup_owner) =
         install_patch_state(&backup, &game_dir, index_is_patched(&index));
     let index_display_path = store.index_display_path();
+    // A second index open peaks near 1.6 GB, so the rows come from this one.
+    let mtx_catalog = build_mtx_catalog(index.paths());
 
     Ok(AppStatus {
         game_dir,
@@ -118,6 +121,7 @@ pub fn load_status(game_dir: Option<PathBuf>) -> Result<AppStatus> {
         has_backup,
         patch_state,
         backup_owner,
+        mtx_catalog,
     })
 }
 
