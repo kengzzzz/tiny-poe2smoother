@@ -713,7 +713,7 @@ pub(super) fn storage_bundle_path(bundle_name: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     use std::path::Path;
@@ -1400,7 +1400,16 @@ mod tests {
         crate::bundle::pack_uncompressed_bundle(&raw).unwrap()
     }
 
-    fn write_test_ggpk_files(path: &Path, dir_name: &str, files: &[(&str, &[u8])]) {
+    pub(crate) fn patch_test_ggpk(game: &Path, bundle_name: &str, index: &[u8]) -> GgpkBackupMeta {
+        let store = BundleStore::new(game);
+        let plan = store
+            .prepare_ggpk_patch(bundle_name, b"new-bundle", index)
+            .unwrap();
+        store.apply_ggpk_patch(&plan).unwrap();
+        plan.backup
+    }
+
+    pub(crate) fn write_test_ggpk_files(path: &Path, dir_name: &str, files: &[(&str, &[u8])]) {
         let root_pdir_size = pdir_record_size("", 1);
         let dir_pdir_size = pdir_record_size(dir_name, files.len());
         let root_offset = 20u64;

@@ -11,3 +11,6 @@ pub use hashing::filepath_hash;
 pub use index::{BundleFile, BundleIndex, IndexedPath, PathList};
 pub use replacements::{BundleWriteReport, apply_bundle_replacements, slice_file};
 pub use store::BundleStore;
+
+#[cfg(test)]
+pub(crate) use store::tests as store_tests;

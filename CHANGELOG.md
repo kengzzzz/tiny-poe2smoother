@@ -14,6 +14,9 @@ Choose which MTX effects to remove.
 - MTX effects: the description now says it also removes some unique item visuals. This was already the case.
 - Uses much less memory and loads about twice as fast on slow PCs.
 
+### Fixes
+- Standalone client: Restore no longer says "No backup found" after it worked.
+
 ## 0.7.0 - 2026-10-27
 
 A redesigned window, profiles, and new patches.

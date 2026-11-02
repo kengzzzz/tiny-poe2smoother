@@ -287,16 +287,19 @@ fn restore_backup_with_store(game_dir: PathBuf, backup: BackupStore) -> Result<R
             detect_install_layout(&game_dir)?,
             InstallLayout::ContentGgpk
         );
+        let mut restored_ggpk_index = 0;
         if overlay_restore && let Some(meta) = ggpk_backup_meta(&entries)? {
             let index_display_path = store.index_display_path();
             store.restore_ggpk_backup(meta).map_err(|err| {
                 anyhow!("failed to restore {index_display_path}.\n  Cause: {err:#}")
             })?;
             store.remove_legacy_overlay_files()?;
+            restored_ggpk_index = 1;
         }
-        backup
-            .restore(&entries, &game_dir, overlay_restore)
-            .with_context(|| format!("restore from {} failed", backup.path().display()))?
+        restored_ggpk_index
+            + backup
+                .restore(&entries, &game_dir, overlay_restore)
+                .with_context(|| format!("restore from {} failed", backup.path().display()))?
     } else {
         eprintln!("No backup found at {}", backup.path().display());
         0
@@ -607,6 +610,37 @@ mod tests {
         assert_eq!(report.restored_files, 0);
         assert!(report.backup_removed);
         assert!(!backup.has_backup());
+    }
+
+    #[test]
+    fn ggpk_restore_counts_the_restored_index() {
+        use crate::bundle::store_tests::{patch_test_ggpk, write_test_ggpk_files};
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game");
+        fs::create_dir_all(&game).unwrap();
+        let original = test_index_bytes(&[]);
+        write_test_ggpk_files(
+            &game.join("Content.ggpk"),
+            "Bundles2",
+            &[("_.index.bin", original.as_slice())],
+        );
+        let meta = patch_test_ggpk(
+            &game,
+            "TinyPoe2Smoother_0",
+            &test_index_bytes(&["TinyPoe2Smoother_0"]),
+        );
+        let backup = BackupStore::for_path(temp.path().join("poe2.bak"));
+        backup.ensure_ggpk_backup_meta(&game, meta).unwrap();
+
+        let report = restore_backup_with_store(game.clone(), backup.clone()).unwrap();
+
+        assert_eq!(report.restored_files, 1);
+        assert!(report.backup_removed);
+        assert!(!backup.has_backup());
+        assert_eq!(
+            BundleStore::new(&game).read_index_bytes().unwrap(),
+            original
+        );
     }
 
     #[test]
