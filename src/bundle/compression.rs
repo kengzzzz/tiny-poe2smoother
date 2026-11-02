@@ -278,27 +278,45 @@ pub fn pack_uncompressed_bundle(data: &[u8]) -> Result<Vec<u8>> {
         .par_chunks(BUNDLE_CHUNK_SIZE)
         .map(compress_chunk)
         .collect::<Result<Vec<_>>>()?;
+    write_bundle(data.len(), &chunks)
+}
 
+/// Like `pack_uncompressed_bundle` on the calling thread only, for background work that
+/// shouldn't take the shared thread pool from the GUI's loaders.
+pub fn pack_bundle_serial(data: &[u8]) -> Result<Vec<u8>> {
+    let chunks = data
+        .chunks(BUNDLE_CHUNK_SIZE)
+        .map(compress_chunk)
+        .collect::<Result<Vec<_>>>()?;
+    write_bundle(data.len(), &chunks)
+}
+
+/// Reads only the header, so callers can bound the allocation before decompressing.
+pub fn bundle_uncompressed_size(src: &[u8]) -> Result<usize> {
+    Ok(parse_bundle_head(src)?.uncompressed_size)
+}
+
+fn write_bundle(data_len: usize, chunks: &[Vec<u8>]) -> Result<Vec<u8>> {
     let compressed_len: usize = chunks.iter().map(Vec::len).sum();
     let head_size = BUNDLE_FIXED_HEAD_SIZE_AFTER_PREFIX + 4 * chunks.len();
     let total_file_size = 12 + head_size + compressed_len;
     let mut out = Vec::with_capacity(total_file_size);
-    out.write_u32::<LittleEndian>(u32::try_from(data.len())?)?;
+    out.write_u32::<LittleEndian>(u32::try_from(data_len)?)?;
     out.write_u32::<LittleEndian>(u32::try_from(compressed_len)?)?;
     out.write_u32::<LittleEndian>(u32::try_from(head_size)?)?;
     out.write_u32::<LittleEndian>(OODLE_MERMAID_COMPRESSOR)?;
     out.write_u32::<LittleEndian>(1)?;
-    out.write_u64::<LittleEndian>(data.len() as u64)?;
+    out.write_u64::<LittleEndian>(data_len as u64)?;
     out.write_u64::<LittleEndian>(compressed_len as u64)?;
     out.write_u32::<LittleEndian>(u32::try_from(chunks.len())?)?;
     out.write_u32::<LittleEndian>(BUNDLE_CHUNK_SIZE as u32)?;
     for _ in 0..4 {
         out.write_u32::<LittleEndian>(0)?;
     }
-    for chunk in &chunks {
+    for chunk in chunks {
         out.write_u32::<LittleEndian>(u32::try_from(chunk.len())?)?;
     }
-    for chunk in &chunks {
+    for chunk in chunks {
         out.extend_from_slice(chunk);
     }
     Ok(out)

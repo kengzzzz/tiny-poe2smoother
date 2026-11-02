@@ -14,6 +14,7 @@ Choose which MTX effects to remove.
 - MTX effects: the description now says it also removes some unique item visuals. This was already the case.
 - Uses much less memory and starts up to three times faster on slow PCs, even right after a game update.
 - Apply, Restore, and the effect editors also use much less memory.
+- Uses less disk space.
 
 ### Fixes
 - Standalone client: Restore no longer says "No backup found" after it worked.

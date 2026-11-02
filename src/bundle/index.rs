@@ -88,15 +88,33 @@ impl<'a> Iterator for PathIter<'a> {
 }
 
 impl PathList {
+    #[cfg(test)]
     pub(super) fn from_text(text: String) -> Option<Self> {
-        (text.is_empty() || text.ends_with('\0')).then(|| Self {
-            len: text.bytes().filter(|byte| *byte == 0).count(),
-            blocks: vec![text],
+        let (block, len) = Self::checked_block(text)?;
+        Some(Self::from_blocks(vec![block], len))
+    }
+
+    /// Returns the block and its path count if every path in it ends with a NUL.
+    pub(super) fn checked_block(text: String) -> Option<(String, usize)> {
+        (text.is_empty() || text.ends_with('\0')).then(|| {
+            let len = text.bytes().filter(|byte| *byte == 0).count();
+            (text, len)
         })
+    }
+
+    /// `blocks` must come from `checked_block`, and `len` is the sum of their counts.
+    pub(super) fn from_blocks(blocks: Vec<String>, len: usize) -> Self {
+        Self { blocks, len }
     }
 
     pub(super) fn blocks(&self) -> &[String] {
         &self.blocks
+    }
+
+    /// Splits the paths into one block each, like a large parallel build.
+    #[cfg(test)]
+    pub(crate) fn split_blocks_for_test(&mut self) {
+        self.blocks = self.iter().map(|path| format!("{path}\0")).collect();
     }
 
     #[cfg(test)]
@@ -306,6 +324,11 @@ impl BundleIndex {
 
     pub fn paths(&self) -> &PathList {
         &self.paths
+    }
+
+    #[cfg(test)]
+    pub(crate) fn paths_mut_for_test(&mut self) -> &mut PathList {
+        &mut self.paths
     }
 
     pub fn matching_paths_by<F>(&self, mut predicate: F) -> Vec<IndexedPath>

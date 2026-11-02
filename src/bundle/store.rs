@@ -1,5 +1,6 @@
 use super::compression::{
-    OOZ_SAFE_SPACE, decompress_bundle, visit_bundle_slices, visit_bundle_slices_from,
+    OOZ_SAFE_SPACE, bundle_uncompressed_size, decompress_bundle, pack_bundle_serial,
+    visit_bundle_slices, visit_bundle_slices_from,
 };
 use super::ggpk::{
     GgpkArchive, GgpkFileSpan, GgpkPatchPlan, GgpkPdirEntry, ggpk_file_record, ggpk_find_file,
@@ -17,7 +18,7 @@ use std::convert::TryFrom;
 use std::fs;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
@@ -40,7 +41,7 @@ struct CacheKey {
     mtime: u128,
 }
 
-const CACHE_MAGIC: &[u8; 4] = b"2SI5";
+const CACHE_MAGIC: &[u8; 4] = b"2SI6";
 const CACHE_MIGRATION_MARKER: &str = "index-cache-v3.migrated";
 
 static SHARED_INDEX: Mutex<Option<(CacheKey, Weak<BundleIndex>)>> = Mutex::new(None);
@@ -171,12 +172,63 @@ fn parse_index_cache(mut reader: impl Read, len: u64, key: &CacheKey) -> Option<
         return None;
     }
     let raw_decompressed = read_cache_section(&mut reader, &mut remaining)?;
-    let path_text = read_cache_section(&mut reader, &mut remaining)?;
+    // Path text runs about 1.8x the raw index, so this only stops absurd headers.
+    let text_budget = (raw_decompressed.len() as u64).saturating_mul(4);
+    let paths = read_path_blocks(&mut reader, &mut remaining, text_budget)?;
     if remaining != 0 {
         return None;
     }
-    let paths = PathList::from_text(String::from_utf8(path_text).ok()?)?;
     BundleIndex::with_paths(raw_decompressed, paths).ok()
+}
+
+/// Reads the compressed path blocks and decodes each one on the pool while the next is
+/// read, so only a few compressed blocks are held at once.
+fn read_path_blocks(
+    reader: &mut impl Read,
+    remaining: &mut u64,
+    mut text_budget: u64,
+) -> Option<PathList> {
+    *remaining = remaining.checked_sub(4)?;
+    let count = reader.read_u32::<LittleEndian>().ok()? as usize;
+    if count as u64 > *remaining / 8 {
+        return None;
+    }
+    let slots: Vec<OnceLock<Option<(String, usize)>>> =
+        std::iter::repeat_with(OnceLock::new).take(count).collect();
+    let all_read = rayon::in_place_scope(|scope| {
+        for slot in &slots {
+            let Some(packed) = read_cache_section(reader, remaining) else {
+                return false;
+            };
+            let Some(size) = bundle_uncompressed_size(&packed)
+                .ok()
+                .and_then(|size| u64::try_from(size).ok())
+                .filter(|&size| size <= text_budget)
+            else {
+                return false;
+            };
+            text_budget -= size;
+            scope.spawn(move |_| {
+                let block = decompress_bundle(&packed)
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+                    .and_then(PathList::checked_block);
+                let _ = slot.set(block);
+            });
+        }
+        true
+    });
+    if !all_read {
+        return None;
+    }
+    let mut blocks = Vec::with_capacity(count);
+    let mut len = 0;
+    for slot in slots {
+        let (block, block_len) = slot.into_inner()??;
+        blocks.push(block);
+        len += block_len;
+    }
+    Some(PathList::from_blocks(blocks, len))
 }
 
 fn write_index_cache(
@@ -189,10 +241,13 @@ fn write_index_cache(
     writer.write_u64::<LittleEndian>(key.size)?;
     writer.write_u128::<LittleEndian>(key.mtime)?;
     write_cache_section(writer, &index.raw_decompressed)?;
+    // Paths compress about 4x, which halves what every cached start reads.
     let blocks = index.paths().blocks();
-    writer.write_u64::<LittleEndian>(blocks.iter().map(|block| block.len() as u64).sum())?;
+    writer
+        .write_u32::<LittleEndian>(u32::try_from(blocks.len()).map_err(std::io::Error::other)?)?;
     for block in blocks {
-        writer.write_all(block.as_bytes())?;
+        let packed = pack_bundle_serial(block.as_bytes()).map_err(std::io::Error::other)?;
+        write_cache_section(writer, &packed)?;
     }
     Ok(())
 }
@@ -987,6 +1042,39 @@ pub(crate) mod tests {
         let second = cached.file_by_path("Metadata/Second.dat").unwrap();
         assert_eq!(second.size, 4);
         assert_eq!(cached.bundle_name(second.bundle_index).unwrap(), "second");
+    }
+
+    #[test]
+    fn index_cache_keeps_the_order_of_many_path_blocks() {
+        let key = test_key();
+        let mut index = BundleIndex::for_test_paths(&[
+            ("Metadata/First.dat", "first", 3),
+            ("Metadata/Second.dat", "second", 4),
+            ("Metadata/Third.dat", "third", 5),
+        ]);
+        index.paths_mut_for_test().split_blocks_for_test();
+        let mut bytes = Vec::new();
+        write_index_cache(&mut bytes, &index, &key).unwrap();
+
+        let cached = parse_cache_bytes(&bytes, &key).unwrap();
+
+        assert_eq!(cached_paths(&cached), cached_paths(&index));
+        assert_eq!(cached.paths().len(), 3);
+    }
+
+    #[test]
+    fn path_block_with_an_absurd_size_is_rejected_before_decoding() {
+        let key = test_key();
+        let index = BundleIndex::for_test_paths(&[("Metadata/First.dat", "first", 3)]);
+        let mut bytes = Vec::new();
+        write_index_cache(&mut bytes, &index, &key).unwrap();
+        let packed = pack_bundle_serial(b"Metadata/First.dat\0").unwrap();
+        let block_start = bytes.len() - packed.len();
+        assert_eq!(&bytes[block_start..], packed.as_slice());
+        // The 64-bit uncompressed size sits 20 bytes into the bundle header.
+        bytes[block_start + 20..block_start + 28].copy_from_slice(&(1u64 << 40).to_le_bytes());
+
+        assert!(parse_cache_bytes(&bytes, &key).is_none());
     }
 
     #[test]
