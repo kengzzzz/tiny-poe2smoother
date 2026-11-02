@@ -1,4 +1,6 @@
-use super::compression::{decompress_bundle, decompress_bundle_slices};
+use super::compression::{
+    OOZ_SAFE_SPACE, decompress_bundle, visit_bundle_slices, visit_bundle_slices_from,
+};
 use super::ggpk::{
     GgpkArchive, GgpkFileSpan, GgpkPatchPlan, GgpkPdirEntry, ggpk_file_record, ggpk_find_file,
     ggpk_find_pdir, ggpk_name_hash, ggpk_pdir_record,
@@ -16,7 +18,8 @@ use std::fs;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
-use std::time::SystemTime;
+use std::thread::JoinHandle;
+use std::time::{Duration, SystemTime};
 
 #[derive(Clone)]
 pub struct BundleStore {
@@ -186,18 +189,166 @@ fn write_index_cache(
     writer.write_u64::<LittleEndian>(key.size)?;
     writer.write_u128::<LittleEndian>(key.mtime)?;
     write_cache_section(writer, &index.raw_decompressed)?;
-    write_cache_section(writer, index.paths().text().as_bytes())
+    let blocks = index.paths().blocks();
+    writer.write_u64::<LittleEndian>(blocks.iter().map(|block| block.len() as u64).sum())?;
+    for block in blocks {
+        writer.write_all(block.as_bytes())?;
+    }
+    Ok(())
 }
 
-fn write_cache_file(
-    path: &std::path::Path,
-    tmp: &std::path::Path,
-    write: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
-) {
-    let result = write(tmp).and_then(|_| fs::rename(tmp, path));
-    if result.is_err() {
-        let _ = fs::remove_file(tmp);
+const CACHE_TEMP_SUFFIX: &str = ".tps-tmp";
+/// A temp this old was left by a killed app, since a live writer keeps touching it.
+const STALE_CACHE_TEMP_AGE: Duration = Duration::from_secs(60);
+
+static CACHE_WRITES: Mutex<Vec<(PathBuf, JoinHandle<()>)>> = Mutex::new(Vec::new());
+
+fn cache_writes() -> MutexGuard<'static, Vec<(PathBuf, JoinHandle<()>)>> {
+    CACHE_WRITES.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn source_key(source_path: &std::path::Path, source: &str) -> Result<CacheKey> {
+    let meta = fs::metadata(source_path)?;
+    let mtime = meta
+        .modified()?
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_nanos();
+    Ok(CacheKey {
+        source: source.to_string(),
+        size: meta.len(),
+        mtime,
+    })
+}
+
+/// A cache write that runs after the index is returned. It holds no game file handle or
+/// mapping, so Apply and Restore can still rewrite or truncate game data while it runs.
+struct CacheWrite {
+    source_path: PathBuf,
+    key: CacheKey,
+    path: PathBuf,
+    index: Arc<BundleIndex>,
+}
+
+impl CacheWrite {
+    fn spawn(self) {
+        let mut writes = cache_writes();
+        writes.retain(|(_, handle)| !handle.is_finished());
+        if writes.iter().any(|(path, _)| *path == self.path) {
+            return;
+        }
+        let path = self.path.clone();
+        let spawned = std::thread::Builder::new()
+            .name("index-cache-write".into())
+            .spawn(move || {
+                if let Err(err) = self.write() {
+                    tracing::debug!("index cache not written: {err:#}");
+                }
+            });
+        if let Ok(handle) = spawned {
+            writes.push((path, handle));
+        }
     }
+
+    fn write(&self) -> Result<()> {
+        let dir = self
+            .path
+            .parent()
+            .ok_or_else(|| anyhow!("cache path has no parent"))?;
+        fs::create_dir_all(dir)?;
+        retire_legacy_caches(dir);
+        remove_stale_cache_temps(dir, &self.path, STALE_CACHE_TEMP_AGE);
+        if cache_file_key(&self.path).as_ref() == Some(&self.key) {
+            return Ok(());
+        }
+        publish_cache(
+            &self.path,
+            |file| {
+                let mut writer = BufWriter::new(file);
+                write_index_cache(&mut writer, &self.index, &self.key)?;
+                writer.flush()
+            },
+            // The game may have updated while writing, so don't publish a stale snapshot.
+            || {
+                source_key(&self.source_path, &self.key.source)
+                    .ok()
+                    .as_ref()
+                    == Some(&self.key)
+            },
+        )
+    }
+}
+
+/// Writes a random-named temp next to `path`, syncs it, and renames it over `path` only
+/// if `still_valid` holds. Readers see the old file or the whole new one, never a part.
+fn publish_cache(
+    path: &std::path::Path,
+    write: impl FnOnce(&mut fs::File) -> std::io::Result<()>,
+    still_valid: impl FnOnce() -> bool,
+) -> Result<()> {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        bail!("not a file path: {}", path.display());
+    };
+    let mut temp = tempfile::Builder::new()
+        .prefix(&format!(".{}.", name.to_string_lossy()))
+        .suffix(CACHE_TEMP_SUFFIX)
+        .tempfile_in(dir)?;
+    write(temp.as_file_mut())?;
+    temp.as_file().sync_all()?;
+    if !still_valid() {
+        bail!("game data changed while caching");
+    }
+    temp.persist(path)?;
+    Ok(())
+}
+
+/// Removes temps left by killed writes of this cache, including the older `.tmp<pid>` names.
+fn remove_stale_cache_temps(dir: &std::path::Path, path: &std::path::Path, min_age: Duration) {
+    let (Some(name), Some(stem)) = (path.file_name(), path.file_stem()) else {
+        return;
+    };
+    let temp_prefix = format!(".{}.", name.to_string_lossy());
+    let old_prefix = format!("{}.tmp", stem.to_string_lossy());
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        let ours = (file_name.starts_with(&temp_prefix) && file_name.ends_with(CACHE_TEMP_SUFFIX))
+            || file_name
+                .strip_prefix(&old_prefix)
+                .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()));
+        let old_enough = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= min_age);
+        if ours && old_enough {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Reads only the header, so a matching cache is not rewritten.
+fn cache_file_key(path: &std::path::Path) -> Option<CacheKey> {
+    let mut reader = std::io::BufReader::new(fs::File::open(path).ok()?);
+    let mut magic = [0u8; 4];
+    reader.read_exact(&mut magic).ok()?;
+    if &magic != CACHE_MAGIC {
+        return None;
+    }
+    let source_len = reader.read_u64::<LittleEndian>().ok()?;
+    if source_len > 1 << 16 {
+        return None;
+    }
+    let mut source = vec![0; source_len as usize];
+    reader.read_exact(&mut source).ok()?;
+    Some(CacheKey {
+        source: String::from_utf8(source).ok()?,
+        size: reader.read_u64::<LittleEndian>().ok()?,
+        mtime: reader.read_u128::<LittleEndian>().ok()?,
+    })
 }
 
 impl BundleStore {
@@ -294,27 +445,36 @@ impl BundleStore {
         (key_before == key_after).then_some(index)
     }
 
-    fn write_cache(&self, index: &BundleIndex, source_key: &CacheKey) {
-        retire_legacy_caches(&self.cache_dir);
-        if self.cache_key().ok().flatten().as_ref() != Some(source_key) {
-            return;
+    fn source_path(&self) -> Option<PathBuf> {
+        if matches!(self.layout, InstallLayout::ContentGgpk) {
+            Some(self.content_path.clone())
+        } else {
+            self.index_path.exists().then(|| self.index_path.clone())
         }
-        let path = self.cache_path();
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
+    }
+
+    fn cache_write(&self, index: Arc<BundleIndex>, key: &CacheKey) -> Option<CacheWrite> {
+        Some(CacheWrite {
+            source_path: self.source_path()?,
+            key: key.clone(),
+            path: self.cache_path(),
+            index,
+        })
+    }
+
+    #[cfg(test)]
+    fn write_cache(&self, index: BundleIndex, key: &CacheKey) {
+        if let Some(job) = self.cache_write(Arc::new(index), key) {
+            let _ = job.write();
         }
-        // Write-then-rename so readers never see a torn file.
-        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-        write_cache_file(&path, &tmp, |tmp| {
-            let mut writer = BufWriter::new(fs::File::create(tmp)?);
-            write_index_cache(&mut writer, index, source_key)?;
-            writer.flush()?;
-            // The game may have updated while serializing, so don't publish a stale snapshot.
-            if self.cache_key().ok().flatten().as_ref() != Some(source_key) {
-                return Err(std::io::Error::other("game data changed while caching"));
-            }
-            Ok(())
-        });
+    }
+
+    /// Waits for background cache writes. Short-lived tools call this before exiting.
+    pub fn flush_cache_writes() {
+        let writes = std::mem::take(&mut *cache_writes());
+        for (_, handle) in writes {
+            let _ = handle.join();
+        }
     }
 
     pub fn clear_cache(&self) {
@@ -333,43 +493,30 @@ impl BundleStore {
         }
     }
 
+    /// For Apply and Restore. It always rebuilds from the game files and never reads the
+    /// cache, so cached bytes can't end up in the game index.
     pub fn open_index(&mut self) -> Result<BundleIndex> {
-        crate::timing!("index_read");
-        let source_key_before = self.refresh_source_snapshot()?;
-        if let Some(cached) = self.read_cache() {
-            self.ensure_source_unchanged(&source_key_before, "loading")?;
-            tracing::debug!("using cached index metadata");
-            return Ok(cached);
-        }
-        // Collapse concurrent misses into one rebuild. Late callers re-read the cache.
-        static REBUILD_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = REBUILD_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-        let source_key_before = self.refresh_source_snapshot()?;
-        if let Some(cached) = self.read_cache() {
-            self.ensure_source_unchanged(&source_key_before, "loading")?;
-            tracing::debug!("using index metadata cached by concurrent rebuild");
-            return Ok(cached);
-        }
+        let source_key = self.refresh_source_snapshot()?;
+        self.rebuild_index(&source_key)
+    }
+
+    fn rebuild_index(&self, source_key: &Option<CacheKey>) -> Result<BundleIndex> {
+        crate::timing!("index_rebuild");
         let bytes = self.read_index_bytes()?;
-        crate::timing!("index_decompress");
         let decompressed =
             decompress_bundle(&bytes).context("failed to decompress bundle index")?;
         drop(bytes);
-        crate::timing!("index_parse");
         let index = BundleIndex::parse(decompressed)?;
-        self.ensure_source_unchanged(&source_key_before, "building")?;
-        if let Some(source_key) = source_key_before.as_ref() {
-            self.write_cache(&index, source_key);
-        }
-        self.ensure_source_unchanged(&source_key_before, "caching")?;
+        self.ensure_source_unchanged(source_key, "building")?;
         Ok(index)
     }
 
-    /// Overlapping readers share one index, freed when the last one drops it.
+    /// Overlapping readers share one index, freed when the last one drops it. A miss
+    /// returns as soon as the index is built and writes the cache in the background.
     pub fn open_shared_index(&mut self) -> Result<Arc<BundleIndex>> {
         let mut shared = shared_index();
         let Some(key) = self.refresh_source_snapshot()? else {
-            return self.open_index().map(Arc::new);
+            return self.rebuild_index(&None).map(Arc::new);
         };
         if let Some((held_key, held)) = shared.as_ref()
             && *held_key == key
@@ -377,7 +524,20 @@ impl BundleStore {
         {
             return Ok(index);
         }
-        let index = Arc::new(self.open_index()?);
+        let source_key = Some(key.clone());
+        let index = match self.read_cache() {
+            Some(cached) => {
+                self.ensure_source_unchanged(&source_key, "loading")?;
+                Arc::new(cached)
+            }
+            None => {
+                let index = Arc::new(self.rebuild_index(&source_key)?);
+                if let Some(job) = self.cache_write(index.clone(), &key) {
+                    job.spawn();
+                }
+                index
+            }
+        };
         *shared = Some((key, Arc::downgrade(&index)));
         Ok(index)
     }
@@ -403,18 +563,8 @@ impl BundleStore {
         let file = index
             .file_by_path(path)
             .ok_or_else(|| anyhow!("path not found in bundle index: {path}"))?;
-        let bundle_name = index.bundle_name(file.bundle_index)?;
-        let compressed = self
-            .read_storage_file_cow(&storage_bundle_path(bundle_name))
-            .with_context(|| format!("failed to read {}", self.bundle_display_path(bundle_name)))?;
-        let mut slices = decompress_bundle_slices(&compressed, &[(file.offset, file.size)])
-            .with_context(|| {
-                format!(
-                    "failed to decompress {}",
-                    self.bundle_display_path(bundle_name)
-                )
-            })?;
-        Ok(slices.pop().expect("one span requested"))
+        let mut bytes = self.visit_files_batch(index, &[file], |_, bytes| Ok(bytes))?;
+        Ok(bytes.pop().expect("one file requested"))
     }
 
     pub fn read_bundle(&self, bundle_name: &str) -> Result<Vec<u8>> {
@@ -456,33 +606,81 @@ impl BundleStore {
         index: &BundleIndex,
         files: &[BundleFile],
     ) -> Result<HashMap<u64, Vec<u8>>> {
-        let mut by_bundle: HashMap<u32, Vec<&BundleFile>> = HashMap::new();
-        for file in files {
-            by_bundle.entry(file.bundle_index).or_default().push(file);
+        let bytes = self.visit_files_batch(index, files, |_, bytes| Ok(bytes))?;
+        Ok(files.iter().map(|file| file.hash).zip(bytes).collect())
+    }
+
+    /// Calls `visit` with each file's index in `files` and its bytes, as soon as they are
+    /// decoded, and returns the results in the order of `files`.
+    pub fn visit_files_batch<T: Send>(
+        &self,
+        index: &BundleIndex,
+        files: &[BundleFile],
+        visit: impl Fn(usize, Vec<u8>) -> Result<T> + Sync,
+    ) -> Result<Vec<T>> {
+        let mut by_bundle: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (i, file) in files.iter().enumerate() {
+            by_bundle.entry(file.bundle_index).or_default().push(i);
         }
         let groups: Vec<_> = by_bundle.into_iter().collect();
-        let per_bundle: Vec<Vec<(u64, Vec<u8>)>> = groups
+        let per_bundle: Vec<Vec<(usize, Result<T>)>> = groups
             .par_iter()
-            .map(|(bundle_index, files)| {
+            .map(|(bundle_index, members)| {
                 let name = index.bundle_name(*bundle_index)?;
-                let compressed = self
-                    .read_storage_file_cow(&storage_bundle_path(name))
-                    .with_context(|| {
-                        format!("failed to read {}", self.bundle_display_path(name))
-                    })?;
-                let spans: Vec<(u32, u32)> =
-                    files.iter().map(|file| (file.offset, file.size)).collect();
-                let slices = decompress_bundle_slices(&compressed, &spans).with_context(|| {
+                let spans: Vec<(u32, u32)> = members
+                    .iter()
+                    .map(|&i| (files[i].offset, files[i].size))
+                    .collect();
+                let mut out = Vec::with_capacity(members.len());
+                let collect = |k: usize, bytes| {
+                    let i = members[k];
+                    out.push((i, visit(i, bytes)));
+                };
+                let decoded = if matches!(self.layout, InstallLayout::ContentGgpk) {
+                    let compressed = self
+                        .read_storage_file_cow(&storage_bundle_path(name))
+                        .with_context(|| {
+                            format!("failed to read {}", self.bundle_display_path(name))
+                        })?;
+                    visit_bundle_slices(&compressed, &spans, collect)
+                } else {
+                    // Loose bundles are read in parts, so only the needed chunks hit the disk.
+                    let path = self.bundle_path(name);
+                    let mut file = fs::File::open(&path)
+                        .with_context(|| format!("failed to read {}", path.display()))?;
+                    let len = file.metadata()?.len();
+                    visit_bundle_slices_from(
+                        usize::try_from(len)?,
+                        |offset, len| {
+                            // Zeroed slack after the data, in case Oodle reads a little past
+                            // the end of a chunk.
+                            let mut buf = vec![0; len + OOZ_SAFE_SPACE];
+                            file.seek(SeekFrom::Start(offset as u64))?;
+                            file.read_exact(&mut buf[..len])?;
+                            buf.truncate(len);
+                            Ok(std::borrow::Cow::Owned(buf))
+                        },
+                        &spans,
+                        collect,
+                    )
+                };
+                decoded.with_context(|| {
                     format!("failed to decompress {}", self.bundle_display_path(name))
                 })?;
-                Ok(files
-                    .iter()
-                    .zip(slices)
-                    .map(|(file, bytes)| (file.hash, bytes))
-                    .collect())
+                Ok(out)
             })
             .collect::<Result<_>>()?;
-        Ok(per_bundle.into_iter().flatten().collect())
+        let mut slots: Vec<Option<T>> = std::iter::repeat_with(|| None).take(files.len()).collect();
+        for (i, result) in per_bundle.into_iter().flatten() {
+            slots[i] = Some(result?);
+        }
+        slots
+            .into_iter()
+            .zip(files)
+            .map(|(slot, file)| {
+                slot.ok_or_else(|| anyhow!("no bytes decoded for file {:016x}", file.hash))
+            })
+            .collect()
     }
 
     fn read_storage_file(&self, rel_path: &str) -> Result<Vec<u8>> {
@@ -828,14 +1026,17 @@ pub(crate) mod tests {
         fs::write(game.join("Content.ggpk"), b"updated-ggpk").unwrap();
         assert_ne!(store.cache_key().unwrap().unwrap(), source_key_before);
 
-        store.write_cache(&stale_index, &source_key_before);
+        store.write_cache(stale_index, &source_key_before);
 
         assert!(!store.cache_path().exists());
         assert!(store.read_cache().is_none());
     }
 
     #[test]
-    fn open_index_remaps_replaced_content_before_caching() {
+    fn shared_open_remaps_replaced_content_before_caching() {
+        let _slot = SHARED_SLOT_TESTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let temp = tempfile::tempdir().unwrap();
         let game = temp.path().join("game");
         fs::create_dir_all(&game).unwrap();
@@ -847,8 +1048,10 @@ pub(crate) mod tests {
         );
         let mut store = BundleStore::new_with_cache_dir(game.clone(), temp.path().join("cache"));
 
-        let old = store.open_index().unwrap();
+        let old = store.open_shared_index().unwrap();
         assert!(old.has_bundle_prefix("old"));
+        drop(old);
+        BundleStore::flush_cache_writes();
 
         let replacement = game.join("Content.replacement.ggpk");
         write_test_ggpk(
@@ -859,13 +1062,37 @@ pub(crate) mod tests {
         fs::remove_file(&content).unwrap();
         fs::rename(replacement, &content).unwrap();
 
-        let rebuilt = store.open_index().unwrap();
+        let rebuilt = store.open_shared_index().unwrap();
         assert!(rebuilt.has_bundle_prefix("replacement"));
         assert!(!rebuilt.has_bundle_prefix("old"));
+        drop(rebuilt);
+        BundleStore::flush_cache_writes();
 
-        let cached = store.open_index().unwrap();
+        let cached = store.read_cache().expect("background write should publish");
         assert!(cached.has_bundle_prefix("replacement"));
         assert!(!cached.has_bundle_prefix("old"));
+    }
+
+    #[test]
+    fn owned_open_never_reads_the_cache() {
+        let _slot = SHARED_SLOT_TESTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let temp = tempfile::tempdir().unwrap();
+        let (mut store, _) = loose_store(temp.path(), "real");
+        // A cache with the right key but other content, like a damaged or forged file.
+        let key = store.cache_key().unwrap().unwrap();
+        let forged =
+            BundleIndex::parse(decompress_bundle(&test_index_bytes(&["forged"])).unwrap()).unwrap();
+        store.write_cache(forged, &key);
+
+        assert!(store.open_index().unwrap().has_bundle_prefix("real"));
+        assert!(
+            store
+                .open_shared_index()
+                .unwrap()
+                .has_bundle_prefix("forged")
+        );
     }
 
     /// Keeps other tests from replacing the single shared slot mid-test.
@@ -909,6 +1136,8 @@ pub(crate) mod tests {
 
         let freed = Arc::downgrade(&held[0]);
         drop(held);
+        // The background cache write holds the index until the file is written.
+        BundleStore::flush_cache_writes();
         assert!(freed.upgrade().is_none());
     }
 
@@ -1071,7 +1300,7 @@ pub(crate) mod tests {
             let index = BundleIndex::for_test_paths(&[("Metadata/Test.dat", "test", 3)]);
             let source_key = direct.cache_key().unwrap().unwrap();
 
-            direct.write_cache(&index, &source_key);
+            direct.write_cache(index, &source_key);
             assert!(!cache_dir.join("index-cache.bin").exists());
             assert!(cache_dir.join(CACHE_MIGRATION_MARKER).exists());
             assert!(direct.cache_path().exists());
@@ -1216,44 +1445,120 @@ pub(crate) mod tests {
         assert_eq!(direct.cache_path(), alternate_store.cache_path());
     }
 
-    #[test]
-    fn failed_cache_write_removes_partial_temp_file() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("index-cache.bin");
-        let tmp = temp.path().join("index-cache.tmp");
-
-        write_cache_file(&path, &tmp, |tmp| {
-            fs::write(tmp, b"partial cache")?;
-            Err(std::io::Error::other("injected write failure"))
-        });
-
-        assert!(!tmp.exists());
-        assert!(!path.exists());
+    fn dir_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
     }
 
     #[test]
-    fn failed_cache_rename_removes_temp_file() {
+    fn failed_cache_write_removes_its_temp_file() {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("index-cache.bin");
-        let tmp = temp.path().join("index-cache.tmp");
-        fs::create_dir(&path).unwrap();
+        let path = temp.path().join("index-cache-v3-0000000000000000.bin");
 
-        write_cache_file(&path, &tmp, |tmp| fs::write(tmp, b"complete cache"));
+        let result = publish_cache(
+            &path,
+            |file| {
+                file.write_all(b"partial cache")?;
+                Err(std::io::Error::other("injected write failure"))
+            },
+            || true,
+        );
 
-        assert!(!tmp.exists());
-        assert!(path.is_dir());
+        assert!(result.is_err());
+        assert!(dir_names(temp.path()).is_empty());
     }
 
     #[test]
-    fn successful_cache_write_leaves_final_file() {
+    fn changed_source_stops_the_publish_and_removes_the_temp_file() {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("index-cache.bin");
-        let tmp = temp.path().join("index-cache.tmp");
+        let path = temp.path().join("index-cache-v3-0000000000000000.bin");
+        fs::write(&path, b"previous cache").unwrap();
 
-        write_cache_file(&path, &tmp, |tmp| fs::write(tmp, b"complete cache"));
+        let result = publish_cache(&path, |file| file.write_all(b"stale cache"), || false);
 
-        assert!(!tmp.exists());
-        assert_eq!(fs::read(path).unwrap(), b"complete cache");
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"previous cache");
+        assert_eq!(
+            dir_names(temp.path()),
+            ["index-cache-v3-0000000000000000.bin"]
+        );
+    }
+
+    #[test]
+    fn successful_cache_write_leaves_only_the_final_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("index-cache-v3-0000000000000000.bin");
+
+        publish_cache(&path, |file| file.write_all(b"complete cache"), || true).unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"complete cache");
+        assert_eq!(
+            dir_names(temp.path()),
+            ["index-cache-v3-0000000000000000.bin"]
+        );
+    }
+
+    #[test]
+    fn only_old_temps_of_this_cache_are_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("index-cache-v3-0000000000000000.bin");
+        let names = [
+            ".index-cache-v3-0000000000000000.bin.a1b2c3.tps-tmp",
+            "index-cache-v3-0000000000000000.tmp4242",
+            ".index-cache-v3-0000000000000000.bin.young1.tps-tmp",
+            ".index-cache-v3-1111111111111111.bin.other1.tps-tmp",
+            "index-cache-v3-0000000000000000.bin",
+        ];
+        for name in names {
+            fs::write(temp.path().join(name), b"x").unwrap();
+        }
+        let old = SystemTime::now() - Duration::from_secs(600);
+        for name in [names[0], names[1], names[3], names[4]] {
+            fs::File::options()
+                .write(true)
+                .open(temp.path().join(name))
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+
+        remove_stale_cache_temps(temp.path(), &path, STALE_CACHE_TEMP_AGE);
+
+        assert_eq!(
+            dir_names(temp.path()),
+            [
+                ".index-cache-v3-0000000000000000.bin.young1.tps-tmp",
+                ".index-cache-v3-1111111111111111.bin.other1.tps-tmp",
+                "index-cache-v3-0000000000000000.bin",
+            ]
+        );
+    }
+
+    #[test]
+    fn shared_miss_writes_the_cache_after_returning() {
+        let _slot = SHARED_SLOT_TESTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let temp = tempfile::tempdir().unwrap();
+        let (mut store, _) = loose_store(temp.path(), "first");
+
+        let index = store.open_shared_index().unwrap();
+        BundleStore::flush_cache_writes();
+        let key = store.cache_key().unwrap().unwrap();
+        assert_eq!(cache_file_key(&store.cache_path()), Some(key));
+        drop(index);
+
+        let cached = store.read_cache().expect("cache should be readable");
+        assert!(cached.has_bundle_prefix("first"));
+        assert_eq!(
+            dir_names(&temp.path().join("cache")).len(),
+            2,
+            "cache and migration marker only"
+        );
     }
 
     #[test]

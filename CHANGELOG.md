@@ -12,7 +12,8 @@ Choose which MTX effects to remove.
 - A kept MTX effect also keeps the files it uses, even with Effects or Particles on.
 - Skills and monsters kept in the effects editor now also keep any MTX files they use.
 - MTX effects: the description now says it also removes some unique item visuals. This was already the case.
-- Uses much less memory and loads about twice as fast on slow PCs.
+- Uses much less memory and starts up to three times faster on slow PCs, even right after a game update.
+- Apply, Restore, and the effect editors also use much less memory.
 
 ### Fixes
 - Standalone client: Restore no longer says "No backup found" after it worked.

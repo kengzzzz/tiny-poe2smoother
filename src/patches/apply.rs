@@ -9,8 +9,7 @@ use super::targeting::{
 };
 use super::transform::{TransformCtx, transform};
 use crate::bundle::{BundleFile, BundleIndex, BundleStore};
-use anyhow::{Result, anyhow, bail};
-use rayon::prelude::*;
+use anyhow::{Result, bail};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 pub fn compute_patch_set(
@@ -52,40 +51,23 @@ pub fn compute_patch_set(
     let candidates = collect_patch_targets(index, &patches, effects_filter.as_ref())?;
     let candidates = dedup_candidates(candidates);
 
-    crate::timing!("bundle_batch_read");
+    crate::timing!("bundle_read_transform");
     let files: Vec<BundleFile> = candidates.iter().map(|(_, file)| *file).collect();
-    let mut by_hash = store.read_files_batch(index, &files)?;
-    let file_data: Vec<Vec<u8>> = candidates
-        .iter()
-        .map(|(path, file)| {
-            by_hash
-                .remove(&file.hash)
-                .ok_or_else(|| anyhow!("patch target bytes missing after read: {path}"))
-        })
-        .collect::<Result<_>>()?;
-
-    crate::timing!("patch_transform");
-    let transformed = candidates
-        .par_iter()
-        .zip(file_data.into_par_iter())
-        .map(
-            |((path, _), mut bytes)| -> Result<(String, Vec<u8>, bool)> {
-                let mut changed = false;
-                for &patch in &patches {
-                    if patch_applies_path(patch, path) {
-                        let after = transform(patch, path, &bytes, ctx)?;
-                        if after != bytes {
-                            bytes = after;
-                            changed = true;
-                        }
-                    }
+    // Transform each file as it is decoded, so only changed bytes stay in memory.
+    let transformed = store.visit_files_batch(index, &files, |i, mut bytes| {
+        let path = &candidates[i].0;
+        let mut changed = false;
+        for &patch in &patches {
+            if patch_applies_path(patch, path) {
+                let after = transform(patch, path, &bytes, ctx)?;
+                if after != bytes {
+                    bytes = after;
+                    changed = true;
                 }
-                Ok((path.clone(), bytes, changed))
-            },
-        )
-        .collect::<Vec<_>>()
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?;
+            }
+        }
+        Ok(changed.then_some(bytes))
+    })?;
 
     build_patch_set_from_transformed(index, &candidates, transformed)
 }
@@ -183,18 +165,15 @@ pub(crate) fn unique_patches(patches: &[PatchId]) -> Vec<PatchId> {
 fn build_patch_set_from_transformed(
     index: &BundleIndex,
     candidates: &[(String, BundleFile)],
-    transformed: Vec<(String, Vec<u8>, bool)>,
+    transformed: Vec<Option<Vec<u8>>>,
 ) -> Result<PatchSet> {
     let mut changes = Vec::new();
     let mut replacements: HashMap<String, Vec<(BundleFile, Vec<u8>)>> = HashMap::new();
-    for ((candidate_path, file), (path, bytes, changed)) in candidates.iter().zip(transformed) {
-        if candidate_path != &path {
-            bail!("transformed patch target order mismatch: {candidate_path} != {path}");
-        }
-        if changed {
+    for ((path, file), bytes) in candidates.iter().zip(transformed) {
+        if let Some(bytes) = bytes {
             let bundle_name = index.bundle_name(file.bundle_index)?;
             changes.push(PatchChange {
-                path,
+                path: path.clone(),
                 bundle_name: bundle_name.to_string(),
                 old_size: file.size as usize,
                 new_size: bytes.len(),
@@ -225,7 +204,7 @@ fn build_patch_set_from_changed(
         if *changed.get(path).unwrap_or(&false) {
             let bytes = file_data
                 .remove(path)
-                .ok_or_else(|| anyhow!("changed patch target bytes missing: {path}"))?;
+                .ok_or_else(|| anyhow::anyhow!("changed patch target bytes missing: {path}"))?;
             let bundle_name = index.bundle_name(file.bundle_index)?;
             changes.push(PatchChange {
                 path: path.clone(),

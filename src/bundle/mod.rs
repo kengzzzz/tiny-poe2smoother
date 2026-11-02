@@ -5,7 +5,10 @@ mod index;
 mod replacements;
 mod store;
 
-pub use compression::{decompress_bundle, decompress_bundle_slices, pack_uncompressed_bundle};
+pub use compression::{
+    decompress_bundle, decompress_bundle_slices, pack_uncompressed_bundle, visit_bundle_slices,
+    visit_bundle_slices_from,
+};
 pub use ggpk::GgpkArchive;
 pub use hashing::filepath_hash;
 pub use index::{BundleFile, BundleIndex, IndexedPath, PathList};

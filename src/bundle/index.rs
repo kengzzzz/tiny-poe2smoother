@@ -2,6 +2,7 @@ use super::compression::{decompress_bundle, pack_uncompressed_bundle};
 use super::hashing::{HashMode, hash_path};
 use anyhow::{Context, Result, anyhow, bail};
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt, WriteBytesExt};
+use rayon::prelude::*;
 use std::convert::TryFrom;
 use std::io::Cursor;
 
@@ -60,28 +61,52 @@ pub struct IndexedPath {
     pub file: BundleFile,
 }
 
-/// One NUL-terminated blob, because 4.27M `String`s fragment the heap.
+/// NUL-terminated paths in a few large blocks, because 4.27M `String`s fragment the heap.
+/// Blocks let the build run in parallel without a second full copy.
 #[derive(Debug, Clone, Default)]
 pub struct PathList {
-    text: String,
+    blocks: Vec<String>,
     len: usize,
+}
+
+pub struct PathIter<'a> {
+    blocks: std::slice::Iter<'a, String>,
+    current: std::str::SplitTerminator<'a, char>,
+}
+
+impl<'a> Iterator for PathIter<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        loop {
+            if let Some(path) = self.current.next() {
+                return Some(path);
+            }
+            self.current = self.blocks.next()?.split_terminator('\0');
+        }
+    }
 }
 
 impl PathList {
     pub(super) fn from_text(text: String) -> Option<Self> {
         (text.is_empty() || text.ends_with('\0')).then(|| Self {
             len: text.bytes().filter(|byte| *byte == 0).count(),
-            text,
+            blocks: vec![text],
         })
     }
 
-    pub(super) fn text(&self) -> &str {
-        &self.text
+    pub(super) fn blocks(&self) -> &[String] {
+        &self.blocks
     }
 
+    #[cfg(test)]
     fn push(&mut self, path: &str) {
-        self.text.push_str(path);
-        self.text.push('\0');
+        if self.blocks.is_empty() {
+            self.blocks.push(String::new());
+        }
+        let block = self.blocks.last_mut().expect("block added above");
+        block.push_str(path);
+        block.push('\0');
         self.len += 1;
     }
 
@@ -93,14 +118,17 @@ impl PathList {
         self.len == 0
     }
 
-    pub fn iter(&self) -> std::str::SplitTerminator<'_, char> {
-        self.text.split_terminator('\0')
+    pub fn iter(&self) -> PathIter<'_> {
+        PathIter {
+            blocks: self.blocks.iter(),
+            current: "".split_terminator('\0'),
+        }
     }
 }
 
 impl<'a> IntoIterator for &'a PathList {
     type Item = &'a str;
-    type IntoIter = std::str::SplitTerminator<'a, char>;
+    type IntoIter = PathIter<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
@@ -393,31 +421,65 @@ fn build_file_slots(records: &[u8], bundle_count: usize) -> Result<Vec<u32>> {
     Ok(slots)
 }
 
+/// Directory bytes per parallel block, about 9 MB of paths.
+const PATH_BLOCK_SOURCE_BYTES: usize = 4 << 20;
+
 fn build_paths_from_directories(bytes: &[u8], directories: &[u8]) -> Result<PathList> {
-    let mut paths = PathList {
-        // Paths run about 2.1x the directory bytes.
-        text: String::with_capacity(bytes.len() * 3),
-        len: 0,
-    };
-    for directory in directories.as_chunks::<DIRECTORY_RECORD_SIZE>().0 {
+    let records = directories.as_chunks::<DIRECTORY_RECORD_SIZE>().0;
+    let range = |directory: &[u8; DIRECTORY_RECORD_SIZE]| {
         let start = LittleEndian::read_u32(&directory[8..]) as usize;
-        let end = start + LittleEndian::read_u32(&directory[12..]) as usize;
-        if end > bytes.len() {
+        start..start + LittleEndian::read_u32(&directory[12..]) as usize
+    };
+    let mut groups = Vec::new();
+    let mut group_start = 0;
+    let mut group_bytes = 0;
+    for (i, directory) in records.iter().enumerate() {
+        let range = range(directory);
+        if range.end > bytes.len() {
             bail!("directory path data exceeds decompressed directory bundle");
         }
-        build_paths(&bytes[start..end], &mut paths)?;
+        group_bytes += range.len();
+        if group_bytes >= PATH_BLOCK_SOURCE_BYTES {
+            groups.push(&records[group_start..=i]);
+            group_start = i + 1;
+            group_bytes = 0;
+        }
     }
-    paths.text.shrink_to_fit();
-    Ok(paths)
+    if group_start < records.len() {
+        groups.push(&records[group_start..]);
+    }
+
+    let blocks = groups
+        .par_iter()
+        .map(|group| {
+            let source: usize = group.iter().map(|directory| range(directory).len()).sum();
+            // Paths run about 2.1x the directory bytes.
+            let mut block = String::with_capacity(source * 5 / 2);
+            let mut count = 0;
+            for directory in *group {
+                count += build_paths(&bytes[range(directory)], &mut block)?;
+            }
+            block.shrink_to_fit();
+            Ok((block, count))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let len = blocks.iter().map(|(_, count)| count).sum();
+    Ok(PathList {
+        blocks: blocks.into_iter().map(|(block, _)| block).collect(),
+        len,
+    })
 }
 
-fn build_paths(bytes: &[u8], files: &mut PathList) -> Result<()> {
-    let mut cursor = Cursor::new(bytes);
+/// Appends this directory's paths to `out` and returns how many it added.
+fn build_paths(bytes: &[u8], out: &mut String) -> Result<usize> {
+    let mut pos = 0;
+    let mut count = 0;
     let mut generation_phase = false;
     let mut table: Vec<String> = Vec::new();
 
-    while cursor.position() + 4 <= bytes.len() as u64 {
-        let index = cursor.read_u32::<LittleEndian>()? as usize;
+    while pos + 4 <= bytes.len() {
+        let index = LittleEndian::read_u32(&bytes[pos..]) as usize;
+        pos += 4;
         if index == 0 {
             generation_phase = !generation_phase;
             if generation_phase {
@@ -426,31 +488,24 @@ fn build_paths(bytes: &[u8], files: &mut PathList) -> Result<()> {
             continue;
         }
 
-        let suffix = read_nul_utf8(&mut cursor)?;
-        let text = if index <= table.len() {
-            format!("{}{}", table[index - 1], suffix)
-        } else {
-            suffix
-        };
+        let len = bytes[pos..]
+            .iter()
+            .position(|&byte| byte == 0)
+            .ok_or_else(|| anyhow!("path data ends without a NUL"))?;
+        let suffix =
+            std::str::from_utf8(&bytes[pos..pos + len]).context("path data is not UTF-8")?;
+        pos += len + 1;
+        let prefix = table.get(index.wrapping_sub(1)).map_or("", String::as_str);
         if generation_phase {
-            table.push(text);
+            table.push([prefix, suffix].concat());
         } else {
-            files.push(&text);
+            out.push_str(prefix);
+            out.push_str(suffix);
+            out.push('\0');
+            count += 1;
         }
     }
-    Ok(())
-}
-
-fn read_nul_utf8(cursor: &mut Cursor<&[u8]>) -> Result<String> {
-    let mut bytes = Vec::new();
-    loop {
-        let byte = cursor.read_u8()?;
-        if byte == 0 {
-            break;
-        }
-        bytes.push(byte);
-    }
-    String::from_utf8(bytes).context("path data is not UTF-8")
+    Ok(count)
 }
 
 #[cfg(test)]
