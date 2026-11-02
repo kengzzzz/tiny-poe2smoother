@@ -140,9 +140,8 @@ pub fn preview_patches(request: PatchRequest) -> Result<PatchPreview> {
 
 pub fn apply_patches(request: PatchRequest) -> Result<ApplyReport> {
     crate::timing!("apply_patches_total");
-    ensure_game_not_running()?;
-
     let game_dir = resolve_game_dir(request.game_dir)?;
+    ensure_game_not_running(&game_dir)?;
     let mut store = BundleStore::new(&game_dir);
     let backup = BackupStore::from_default_location()?;
 
@@ -191,6 +190,9 @@ pub fn apply_patches(request: PatchRequest) -> Result<ApplyReport> {
             );
         }
     }
+
+    // The game may have started while the patch set was built.
+    ensure_game_not_running(&game_dir)?;
 
     if patch_state.has_stale_backup() {
         backup.remove().with_context(|| {
@@ -242,8 +244,8 @@ pub fn apply_patches(request: PatchRequest) -> Result<ApplyReport> {
 }
 
 pub fn restore_backup(game_dir: Option<PathBuf>) -> Result<RestoreReport> {
-    ensure_game_not_running()?;
     let game_dir = resolve_game_dir(game_dir)?;
+    ensure_game_not_running(&game_dir)?;
     let backup = BackupStore::from_default_location()?;
     restore_backup_with_store(game_dir, backup)
 }

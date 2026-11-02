@@ -599,7 +599,8 @@ fn draw_modals(app: &mut GuiApp, ctx: &egui::Context) {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.add(widgets::primary_button("Apply")).clicked() {
                     app.confirm_apply = false;
-                    if is_game_running() {
+                    if is_game_running(app.status.as_ref().map(|status| status.game_dir.as_path()))
+                    {
                         app.show_game_running_dialog = true;
                     } else {
                         match app.patch_request() {
@@ -643,7 +644,8 @@ fn draw_modals(app: &mut GuiApp, ctx: &egui::Context) {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.add(widgets::danger_button("Restore")).clicked() {
                     app.confirm_restore = false;
-                    if is_game_running() {
+                    if is_game_running(app.status.as_ref().map(|status| status.game_dir.as_path()))
+                    {
                         app.show_game_running_dialog = true;
                     } else {
                         app.spawn_restore();

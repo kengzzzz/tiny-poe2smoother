@@ -1,7 +1,8 @@
 use anyhow::{Result, anyhow, bail};
 use std::collections::HashSet;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use sysinfo::{ProcessRefreshKind, RefreshKind, System, UpdateKind};
+use sysinfo::{Pid, ProcessRefreshKind, RefreshKind, System, UpdateKind};
 
 const POE2_APP_ID: &str = "2694490";
 const STANDALONE_DIRS: &[&str] = &["Path of Exile 2", "Path of Exile 2 - poe2_production"];
@@ -91,8 +92,8 @@ pub fn detect_install_layout(path: &Path) -> Result<InstallLayout> {
     ))
 }
 
-pub fn ensure_game_not_running() -> Result<()> {
-    if is_game_running() {
+pub fn ensure_game_not_running(game_dir: &Path) -> Result<()> {
+    if is_game_running(Some(game_dir)) {
         bail!(
             "Path of Exile 2 appears to be running.\n\
              Close the game (and Steam if needed) before apply/restore"
@@ -101,12 +102,16 @@ pub fn ensure_game_not_running() -> Result<()> {
     Ok(())
 }
 
-pub fn is_game_running() -> bool {
-    let system = System::new_with_specifics(
-        RefreshKind::nothing()
-            .with_processes(ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always)),
-    );
-    // The app, its threads, and its launchers match when it sits in the game folder.
+pub fn is_game_running(game_dir: Option<&Path>) -> bool {
+    let kind = ProcessRefreshKind::nothing().without_tasks();
+    #[cfg(windows)]
+    let kind = kind.with_exe(UpdateKind::Always);
+    // Under Wine the exe is Wine's loader, so the game's path comes from the first argument.
+    #[cfg(not(windows))]
+    let kind = kind.with_cmd(UpdateKind::Always);
+    let system = System::new_with_specifics(RefreshKind::nothing().with_processes(kind));
+    let game = game_dir.and_then(GameFolder::read);
+    // The app and its launchers match when it sits in the game folder.
     let mut ours = HashSet::new();
     let mut next = sysinfo::get_current_pid().ok();
     while let Some(pid) = next {
@@ -119,16 +124,190 @@ pub fn is_game_running() -> bool {
         if ours.contains(pid) || process.thread_kind().is_some() {
             return false;
         }
-        let name = process.name().to_string_lossy().to_ascii_lowercase();
-        if name.contains("pathofexile") || name.contains("path of exile") {
+        if is_steam_launch(process.cmd()) {
             return true;
         }
-        // Under Proton the process name is often "Main", but the command line has the game path.
-        process.cmd().iter().any(|arg| {
-            let arg = arg.to_string_lossy().to_ascii_lowercase();
-            arg.contains("pathofexile") || arg.contains("path of exile")
-        })
+        #[cfg(windows)]
+        let (program, location) = (process.name(), process.exe());
+        #[cfg(not(windows))]
+        let Some((program, location)) = process
+            .cmd()
+            .first()
+            .map(|program| (program.as_os_str(), Some(Path::new(program))))
+        else {
+            return false;
+        };
+        runs_game_program(*pid, program, location, game.as_ref())
     })
+}
+
+/// Steam on Linux runs the game under `reaper SteamLaunch AppId=2694490 -- ...`.
+fn is_steam_launch(cmd: &[OsString]) -> bool {
+    let end = cmd.iter().position(|arg| arg == "--").unwrap_or(cmd.len());
+    let launcher = &cmd[..end];
+    launcher
+        .first()
+        .is_some_and(|program| Path::new(program).file_name() == Some(OsStr::new("reaper")))
+        && launcher.iter().any(|arg| arg == "SteamLaunch")
+        && launcher.iter().any(|arg| arg == "AppId=2694490")
+}
+
+struct GameFolder {
+    forms: Vec<String>,
+    programs: Vec<GameProgram>,
+}
+
+struct GameProgram {
+    name: String,
+    id: Option<FileId>,
+}
+
+impl GameFolder {
+    fn read(dir: &Path) -> Option<Self> {
+        let programs = std::fs::read_dir(dir)
+            .ok()?
+            .flatten()
+            .filter_map(|entry| {
+                let name = program_name(&entry.file_name());
+                name.ends_with(".exe").then(|| GameProgram {
+                    name,
+                    id: file_id(&entry.path()),
+                })
+            })
+            .collect();
+        let mut forms = vec![comparable_path(&dir.to_string_lossy())];
+        if let Ok(canonical) = std::fs::canonicalize(dir) {
+            let canonical = comparable_path(&canonical.to_string_lossy());
+            if !forms.contains(&canonical) {
+                forms.push(canonical);
+            }
+        }
+        Some(Self { forms, programs })
+    }
+}
+
+/// Path of Exile 1 uses the same program names, so the running file must be this folder's.
+fn runs_game_program(
+    pid: Pid,
+    program: &OsStr,
+    location: Option<&Path>,
+    game: Option<&GameFolder>,
+) -> bool {
+    let name = program_name(program);
+    let Some(game) = game else {
+        return is_game_name(&name);
+    };
+    let Some(ours) = game.programs.iter().find(|ours| ours.name == name) else {
+        return false;
+    };
+    let same_file = ours
+        .id
+        .as_ref()
+        .and_then(|ours| running_file_id(pid, location, &name).map(|theirs| *ours == theirs));
+    let in_folder =
+        location.and_then(|location| folder_match(&location.to_string_lossy(), &game.forms));
+    game_verdict(&name, same_file, in_folder)
+}
+
+/// Identity can break on overlay mounts and paths on symlinks, so both must say elsewhere.
+fn game_verdict(name: &str, same_file: Option<bool>, in_folder: Option<bool>) -> bool {
+    match (same_file, in_folder) {
+        (Some(true), _) | (_, Some(true)) => true,
+        (Some(false), Some(false)) => false,
+        _ => is_game_name(name),
+    }
+}
+
+fn is_game_name(name: &str) -> bool {
+    name.starts_with("pathofexile") && name.ends_with(".exe")
+}
+
+fn program_name(program: &OsStr) -> String {
+    let program = program.to_string_lossy();
+    let name = program.rsplit(['/', '\\']).next().unwrap_or_default();
+    name.to_ascii_lowercase()
+}
+
+fn folder_match(program: &str, forms: &[String]) -> Option<bool> {
+    let program = comparable_path(program);
+    let bytes = program.as_bytes();
+    let drive = bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && &bytes[1..3] == b":/";
+    if !drive && !program.starts_with('/') {
+        return None;
+    }
+    // Wine drive roots are unknown (Proton maps the Steam library to S:), so compare folder tails.
+    #[cfg(not(windows))]
+    if drive {
+        let folder = &program[2..program.rfind('/')?];
+        return (folder.len() > 1).then(|| forms.iter().any(|dir| dir.ends_with(folder)));
+    }
+    Some(forms.iter().any(|dir| {
+        program.len() > dir.len()
+            && program.starts_with(dir.as_str())
+            && program.as_bytes()[dir.len()] == b'/'
+    }))
+}
+
+fn comparable_path(path: &str) -> String {
+    let path = path.replace('\\', "/").to_ascii_lowercase();
+    let path = if let Some(rest) = path.strip_prefix("//?/unc/") {
+        format!("//{rest}")
+    } else if let Some(rest) = path.strip_prefix("//?/") {
+        rest.to_string()
+    } else {
+        path
+    };
+    path.trim_end_matches('/').to_string()
+}
+
+#[cfg(windows)]
+type FileId = PathBuf;
+
+#[cfg(windows)]
+fn file_id(path: &Path) -> Option<FileId> {
+    std::fs::canonicalize(path).ok()
+}
+
+#[cfg(windows)]
+fn running_file_id(_pid: Pid, location: Option<&Path>, _name: &str) -> Option<FileId> {
+    location
+        .filter(|exe| !exe.as_os_str().is_empty())
+        .and_then(file_id)
+}
+
+#[cfg(not(windows))]
+type FileId = (u64, u64);
+
+#[cfg(not(windows))]
+fn file_id(path: &Path) -> Option<FileId> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path)
+        .ok()
+        .map(|meta| (meta.dev(), meta.ino()))
+}
+
+/// Wine maps the program file, and `/proc/<pid>/root` resolves it in container mounts.
+#[cfg(not(windows))]
+fn running_file_id(pid: Pid, _location: Option<&Path>, name: &str) -> Option<FileId> {
+    let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).ok()?;
+    let path = maps
+        .lines()
+        .filter_map(mapped_path)
+        .find(|path| program_name(OsStr::new(path)) == name)?;
+    file_id(Path::new(&format!("/proc/{pid}/root{path}")))
+}
+
+/// Five fields come before the path, and the path may contain spaces.
+#[cfg(not(windows))]
+fn mapped_path(line: &str) -> Option<&str> {
+    let mut rest = line;
+    for _ in 0..5 {
+        rest = rest.trim_start();
+        rest = &rest[rest.find(' ')?..];
+    }
+    let path = rest.trim_start();
+    let path = path.strip_suffix(" (deleted)").unwrap_or(path);
+    path.starts_with('/').then_some(path)
 }
 
 fn steam_candidates() -> Vec<PathBuf> {
@@ -687,5 +866,232 @@ mod tests {
                 PathBuf::from(r"D:\SteamLibrary")
             ]
         );
+    }
+
+    fn no_process() -> Pid {
+        Pid::from_u32(u32::MAX)
+    }
+
+    fn game_dir(root: &Path, name: &str, programs: &[&str]) -> PathBuf {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        for program in programs {
+            fs::write(dir.join(program), name).unwrap();
+        }
+        dir
+    }
+
+    fn runs(program: &str, location: Option<&Path>, game: Option<&GameFolder>) -> bool {
+        runs_game_program(no_process(), OsStr::new(program), location, game)
+    }
+
+    #[test]
+    fn running_check_ignores_programs_that_only_mention_the_game() {
+        let temp = tempfile::tempdir().unwrap();
+        let poe2 = game_dir(
+            temp.path(),
+            "Path of Exile 2",
+            &["PathOfExile.exe", "Client.exe"],
+        );
+        let game = GameFolder::read(&poe2).unwrap();
+        for program in [
+            "zsh",
+            "/usr/bin/nvim",
+            "/usr/lib/firefox/firefox",
+            r"C:\Windows\System32\notepad.exe",
+            r"c:\windows\system32\steam.exe",
+        ] {
+            assert!(!runs(program, Some(Path::new(program)), Some(&game)));
+        }
+    }
+
+    #[test]
+    fn running_check_needs_both_checks_to_call_a_program_elsewhere() {
+        assert!(game_verdict("client.exe", Some(true), Some(false)));
+        assert!(game_verdict("client.exe", Some(false), Some(true)));
+        assert!(!game_verdict("pathofexile.exe", Some(false), Some(false)));
+        assert!(game_verdict("pathofexile.exe", Some(false), None));
+        assert!(game_verdict("pathofexile.exe", None, Some(false)));
+        assert!(!game_verdict("client.exe", None, Some(false)));
+        assert!(!game_verdict("client.exe", None, None));
+    }
+
+    #[test]
+    fn running_check_falls_back_to_the_program_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let poe2 = game_dir(
+            temp.path(),
+            "Path of Exile 2",
+            &["PathOfExile.exe", "Client.exe"],
+        );
+        let game = GameFolder::read(&poe2).unwrap();
+        assert!(runs("PathOfExile.exe", None, Some(&game)));
+        assert!(!runs("Client.exe", None, Some(&game)));
+        assert!(!runs("PathOfExileSteam.exe", None, Some(&game)));
+        assert!(runs("PathOfExileSteam.exe", None, None));
+        assert!(!runs("Client.exe", None, None));
+    }
+
+    #[test]
+    fn running_check_reads_the_folder_programs() {
+        let temp = tempfile::tempdir().unwrap();
+        let poe1 = game_dir(temp.path(), "Path of Exile", &["PathOfExile.exe"]);
+        let poe2 = game_dir(
+            temp.path(),
+            "Path of Exile 2",
+            &["PathOfExile.exe", "Client.exe", "fmod.dll"],
+        );
+        let game = GameFolder::read(&poe2).unwrap();
+        let mut names: Vec<&str> = game
+            .programs
+            .iter()
+            .map(|program| program.name.as_str())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["client.exe", "pathofexile.exe"]);
+        let ours = game
+            .programs
+            .iter()
+            .find(|program| program.name == "pathofexile.exe")
+            .unwrap();
+        assert!(ours.id.is_some());
+        assert_ne!(ours.id, file_id(&poe1.join("PathOfExile.exe")));
+        assert_eq!(ours.id, file_id(&poe2.join("PathOfExile.exe")));
+    }
+
+    #[test]
+    fn running_check_trusts_only_steams_launcher_for_the_app_id() {
+        let cmd = |args: &[&str]| args.iter().map(OsString::from).collect::<Vec<_>>();
+        let reaper = "/home/u/.local/share/Steam/ubuntu12_32/reaper";
+        assert!(is_steam_launch(&cmd(&[
+            reaper,
+            "SteamLaunch",
+            "AppId=2694490",
+            "--",
+            "proton"
+        ])));
+        assert!(!is_steam_launch(&cmd(&[
+            "bash",
+            "-c",
+            "echo",
+            "AppId=2694490"
+        ])));
+        assert!(!is_steam_launch(&cmd(&[
+            reaper,
+            "SteamLaunch",
+            "AppId=238960",
+            "--",
+            "wrapper",
+            "AppId=2694490"
+        ])));
+    }
+
+    #[test]
+    fn running_check_matches_the_folder_of_a_path() {
+        let forms = [comparable_path(r"C:\Games\Path of Exile 2")];
+        assert_eq!(
+            folder_match(r"C:\Games\Path of Exile 2\Client.exe", &forms),
+            Some(true)
+        );
+        assert_eq!(
+            folder_match(r"C:\Games\Path of Exile\Client.exe", &forms),
+            Some(false)
+        );
+        assert_eq!(
+            folder_match(
+                r"C:\Games\Path of Exile 2 - poe2_production\Client.exe",
+                &forms
+            ),
+            Some(false)
+        );
+        assert_eq!(folder_match("Client.exe", &forms), None);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn running_check_matches_wine_paths_on_any_drive() {
+        let steam = [comparable_path(
+            "/home/u/.local/share/Steam/steamapps/common/Path of Exile 2",
+        )];
+        let proton = r"S:\steamapps\common\Path of Exile 2\PathOfExileSteam.exe";
+        assert_eq!(folder_match(proton, &steam), Some(true));
+        let first_game = r"S:\steamapps\common\Path of Exile\PathOfExileSteam.exe";
+        assert_eq!(folder_match(first_game, &steam), Some(false));
+        let z_drive = r"Z:\home\u\.local\share\Steam\steamapps\common\Path of Exile 2\Client.exe";
+        assert_eq!(folder_match(z_drive, &steam), Some(true));
+        assert_eq!(folder_match(r"D:\PathOfExile.exe", &steam), None);
+        let prefix = [comparable_path(
+            "/home/u/Games/poe2/drive_c/Program Files (x86)/Grinding Gear Games/Path of Exile 2",
+        )];
+        let client = r"C:\Program Files (x86)\Grinding Gear Games\Path of Exile 2\Client.exe";
+        assert_eq!(folder_match(client, &prefix), Some(true));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn running_check_parses_mapped_paths() {
+        let line = "7f00-7f10 r--p 00000000 00:2a 1234                       /games/Path of Exile 2/PathOfExile.exe";
+        assert_eq!(
+            mapped_path(line),
+            Some("/games/Path of Exile 2/PathOfExile.exe")
+        );
+        let deleted = "7f00-7f10 r--p 00000000 00:2a 1234 /games/a b/x.exe (deleted)";
+        assert_eq!(mapped_path(deleted), Some("/games/a b/x.exe"));
+        assert_eq!(mapped_path("7f00-7f10 rw-p 00000000 00:00 0 "), None);
+        assert_eq!(
+            mapped_path("7ffd-7ffe rw-p 00000000 00:00 0                  [stack]"),
+            None
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn running_check_finds_the_mapped_program_of_a_process() {
+        let exe = std::env::current_exe().unwrap();
+        let name = program_name(exe.file_name().unwrap());
+        let pid = Pid::from_u32(std::process::id());
+        assert_eq!(running_file_id(pid, None, &name), file_id(&exe));
+        assert_eq!(running_file_id(no_process(), None, &name), None);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn running_check_sees_through_symlinked_folders() {
+        let temp = tempfile::tempdir().unwrap();
+        let poe2 = game_dir(temp.path(), "Path of Exile 2", &["PathOfExile.exe"]);
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&poe2, &alias).unwrap();
+        let game = GameFolder::read(&poe2).unwrap();
+        assert_eq!(game.programs[0].id, file_id(&alias.join("PathOfExile.exe")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn running_check_tells_path_of_exile_1_from_2() {
+        let temp = tempfile::tempdir().unwrap();
+        let poe1 = game_dir(temp.path(), "Path of Exile", &["PathOfExile.exe"]);
+        let poe2 = game_dir(
+            temp.path(),
+            "Path of Exile 2",
+            &["PathOfExile.exe", "Client.exe"],
+        );
+        let game = GameFolder::read(&poe2).unwrap();
+        let exe = |dir: &Path, name: &str| dir.join(name);
+        assert!(runs(
+            "PathOfExile.exe",
+            Some(&exe(&poe2, "PathOfExile.exe")),
+            Some(&game)
+        ));
+        assert!(runs(
+            "Client.exe",
+            Some(&exe(&poe2, "Client.exe")),
+            Some(&game)
+        ));
+        assert!(!runs(
+            "PathOfExile.exe",
+            Some(&exe(&poe1, "PathOfExile.exe")),
+            Some(&game)
+        ));
+        assert!(runs("PathOfExile.exe", Some(Path::new("")), Some(&game)));
     }
 }

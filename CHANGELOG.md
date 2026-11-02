@@ -19,6 +19,7 @@ Choose which MTX effects to remove.
 ### Fixes
 - Standalone client: Restore no longer says "No backup found" after it worked.
 - Memory no longer keeps growing each time you click Apply.
+- Apply and Restore no longer refuse to run when a browser, editor, script, or Path of Exile 1 is open.
 
 ## 0.7.0 - 2026-10-27
 
