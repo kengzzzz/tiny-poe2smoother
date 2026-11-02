@@ -2726,7 +2726,8 @@ int Kraken_DecodeQuantum(byte *dst, byte *dst_end, byte *dst_start,
     if (!(chunkhdr & 0x800000)) {
       // Stored as entropy without any match copying.
       byte *out = dst;
-      src_used = Kraken_DecodeBytes(&out, src, src_end, &written_bytes, dst_count, false, scratch, scratch_end);
+      // tiny-poe2smoother: force the copy. Upstream left dst unwritten for raw data.
+      src_used = Kraken_DecodeBytes(&out, src, src_end, &written_bytes, dst_count, true, scratch, scratch_end);
       if (src_used < 0 || written_bytes != dst_count)
         return -1;
     } else {
@@ -3386,7 +3387,8 @@ int Leviathan_DecodeQuantum(byte *dst, byte *dst_end, byte *dst_start,
     if (!(chunkhdr & 0x800000)) {
       // Stored as entropy without any match copying.
       byte *out = dst;
-      src_used = Kraken_DecodeBytes(&out, src, src_end, &written_bytes, dst_count, false, scratch, scratch_end);
+      // tiny-poe2smoother: force the copy. Upstream left dst unwritten for raw data.
+      src_used = Kraken_DecodeBytes(&out, src, src_end, &written_bytes, dst_count, true, scratch, scratch_end);
       if (src_used < 0 || written_bytes != dst_count)
         return -1;
     } else {
@@ -3994,7 +3996,8 @@ int Mermaid_DecodeQuantum(byte *dst, byte *dst_end, byte *dst_start,
     if (!(chunkhdr & 0x800000)) {
       // Stored without any match copying.
       byte *out = dst;
-      src_used = Kraken_DecodeBytes(&out, src, src_end, &written_bytes, dst_count, false, temp, temp_end);
+      // tiny-poe2smoother: force the copy. Upstream left dst unwritten for raw data.
+      src_used = Kraken_DecodeBytes(&out, src, src_end, &written_bytes, dst_count, true, temp, temp_end);
       if (src_used < 0 || written_bytes != dst_count)
         return -1;
     } else {

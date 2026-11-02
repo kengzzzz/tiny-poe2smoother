@@ -10,6 +10,12 @@
 #include "compr_match_finder.h"
 
 struct MermaidWriter {
+  // tiny-poe2smoother: owns the Init buffer, which upstream leaks.
+  uint8 *alloc = NULL;
+  MermaidWriter() = default;
+  MermaidWriter(const MermaidWriter &) = delete;
+  MermaidWriter &operator=(const MermaidWriter &) = delete;
+  ~MermaidWriter() { delete[] alloc; }
   uint8 *lit_start;
   uint8 *lit_cur;
   uint8 *litsub_start;
@@ -51,6 +57,8 @@ void MermaidWriter_Init(MermaidWriter *mw, uint src_len, const uint8 *src, bool 
   if (use_litsub)
     total_size += lit_size;
   uint8 *temp = new uint8[total_size];
+  delete[] mw->alloc;
+  mw->alloc = temp;
 
   mw->lit_start = mw->lit_cur = temp;
   temp += lit_size;

@@ -16,6 +16,7 @@ Choose which MTX effects to remove.
 
 ### Fixes
 - Standalone client: Restore no longer says "No backup found" after it worked.
+- Memory no longer keeps growing each time you click Apply.
 
 ## 0.7.0 - 2026-10-27
 
