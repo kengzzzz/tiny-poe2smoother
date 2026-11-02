@@ -172,7 +172,7 @@ fn parse_index_cache(mut reader: impl Read, len: u64, key: &CacheKey) -> Option<
         return None;
     }
     let raw_decompressed = read_cache_section(&mut reader, &mut remaining)?;
-    // Path text runs about 1.8x the raw index, so this only stops absurd headers.
+    // Real path text is about 1.8x the raw index. This only stops absurd headers.
     let text_budget = (raw_decompressed.len() as u64).saturating_mul(4);
     let paths = read_path_blocks(&mut reader, &mut remaining, text_budget)?;
     if remaining != 0 {
@@ -181,8 +181,8 @@ fn parse_index_cache(mut reader: impl Read, len: u64, key: &CacheKey) -> Option<
     BundleIndex::with_paths(raw_decompressed, paths).ok()
 }
 
-/// Reads the compressed path blocks and decodes each one on the pool while the next is
-/// read, so only a few compressed blocks are held at once.
+/// Decodes each block on the pool while the next is read, so few compressed blocks are
+/// held at once.
 fn read_path_blocks(
     reader: &mut impl Read,
     remaining: &mut u64,
@@ -190,7 +190,7 @@ fn read_path_blocks(
 ) -> Option<PathList> {
     *remaining = remaining.checked_sub(4)?;
     let count = reader.read_u32::<LittleEndian>().ok()? as usize;
-    if count as u64 > *remaining / 8 {
+    if count as u64 > *remaining / 16 {
         return None;
     }
     let slots: Vec<OnceLock<Option<(String, usize)>>> =
@@ -200,6 +200,14 @@ fn read_path_blocks(
             let Some(packed) = read_cache_section(reader, remaining) else {
                 return false;
             };
+            // Oodle trusts its input, so damaged blocks must never reach it.
+            let Some(rest) = remaining.checked_sub(8) else {
+                return false;
+            };
+            *remaining = rest;
+            if reader.read_u64::<LittleEndian>().ok() != Some(checksum(&packed)) {
+                return false;
+            }
             let Some(size) = bundle_uncompressed_size(&packed)
                 .ok()
                 .and_then(|size| u64::try_from(size).ok())
@@ -241,19 +249,20 @@ fn write_index_cache(
     writer.write_u64::<LittleEndian>(key.size)?;
     writer.write_u128::<LittleEndian>(key.mtime)?;
     write_cache_section(writer, &index.raw_decompressed)?;
-    // Paths compress about 4x, which halves what every cached start reads.
+    // Paths compress about 4x, which halves the read on every cached start.
     let blocks = index.paths().blocks();
     writer
         .write_u32::<LittleEndian>(u32::try_from(blocks.len()).map_err(std::io::Error::other)?)?;
     for block in blocks {
         let packed = pack_bundle_serial(block.as_bytes()).map_err(std::io::Error::other)?;
         write_cache_section(writer, &packed)?;
+        writer.write_u64::<LittleEndian>(checksum(&packed))?;
     }
     Ok(())
 }
 
 const CACHE_TEMP_SUFFIX: &str = ".tps-tmp";
-/// A temp this old was left by a killed app, since a live writer keeps touching it.
+/// A live writer keeps touching its temp, so one this old was left by a killed app.
 const STALE_CACHE_TEMP_AGE: Duration = Duration::from_secs(60);
 
 static CACHE_WRITES: Mutex<Vec<(PathBuf, JoinHandle<()>)>> = Mutex::new(Vec::new());
@@ -275,8 +284,8 @@ fn source_key(source_path: &std::path::Path, source: &str) -> Result<CacheKey> {
     })
 }
 
-/// A cache write that runs after the index is returned. It holds no game file handle or
-/// mapping, so Apply and Restore can still rewrite or truncate game data while it runs.
+/// Runs after the index is returned. It holds no game file handle or mapping, so Apply
+/// and Restore can still rewrite or truncate game data meanwhile.
 struct CacheWrite {
     source_path: PathBuf,
     key: CacheKey,
@@ -312,9 +321,6 @@ impl CacheWrite {
         fs::create_dir_all(dir)?;
         retire_legacy_caches(dir);
         remove_stale_cache_temps(dir, &self.path, STALE_CACHE_TEMP_AGE);
-        if cache_file_key(&self.path).as_ref() == Some(&self.key) {
-            return Ok(());
-        }
         publish_cache(
             &self.path,
             |file| {
@@ -333,8 +339,8 @@ impl CacheWrite {
     }
 }
 
-/// Writes a random-named temp next to `path`, syncs it, and renames it over `path` only
-/// if `still_valid` holds. Readers see the old file or the whole new one, never a part.
+/// Renames a synced temp over `path` only if `still_valid`, so readers never see a
+/// partial or stale file.
 fn publish_cache(
     path: &std::path::Path,
     write: impl FnOnce(&mut fs::File) -> std::io::Result<()>,
@@ -356,7 +362,7 @@ fn publish_cache(
     Ok(())
 }
 
-/// Removes temps left by killed writes of this cache, including the older `.tmp<pid>` names.
+/// Also removes the `.tmp<pid>` temps that older versions left.
 fn remove_stale_cache_temps(dir: &std::path::Path, path: &std::path::Path, min_age: Duration) {
     let (Some(name), Some(stem)) = (path.file_name(), path.file_stem()) else {
         return;
@@ -385,25 +391,25 @@ fn remove_stale_cache_temps(dir: &std::path::Path, path: &std::path::Path, min_a
     }
 }
 
-/// Reads only the header, so a matching cache is not rewritten.
-fn cache_file_key(path: &std::path::Path) -> Option<CacheKey> {
-    let mut reader = std::io::BufReader::new(fs::File::open(path).ok()?);
-    let mut magic = [0u8; 4];
-    reader.read_exact(&mut magic).ok()?;
-    if &magic != CACHE_MAGIC {
-        return None;
+/// Detects damaged cache blocks. Not cryptographic.
+fn checksum(bytes: &[u8]) -> u64 {
+    const K: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut lanes = [K, K.rotate_left(17), K.rotate_left(31), K.rotate_left(47)];
+    let (words, tail) = bytes.as_chunks::<32>();
+    for chunk in words {
+        for (lane, word) in lanes.iter_mut().zip(chunk.as_chunks::<8>().0) {
+            *lane = (*lane ^ u64::from_le_bytes(*word))
+                .wrapping_mul(K)
+                .rotate_left(29);
+        }
     }
-    let source_len = reader.read_u64::<LittleEndian>().ok()?;
-    if source_len > 1 << 16 {
-        return None;
+    let mut hash = lanes.iter().fold(bytes.len() as u64, |hash, &lane| {
+        (hash ^ lane).wrapping_mul(K).rotate_left(27)
+    });
+    for &byte in tail {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(K).rotate_left(5);
     }
-    let mut source = vec![0; source_len as usize];
-    reader.read_exact(&mut source).ok()?;
-    Some(CacheKey {
-        source: String::from_utf8(source).ok()?,
-        size: reader.read_u64::<LittleEndian>().ok()?,
-        mtime: reader.read_u128::<LittleEndian>().ok()?,
-    })
+    hash ^ (hash >> 32)
 }
 
 impl BundleStore {
@@ -548,8 +554,8 @@ impl BundleStore {
         }
     }
 
-    /// For Apply and Restore. It always rebuilds from the game files and never reads the
-    /// cache, so cached bytes can't end up in the game index.
+    /// For Apply and Restore. It never reads the cache, so cached bytes can't reach the
+    /// game index.
     pub fn open_index(&mut self) -> Result<BundleIndex> {
         let source_key = self.refresh_source_snapshot()?;
         self.rebuild_index(&source_key)
@@ -567,7 +573,7 @@ impl BundleStore {
     }
 
     /// Overlapping readers share one index, freed when the last one drops it. A miss
-    /// returns as soon as the index is built and writes the cache in the background.
+    /// returns once the index is built and writes the cache in the background.
     pub fn open_shared_index(&mut self) -> Result<Arc<BundleIndex>> {
         let mut shared = shared_index();
         let Some(key) = self.refresh_source_snapshot()? else {
@@ -665,8 +671,7 @@ impl BundleStore {
         Ok(files.iter().map(|file| file.hash).zip(bytes).collect())
     }
 
-    /// Calls `visit` with each file's index in `files` and its bytes, as soon as they are
-    /// decoded, and returns the results in the order of `files`.
+    /// Calls `visit` as each file is decoded. Results keep the order of `files`.
     pub fn visit_files_batch<T: Send>(
         &self,
         index: &BundleIndex,
@@ -699,7 +704,7 @@ impl BundleStore {
                         })?;
                     visit_bundle_slices(&compressed, &spans, collect)
                 } else {
-                    // Loose bundles are read in parts, so only the needed chunks hit the disk.
+                    // Read only the needed chunks. GGPK is mapped, so it skips this.
                     let path = self.bundle_path(name);
                     let mut file = fs::File::open(&path)
                         .with_context(|| format!("failed to read {}", path.display()))?;
@@ -707,8 +712,7 @@ impl BundleStore {
                     visit_bundle_slices_from(
                         usize::try_from(len)?,
                         |offset, len| {
-                            // Zeroed slack after the data, in case Oodle reads a little past
-                            // the end of a chunk.
+                            // Zeroed slack in case Oodle reads past the chunk end.
                             let mut buf = vec![0; len + OOZ_SAFE_SPACE];
                             file.seek(SeekFrom::Start(offset as u64))?;
                             file.read_exact(&mut buf[..len])?;
@@ -1069,10 +1073,26 @@ pub(crate) mod tests {
         let mut bytes = Vec::new();
         write_index_cache(&mut bytes, &index, &key).unwrap();
         let packed = pack_bundle_serial(b"Metadata/First.dat\0").unwrap();
-        let block_start = bytes.len() - packed.len();
-        assert_eq!(&bytes[block_start..], packed.as_slice());
+        let block_end = bytes.len() - 8;
+        let block_start = block_end - packed.len();
+        assert_eq!(&bytes[block_start..block_end], packed.as_slice());
         // The 64-bit uncompressed size sits 20 bytes into the bundle header.
         bytes[block_start + 20..block_start + 28].copy_from_slice(&(1u64 << 40).to_le_bytes());
+        // A matching checksum, so the size limit is what rejects it.
+        let sum = checksum(&bytes[block_start..block_end]);
+        bytes[block_end..].copy_from_slice(&sum.to_le_bytes());
+
+        assert!(parse_cache_bytes(&bytes, &key).is_none());
+    }
+
+    #[test]
+    fn damaged_path_block_is_rejected_before_decoding() {
+        let key = test_key();
+        let index = BundleIndex::for_test_paths(&[("Metadata/First.dat", "first", 3)]);
+        let mut bytes = Vec::new();
+        write_index_cache(&mut bytes, &index, &key).unwrap();
+        let last_block_byte = bytes.len() - 9;
+        bytes[last_block_byte] ^= 0x40;
 
         assert!(parse_cache_bytes(&bytes, &key).is_none());
     }
@@ -1168,7 +1188,7 @@ pub(crate) mod tests {
             .unwrap_or_else(PoisonError::into_inner);
         let temp = tempfile::tempdir().unwrap();
         let (mut store, _) = loose_store(temp.path(), "real");
-        // A cache with the right key but other content, like a damaged or forged file.
+        // Right key, wrong content, like a damaged or forged file.
         let key = store.cache_key().unwrap().unwrap();
         let forged =
             BundleIndex::parse(decompress_bundle(&test_index_bytes(&["forged"])).unwrap()).unwrap();
@@ -1627,6 +1647,28 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn damaged_cache_with_a_good_header_is_rewritten() {
+        let _slot = SHARED_SLOT_TESTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let temp = tempfile::tempdir().unwrap();
+        let (mut store, _) = loose_store(temp.path(), "first");
+        drop(store.open_shared_index().unwrap());
+        BundleStore::flush_cache_writes();
+        let path = store.cache_path();
+        let mut bytes = fs::read(&path).unwrap();
+        let len = bytes.len();
+        bytes[len - 9] ^= 0x40;
+        fs::write(&path, &bytes).unwrap();
+        assert!(store.read_cache().is_none());
+
+        drop(store.open_shared_index().unwrap());
+        BundleStore::flush_cache_writes();
+
+        assert!(store.read_cache().is_some());
+    }
+
+    #[test]
     fn shared_miss_writes_the_cache_after_returning() {
         let _slot = SHARED_SLOT_TESTS
             .lock()
@@ -1636,8 +1678,6 @@ pub(crate) mod tests {
 
         let index = store.open_shared_index().unwrap();
         BundleStore::flush_cache_writes();
-        let key = store.cache_key().unwrap().unwrap();
-        assert_eq!(cache_file_key(&store.cache_path()), Some(key));
         drop(index);
 
         let cached = store.read_cache().expect("cache should be readable");

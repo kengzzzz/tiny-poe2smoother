@@ -28,6 +28,8 @@ const OODLE_COMPRESS_LEVEL: c_int = 1;
 
 // Oodle decoders may write up to 64 bytes past the output end.
 pub(super) const OOZ_SAFE_SPACE: usize = 64;
+/// PoE uses 256 KiB chunks. This only stops absurd headers.
+const MAX_CHUNK_UNPACKED_SIZE: usize = 16 << 20;
 const MAX_BUNDLE_HEAD_SIZE: usize = 16 << 20;
 const MAX_RUN_CHUNKS: usize = 16;
 
@@ -60,6 +62,12 @@ fn parse_bundle_head(src: &[u8]) -> Result<BundleHead> {
     for _ in 0..4 {
         let _ = cursor.read_u32::<LittleEndian>()?;
     }
+    if chunk_count > (src.len() - cursor.position() as usize) / 4 {
+        bail!("bundle chunk table exceeds source length");
+    }
+    if chunk_unpacked_size > MAX_CHUNK_UNPACKED_SIZE {
+        bail!("bundle chunk size {chunk_unpacked_size} is too large");
+    }
     let mut chunk_sizes = Vec::with_capacity(chunk_count);
     for _ in 0..chunk_count {
         chunk_sizes.push(cursor.read_u32::<LittleEndian>()? as usize);
@@ -68,7 +76,7 @@ fn parse_bundle_head(src: &[u8]) -> Result<BundleHead> {
     if data_offset < cursor.position() as usize {
         bail!("bundle head_size is smaller than chunk table");
     }
-    if chunk_count > 0 && chunk_unpacked_size == 0 {
+    if chunk_unpacked_size == 0 && (chunk_count > 0 || uncompressed_size > 0) {
         bail!("bundle chunk size is zero");
     }
     Ok(BundleHead {
@@ -116,12 +124,11 @@ pub fn decompress_bundle(src: &[u8]) -> Result<Vec<u8>> {
     if chunk_count == 0 {
         return Ok(out);
     }
-    // Chunks are independent. Each decodes into its own scratch buffer, because Oodle may
-    // write past the chunk end, then lands in its slot.
+    // Oodle may write past the chunk end, so each chunk decodes into scratch first.
     out.par_chunks_mut(head.chunk_unpacked_size)
         .zip(ranges.par_iter())
         .try_for_each_init(
-            || vec![0u8; head.chunk_unpacked_size + OOZ_SAFE_SPACE],
+            || vec![0u8; head.chunk_unpacked_size.min(head.uncompressed_size) + OOZ_SAFE_SPACE],
             |scratch, (dst, range)| -> Result<()> {
                 decompress_chunk_into(&src[range.clone()], scratch.as_mut_ptr(), dst.len())?;
                 dst.copy_from_slice(&scratch[..dst.len()]);
@@ -137,8 +144,7 @@ pub fn decompress_bundle_slices(src: &[u8], spans: &[(u32, u32)]) -> Result<Vec<
     Ok(out)
 }
 
-/// Decodes one chunk at a time and hands each span to `visit` as soon as it is complete,
-/// so memory stays near one chunk plus the spans themselves.
+/// Decodes one chunk at a time, so memory stays near one chunk plus the spans.
 pub fn visit_bundle_slices(
     src: &[u8],
     spans: &[(u32, u32)],
@@ -152,9 +158,8 @@ pub fn visit_bundle_slices(
     )
 }
 
-/// Like `visit_bundle_slices`, but reads through `read_at(offset, len)` and fetches only
-/// the header and the compressed chunks the spans need. Reads never pass `src_len`, so a
-/// corrupt chunk table can't ask for a huge buffer.
+/// Reads only the header and the chunks the spans need. Reads past `src_len` fail, so a
+/// corrupt chunk table can't force a huge buffer.
 pub fn visit_bundle_slices_from<'a>(
     src_len: usize,
     mut read_at: impl FnMut(usize, usize) -> Result<Cow<'a, [u8]>>,
@@ -207,7 +212,7 @@ pub fn visit_bundle_slices_from<'a>(
         }
         needed[first..=last].fill(true);
     }
-    // Neighbouring chunks are read together, in pieces small enough to hold per thread.
+    // Capped so each thread holds little compressed data.
     let mut runs: Vec<(usize, usize)> = Vec::new();
     let mut chunk = 0;
     while chunk < needed.len() {
@@ -281,8 +286,7 @@ pub fn pack_uncompressed_bundle(data: &[u8]) -> Result<Vec<u8>> {
     write_bundle(data.len(), &chunks)
 }
 
-/// Like `pack_uncompressed_bundle` on the calling thread only, for background work that
-/// shouldn't take the shared thread pool from the GUI's loaders.
+/// Runs on the calling thread, so background writes leave the pool to the loaders.
 pub fn pack_bundle_serial(data: &[u8]) -> Result<Vec<u8>> {
     let chunks = data
         .chunks(BUNDLE_CHUNK_SIZE)
@@ -291,7 +295,6 @@ pub fn pack_bundle_serial(data: &[u8]) -> Result<Vec<u8>> {
     write_bundle(data.len(), &chunks)
 }
 
-/// Reads only the header, so callers can bound the allocation before decompressing.
 pub fn bundle_uncompressed_size(src: &[u8]) -> Result<usize> {
     Ok(parse_bundle_head(src)?.uncompressed_size)
 }
@@ -468,6 +471,34 @@ mod tests {
             |offset: usize, len: usize| Ok(Cow::Owned(oversized[offset..offset + len].to_vec()));
         assert!(
             visit_bundle_slices_from(oversized.len(), read_oversized, &span, |_, _| ()).is_err()
+        );
+    }
+
+    fn header_with(chunk_count: u32, chunk_size: u32, uncompressed: u64) -> Vec<u8> {
+        let mut head = vec![0u8; 60];
+        head[8..12].copy_from_slice(&48u32.to_le_bytes());
+        head[20..28].copy_from_slice(&uncompressed.to_le_bytes());
+        head[36..40].copy_from_slice(&chunk_count.to_le_bytes());
+        head[40..44].copy_from_slice(&chunk_size.to_le_bytes());
+        head
+    }
+
+    #[test]
+    fn absurd_bundle_headers_fail_without_huge_allocations() {
+        let huge_table = header_with(u32::MAX, 0x40000, 1);
+        assert!(decompress_bundle(&huge_table).is_err());
+        assert!(bundle_uncompressed_size(&huge_table).is_err());
+
+        let mut huge_chunk = header_with(1, u32::MAX, 1);
+        huge_chunk.extend_from_slice(&1u32.to_le_bytes());
+        huge_chunk.push(0);
+        assert!(decompress_bundle(&huge_chunk).is_err());
+
+        let no_chunks = header_with(0, 0, 1);
+        assert!(decompress_bundle(&no_chunks).is_err());
+        assert_eq!(
+            decompress_bundle(&header_with(0, 0, 0)).unwrap(),
+            Vec::<u8>::new()
         );
     }
 

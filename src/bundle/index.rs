@@ -61,8 +61,8 @@ pub struct IndexedPath {
     pub file: BundleFile,
 }
 
-/// NUL-terminated paths in a few large blocks, because 4.27M `String`s fragment the heap.
-/// Blocks let the build run in parallel without a second full copy.
+/// NUL-terminated paths in large blocks. A `String` per path fragments the heap, and
+/// blocks can be built in parallel.
 #[derive(Debug, Clone, Default)]
 pub struct PathList {
     blocks: Vec<String>,
@@ -94,7 +94,7 @@ impl PathList {
         Some(Self::from_blocks(vec![block], len))
     }
 
-    /// Returns the block and its path count if every path in it ends with a NUL.
+    /// Checks the block ends with a NUL and counts its paths.
     pub(super) fn checked_block(text: String) -> Option<(String, usize)> {
         (text.is_empty() || text.ends_with('\0')).then(|| {
             let len = text.bytes().filter(|byte| *byte == 0).count();
@@ -102,7 +102,7 @@ impl PathList {
         })
     }
 
-    /// `blocks` must come from `checked_block`, and `len` is the sum of their counts.
+    /// `blocks` must pass `checked_block`, and `len` is their total count.
     pub(super) fn from_blocks(blocks: Vec<String>, len: usize) -> Self {
         Self { blocks, len }
     }
@@ -111,7 +111,6 @@ impl PathList {
         &self.blocks
     }
 
-    /// Splits the paths into one block each, like a large parallel build.
     #[cfg(test)]
     pub(crate) fn split_blocks_for_test(&mut self) {
         self.blocks = self.iter().map(|path| format!("{path}\0")).collect();
@@ -493,7 +492,7 @@ fn build_paths_from_directories(bytes: &[u8], directories: &[u8]) -> Result<Path
     })
 }
 
-/// Appends this directory's paths to `out` and returns how many it added.
+/// Returns how many paths it appended.
 fn build_paths(bytes: &[u8], out: &mut String) -> Result<usize> {
     let mut pos = 0;
     let mut count = 0;
