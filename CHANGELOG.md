@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.8.0
+## 0.8.0 - 2026-11-03
 
 Choose which MTX effects to remove.
 
