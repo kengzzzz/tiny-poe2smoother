@@ -298,6 +298,11 @@ template<typename T>
 class FastMatchHasher {
 public:
   typedef T ElemType;
+  // tiny-poe2smoother: upstream never frees the table.
+  ~FastMatchHasher() {
+    free(malloced_ptr_);
+  }
+
   void AllocateHash(int bits, int k) {
     hash_bits_ = bits;
     if (k == 0)

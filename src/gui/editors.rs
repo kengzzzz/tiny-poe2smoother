@@ -1,11 +1,14 @@
 use eframe::egui;
-use tiny_poe2smoother::patches::{ColorModEntry, EffectLevel, PRESET_COLORS, default_color_mods};
+use tiny_poe2smoother::patches::{
+    ColorModEntry, EffectLevel, PRESET_COLORS, PatchId, default_color_mods,
+};
 
 use super::theme::{self, palette};
 use super::widgets::{self, count_label, small_action};
 use crate::{ColorRowRef, EffectsEditorTab, GuiApp};
 
 const COLOR_ROW_HEIGHT: f32 = 26.0;
+const MTX_PREFIX: &str = "metadata/effects/microtransactions/";
 
 pub fn draw_color_editor(app: &mut GuiApp, ctx: &egui::Context) {
     let modal = egui::Modal::new(egui::Id::unique("color_mods_editor"))
@@ -157,6 +160,9 @@ const EFFECTS_MONSTERS_DESCRIPTION: &str = "Toggled on strips heavy client effec
      Shared effects stay original for all monsters using them · unlisted monsters stay reduced.";
 const EFFECTS_OTHERS_DESCRIPTION: &str = "Shared or unmapped effects (default reduced) · off keeps original visuals, including \
      referenced particles even with Particles enabled. Kept effects stay original for other users.";
+
+const MTX_DESCRIPTION: &str = "Checked effects are removed (default) · uncheck to keep one. A kept effect \
+     also keeps the files it uses, even with Effects or Particles on.";
 
 pub fn draw_effects_editor(app: &mut GuiApp, ctx: &egui::Context) {
     let modal = egui::Modal::new(egui::Id::unique("effects_editor"))
@@ -643,6 +649,123 @@ fn draw_effects_monsters_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
     });
 }
 
+pub fn draw_mtx_editor(app: &mut GuiApp, ctx: &egui::Context) {
+    let modal = egui::Modal::new(egui::Id::unique("mtx_editor"))
+        .frame(widgets::card().inner_margin(20))
+        .backdrop_color(egui::Color32::from_black_alpha(140))
+        .show(ctx, |ui| {
+            ui.set_width(640.0);
+            draw_mtx_tab(app, ui);
+        })
+        .should_close();
+    if modal {
+        app.show_mtx_editor = false;
+    }
+}
+
+fn draw_mtx_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
+    ui.label(theme::heading_text("MTX effects"));
+    ui.add_space(2.0);
+    draw_effects_tab_description(ui, MTX_DESCRIPTION);
+    ui.add_space(8.0);
+    ui.add(
+        egui::TextEdit::singleline(&mut app.mtx_search)
+            .id_salt("mtx_search")
+            .hint_text("Search by name or effect file (regex, \"quotes\", !exclude)")
+            .desired_width(f32::INFINITY)
+            .margin(egui::Margin::symmetric(10, 8)),
+    );
+    ui.add_space(6.0);
+    app.refresh_mtx_filter();
+    let row_count = app.mtx_filter_rows.len();
+    let portals_hidden = !app.options.enabled(PatchId::MtxSoft, "town_portals");
+    draw_effects_list_header(
+        ui,
+        |ui| {
+            ui.label(theme::caption_text(&format!("{row_count} shown")));
+        },
+        |ui| {
+            if portals_hidden {
+                ui.label(theme::caption_text(
+                    "Town portals stay visible, so they are not listed",
+                ));
+            }
+        },
+    );
+    ui.add_space(4.0);
+    egui::ScrollArea::vertical()
+        .id_salt("mtx_list")
+        .max_height(380.0)
+        .auto_shrink([false, false])
+        .show_rows(ui, COLOR_ROW_HEIGHT, row_count, |ui, range| {
+            for i in range {
+                let idx = app.mtx_filter_rows[i];
+                draw_mtx_list_row(app, ui, idx);
+            }
+        });
+
+    ui.add_space(10.0);
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if ui.add(widgets::primary_button("Close")).clicked() {
+            app.show_mtx_editor = false;
+        }
+        ui.add_enabled_ui(row_count > 0, |ui| {
+            if ui.add(widgets::secondary_button("Uncheck all")).clicked() {
+                app.set_filtered_mtx_kept(true);
+            }
+            if ui.add(widgets::secondary_button("Check all")).clicked() {
+                app.set_filtered_mtx_kept(false);
+            }
+        });
+    });
+}
+
+fn draw_mtx_list_row(app: &mut GuiApp, ui: &mut egui::Ui, idx: usize) {
+    let row = &app.mtx_catalog[idx];
+    let folder = row.folder.clone();
+    let display = row.display.clone();
+    let context = row.context.clone();
+    let mut removed = !app.kept_mtx.contains(&folder);
+    let hover = format!("{MTX_PREFIX}{folder}");
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), COLOR_ROW_HEIGHT),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let toggle = ui.add(egui::Checkbox::without_text(&mut removed));
+            if toggle.changed() {
+                if removed {
+                    app.kept_mtx.remove(&folder);
+                } else {
+                    app.kept_mtx.insert(folder);
+                }
+            }
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(egui::RichText::new(&display).size(11.5).color(if removed {
+                    palette::TEXT_MUTED
+                } else {
+                    palette::TEXT
+                }))
+                .truncate(),
+            )
+            .on_hover_text(&hover);
+            if !context.is_empty() {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(monster_context_label(&context))
+                            .size(11.5)
+                            .color(palette::TEXT_MUTED),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(&hover);
+            }
+            toggle.on_hover_text(hover);
+        },
+    );
+}
+
 fn draw_effects_tab_description(ui: &mut egui::Ui, text: &str) {
     // Reserve two lines on every tab so the search field doesn't jump.
     let height = 2.0 * ui.text_style_height(&egui::TextStyle::Small);
@@ -929,6 +1052,111 @@ mod tests {
         })
         .drop_without_applying_deltas();
         assert_eq!(app.monsters_filter_rows, vec![0, 1]);
+    }
+
+    #[test]
+    fn clicking_an_mtx_row_checkbox_toggles_the_kept_list() {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let mut app = GuiApp {
+            mtx_catalog: vec![crate::MtxRow {
+                folder: "foot_prints".to_string(),
+                display: "Foot Prints".to_string(),
+                context: String::new(),
+                display_lower: "foot prints".to_string(),
+                search_lower: "foot prints foot_prints".to_string(),
+                file_words: String::new(),
+            }],
+            ..GuiApp::default()
+        };
+        let frame = |events: Vec<egui::Event>, app: &mut GuiApp| {
+            let input = egui::RawInput {
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(600.0, 200.0),
+                )),
+                ..Default::default()
+            };
+            ctx.run_ui(input, |ui| draw_mtx_list_row(app, ui, 0))
+                .drop_without_applying_deltas();
+        };
+        let click = |app: &mut GuiApp| {
+            let pos = egui::pos2(16.0, 21.0);
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            frame(vec![egui::Event::PointerMoved(pos)], app);
+            frame(vec![button(true)], app);
+            frame(vec![button(false)], app);
+        };
+
+        frame(Vec::new(), &mut app);
+        click(&mut app);
+        assert!(app.kept_mtx.contains("foot_prints"));
+        click(&mut app);
+        assert!(app.kept_mtx.is_empty());
+    }
+
+    #[test]
+    fn mtx_description_fits_the_reserved_height() {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let mut bottoms = [0.0; 2];
+        for (bottom, text) in bottoms
+            .iter_mut()
+            .zip([EFFECTS_OTHERS_DESCRIPTION, MTX_DESCRIPTION])
+        {
+            ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.set_width(640.0);
+                draw_effects_tab_description(ui, text);
+                *bottom = ui.cursor().top();
+            })
+            .drop_without_applying_deltas();
+        }
+        assert_eq!(bottoms[0], bottoms[1]);
+    }
+
+    #[test]
+    fn mtx_editor_renders_rows_and_filters_by_folder_text() {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let row = |folder: &str, display: &str, context: &str| crate::MtxRow {
+            search_lower: format!("{display} {context} {folder}").to_lowercase(),
+            display_lower: display.to_lowercase(),
+            folder: folder.to_string(),
+            display: display.to_string(),
+            context: context.to_string(),
+            file_words: String::new(),
+        };
+        let mut app = GuiApp {
+            mtx_catalog: vec![
+                row(
+                    "misc/uniques/berekthetaming",
+                    "Berekthetaming",
+                    "Misc · Uniques",
+                ),
+                row("spells/witch/chaoscurse", "Chaoscurse", "Spells · Witch"),
+            ],
+            ..GuiApp::default()
+        };
+
+        ctx.run_ui(egui::RawInput::default(), |ui| draw_mtx_tab(&mut app, ui))
+            .drop_without_applying_deltas();
+        assert_eq!(app.mtx_filter_rows, vec![0, 1]);
+
+        app.mtx_search = "taming".to_string();
+        ctx.run_ui(egui::RawInput::default(), |ui| draw_mtx_tab(&mut app, ui))
+            .drop_without_applying_deltas();
+        assert_eq!(app.mtx_filter_rows, vec![0]);
+
+        app.mtx_search = "witch !bolt".to_string();
+        ctx.run_ui(egui::RawInput::default(), |ui| draw_mtx_tab(&mut app, ui))
+            .drop_without_applying_deltas();
+        assert_eq!(app.mtx_filter_rows, vec![1]);
     }
 
     fn other_row(folder: &str, display: &str) -> crate::OtherEffectRow {

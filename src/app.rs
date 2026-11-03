@@ -6,10 +6,10 @@ use crate::install::{
 };
 use crate::patches::{
     ACTIONTYPES_DATC64_PATH, ACTIVESKILLS_DATC64_PATH, EffectSkillCatalogEntry,
-    ITEM_VISUAL_EFFECT_DATC64_PATH, MonsterEffectCatalogEntry, OtherEffectCatalogEntry,
-    PatchChange, PatchId, PatchParams, StatCatalogEntry, build_effect_skill_catalog,
-    build_monster_effect_catalog, build_other_effect_catalog, compute_patch_set,
-    parse_stat_catalog,
+    ITEM_VISUAL_EFFECT_DATC64_PATH, MonsterEffectCatalogEntry, MtxCatalogEntry,
+    OtherEffectCatalogEntry, PatchChange, PatchId, PatchParams, StatCatalogEntry,
+    build_effect_skill_catalog, build_monster_effect_catalog, build_mtx_catalog,
+    build_other_effect_catalog, compute_patch_set, parse_stat_catalog,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use rayon::prelude::*;
@@ -51,6 +51,7 @@ pub struct AppStatus {
     pub has_backup: bool,
     pub patch_state: PatchState,
     pub backup_owner: Option<PathBuf>,
+    pub mtx_catalog: Vec<MtxCatalogEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -100,13 +101,14 @@ pub fn load_status(game_dir: Option<PathBuf>) -> Result<AppStatus> {
     crate::timing!("load_status_total");
     let game_dir = resolve_game_dir(game_dir)?;
     let mut store = BundleStore::new(&game_dir);
-    let mut index = store.open_index()?;
-    let indexed_paths = index.ensure_paths_built()?.len();
+    let index = store.open_shared_index()?;
+    let indexed_paths = index.paths().len();
     let backup = BackupStore::from_default_location()?;
     let has_backup = backup.has_backup();
     let (patch_state, backup_owner) =
         install_patch_state(&backup, &game_dir, index_is_patched(&index));
     let index_display_path = store.index_display_path();
+    let mtx_catalog = build_mtx_catalog(index.paths());
 
     Ok(AppStatus {
         game_dir,
@@ -118,6 +120,7 @@ pub fn load_status(game_dir: Option<PathBuf>) -> Result<AppStatus> {
         has_backup,
         patch_state,
         backup_owner,
+        mtx_catalog,
     })
 }
 
@@ -125,8 +128,8 @@ pub fn preview_patches(request: PatchRequest) -> Result<PatchPreview> {
     crate::timing!("preview_patches_total");
     let game_dir = resolve_game_dir(request.game_dir)?;
     let mut store = BundleStore::new(&game_dir);
-    let mut index = store.open_index()?;
-    let patch_set = compute_patch_set(&store, &mut index, &request.patches, &request.params)?;
+    let index = store.open_shared_index()?;
+    let patch_set = compute_patch_set(&store, &index, &request.patches, &request.params)?;
 
     Ok(PatchPreview {
         game_dir,
@@ -137,9 +140,8 @@ pub fn preview_patches(request: PatchRequest) -> Result<PatchPreview> {
 
 pub fn apply_patches(request: PatchRequest) -> Result<ApplyReport> {
     crate::timing!("apply_patches_total");
-    ensure_game_not_running()?;
-
     let game_dir = resolve_game_dir(request.game_dir)?;
+    ensure_game_not_running(&game_dir)?;
     let mut store = BundleStore::new(&game_dir);
     let backup = BackupStore::from_default_location()?;
 
@@ -170,7 +172,7 @@ pub fn apply_patches(request: PatchRequest) -> Result<ApplyReport> {
         index = store.open_index()?;
     }
 
-    let patch_set = compute_patch_set(&store, &mut index, &request.patches, &request.params)?;
+    let patch_set = compute_patch_set(&store, &index, &request.patches, &request.params)?;
 
     if patch_set.changes.is_empty() {
         bail!(
@@ -188,6 +190,9 @@ pub fn apply_patches(request: PatchRequest) -> Result<ApplyReport> {
             );
         }
     }
+
+    // The game may have started while the patch set was built.
+    ensure_game_not_running(&game_dir)?;
 
     if patch_state.has_stale_backup() {
         backup.remove().with_context(|| {
@@ -239,8 +244,8 @@ pub fn apply_patches(request: PatchRequest) -> Result<ApplyReport> {
 }
 
 pub fn restore_backup(game_dir: Option<PathBuf>) -> Result<RestoreReport> {
-    ensure_game_not_running()?;
     let game_dir = resolve_game_dir(game_dir)?;
+    ensure_game_not_running(&game_dir)?;
     let backup = BackupStore::from_default_location()?;
     restore_backup_with_store(game_dir, backup)
 }
@@ -284,16 +289,19 @@ fn restore_backup_with_store(game_dir: PathBuf, backup: BackupStore) -> Result<R
             detect_install_layout(&game_dir)?,
             InstallLayout::ContentGgpk
         );
+        let mut restored_ggpk_index = 0;
         if overlay_restore && let Some(meta) = ggpk_backup_meta(&entries)? {
             let index_display_path = store.index_display_path();
             store.restore_ggpk_backup(meta).map_err(|err| {
                 anyhow!("failed to restore {index_display_path}.\n  Cause: {err:#}")
             })?;
             store.remove_legacy_overlay_files()?;
+            restored_ggpk_index = 1;
         }
-        backup
-            .restore(&entries, &game_dir, overlay_restore)
-            .with_context(|| format!("restore from {} failed", backup.path().display()))?
+        restored_ggpk_index
+            + backup
+                .restore(&entries, &game_dir, overlay_restore)
+                .with_context(|| format!("restore from {} failed", backup.path().display()))?
     } else {
         eprintln!("No backup found at {}", backup.path().display());
         0
@@ -419,9 +427,8 @@ pub fn find_paths(
 ) -> Result<Vec<PathSearchResult>> {
     let game_dir = resolve_game_dir(game_dir)?;
     let mut store = BundleStore::new(&game_dir);
-    let mut index = store.open_index()?;
+    let index = store.open_shared_index()?;
     let query = query.to_ascii_lowercase();
-    index.ensure_paths_built()?;
 
     Ok(index
         .paths()
@@ -429,7 +436,7 @@ pub fn find_paths(
         .filter(|path| path.to_ascii_lowercase().contains(&query))
         .take(limit)
         .map(|path| PathSearchResult {
-            path: path.clone(),
+            path: path.to_string(),
             has_record: index.file_by_path(path).is_some(),
         })
         .collect())
@@ -441,13 +448,13 @@ pub fn load_stat_catalog(game_dir: Option<PathBuf>) -> Result<Vec<StatCatalogEnt
     const PREFIX: &str = "data/statdescriptions/";
     let game_dir = resolve_game_dir(game_dir)?;
     let mut store = BundleStore::new(&game_dir);
-    let mut index = store.open_index()?;
+    let index = store.open_shared_index()?;
     let entries = index.matching_paths_by(|path| {
         let normalized = path.replace('\\', "/").to_ascii_lowercase();
         normalized
             .strip_prefix(PREFIX)
             .is_some_and(|rest| rest.ends_with(".csd") && !rest.contains('/'))
-    })?;
+    });
     let files: Vec<_> = entries.iter().map(|entry| entry.file).collect();
     let by_hash = store.read_files_batch(&index, &files)?;
 
@@ -480,8 +487,7 @@ pub fn load_effect_skill_catalog(
     crate::timing!("load_effect_skill_catalog_total");
     let game_dir = resolve_game_dir(game_dir)?;
     let mut store = BundleStore::new(&game_dir);
-    let mut index = store.open_index()?;
-    index.ensure_paths_built()?;
+    let index = store.open_shared_index()?;
     skill_catalog_from_index(&store, &index)
 }
 
@@ -491,8 +497,7 @@ pub fn load_other_effect_catalog(
 ) -> Result<Vec<OtherEffectCatalogEntry>> {
     let game_dir = resolve_game_dir(game_dir)?;
     let mut store = BundleStore::new(&game_dir);
-    let mut index = store.open_index()?;
-    index.ensure_paths_built()?;
+    let index = store.open_shared_index()?;
     let skills = skill_catalog_from_index(&store, &index)?;
     Ok(build_other_effect_catalog(index.paths(), &skills))
 }
@@ -529,8 +534,8 @@ pub fn load_monster_effect_catalog(
     crate::timing!("load_monster_effect_catalog_total");
     let game_dir = resolve_game_dir(game_dir)?;
     let mut store = BundleStore::new(&game_dir);
-    let mut index = store.open_index()?;
-    build_monster_effect_catalog(&store, &mut index)
+    let index = store.open_shared_index()?;
+    build_monster_effect_catalog(&store, &index)
 }
 
 pub fn inspect_path(
@@ -540,7 +545,7 @@ pub fn inspect_path(
 ) -> Result<InspectedPath> {
     let game_dir = resolve_game_dir(game_dir)?;
     let mut store = BundleStore::new(&game_dir);
-    let index = store.open_index()?;
+    let index = store.open_shared_index()?;
     let bytes = store.read_file(&index, path)?;
     let limited = bytes.iter().take(byte_limit).copied().collect::<Vec<_>>();
     let text_preview = if bytes.starts_with(&[0xff, 0xfe]) {
@@ -607,6 +612,37 @@ mod tests {
         assert_eq!(report.restored_files, 0);
         assert!(report.backup_removed);
         assert!(!backup.has_backup());
+    }
+
+    #[test]
+    fn ggpk_restore_counts_the_restored_index() {
+        use crate::bundle::store_tests::{patch_test_ggpk, write_test_ggpk_files};
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game");
+        fs::create_dir_all(&game).unwrap();
+        let original = test_index_bytes(&[]);
+        write_test_ggpk_files(
+            &game.join("Content.ggpk"),
+            "Bundles2",
+            &[("_.index.bin", original.as_slice())],
+        );
+        let meta = patch_test_ggpk(
+            &game,
+            "TinyPoe2Smoother_0",
+            &test_index_bytes(&["TinyPoe2Smoother_0"]),
+        );
+        let backup = BackupStore::for_path(temp.path().join("poe2.bak"));
+        backup.ensure_ggpk_backup_meta(&game, meta).unwrap();
+
+        let report = restore_backup_with_store(game.clone(), backup.clone()).unwrap();
+
+        assert_eq!(report.restored_files, 1);
+        assert!(report.backup_removed);
+        assert!(!backup.has_backup());
+        assert_eq!(
+            BundleStore::new(&game).read_index_bytes().unwrap(),
+            original
+        );
     }
 
     #[test]

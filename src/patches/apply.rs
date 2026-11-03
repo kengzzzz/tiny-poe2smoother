@@ -3,18 +3,18 @@ use super::color_mods::ColorMatcher;
 use super::effect_dependencies::resolve_full_effect_dependencies;
 use super::effect_skills::EffectsFilter;
 use super::monster_effects::resolve_full_monster_effect_paths;
+use super::mtx_effects::kept_mtx_paths;
 use super::targeting::{
     effects_targets_path, exact_patch_targets, patch_applies_path, patch_targets_path,
 };
 use super::transform::{TransformCtx, transform};
 use crate::bundle::{BundleFile, BundleIndex, BundleStore};
-use anyhow::{Result, anyhow, bail};
-use rayon::prelude::*;
+use anyhow::{Result, bail};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 pub fn compute_patch_set(
     store: &BundleStore,
-    index: &mut BundleIndex,
+    index: &BundleIndex,
     patches: &[PatchId],
     params: &PatchParams,
 ) -> Result<PatchSet> {
@@ -25,13 +25,19 @@ pub fn compute_patch_set(
     // Only resolved when needed so the default path skips the extra reads.
     let protects_visuals =
         patches.contains(&PatchId::Effects) || patches.contains(&PatchId::Particles);
-    let full_monster_paths = if protects_visuals {
+    let mut full_paths = if protects_visuals {
         resolve_full_monster_effect_paths(store, index, &params.monster_effects)?
     } else {
         BTreeSet::new()
     };
-    let mut effects_filter = EffectsFilter::new(&params.effect_skills, full_monster_paths);
-    if protects_visuals && let Some(filter) = effects_filter.as_mut() {
+    let keeps_mtx = patches.contains(&PatchId::MtxSoft) && !params.kept_mtx.is_empty();
+    if keeps_mtx {
+        full_paths.extend(kept_mtx_paths(index.paths(), &params.kept_mtx));
+    }
+    let mut effects_filter = EffectsFilter::new(&params.effect_skills, full_paths);
+    if (protects_visuals || keeps_mtx)
+        && let Some(filter) = effects_filter.as_mut()
+    {
         let dependencies = resolve_full_effect_dependencies(store, index, filter)?;
         filter.protect_paths(dependencies);
     }
@@ -45,46 +51,29 @@ pub fn compute_patch_set(
     let candidates = collect_patch_targets(index, &patches, effects_filter.as_ref())?;
     let candidates = dedup_candidates(candidates);
 
-    crate::timing!("bundle_batch_read");
+    crate::timing!("bundle_read_transform");
     let files: Vec<BundleFile> = candidates.iter().map(|(_, file)| *file).collect();
-    let mut by_hash = store.read_files_batch(index, &files)?;
-    let file_data: Vec<Vec<u8>> = candidates
-        .iter()
-        .map(|(path, file)| {
-            by_hash
-                .remove(&file.hash)
-                .ok_or_else(|| anyhow!("patch target bytes missing after read: {path}"))
-        })
-        .collect::<Result<_>>()?;
-
-    crate::timing!("patch_transform");
-    let transformed = candidates
-        .par_iter()
-        .zip(file_data.into_par_iter())
-        .map(
-            |((path, _), mut bytes)| -> Result<(String, Vec<u8>, bool)> {
-                let mut changed = false;
-                for &patch in &patches {
-                    if patch_applies_path(patch, path) {
-                        let after = transform(patch, path, &bytes, ctx)?;
-                        if after != bytes {
-                            bytes = after;
-                            changed = true;
-                        }
-                    }
+    // Transform each file as it is decoded, so only changed bytes stay in memory.
+    let transformed = store.visit_files_batch(index, &files, |i, mut bytes| {
+        let path = &candidates[i].0;
+        let mut changed = false;
+        for &patch in &patches {
+            if patch_applies_path(patch, path) {
+                let after = transform(patch, path, &bytes, ctx)?;
+                if after != bytes {
+                    bytes = after;
+                    changed = true;
                 }
-                Ok((path.clone(), bytes, changed))
-            },
-        )
-        .collect::<Vec<_>>()
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?;
+            }
+        }
+        Ok(changed.then_some(bytes))
+    })?;
 
     build_patch_set_from_transformed(index, &candidates, transformed)
 }
 
 fn collect_patch_targets(
-    index: &mut BundleIndex,
+    index: &BundleIndex,
     patches: &[PatchId],
     effects: Option<&EffectsFilter>,
 ) -> Result<Vec<(String, BundleFile)>> {
@@ -114,7 +103,7 @@ fn collect_patch_targets(
             continue;
         }
         for path in exact_targets {
-            if let Some(file) = index.file_by_path(path).copied() {
+            if let Some(file) = index.file_by_path(path) {
                 targets
                     .entry(patch)
                     .or_default()
@@ -124,9 +113,9 @@ fn collect_patch_targets(
     }
 
     if !broad_patches.is_empty() {
-        for entry in index.matching_paths_by(|path| {
-            broad_patches.iter().any(|patch| targets_path(*patch, path))
-        })? {
+        for entry in index
+            .matching_paths_by(|path| broad_patches.iter().any(|patch| targets_path(*patch, path)))
+        {
             for patch in &broad_patches {
                 if targets_path(*patch, &entry.path) {
                     targets
@@ -176,18 +165,15 @@ pub(crate) fn unique_patches(patches: &[PatchId]) -> Vec<PatchId> {
 fn build_patch_set_from_transformed(
     index: &BundleIndex,
     candidates: &[(String, BundleFile)],
-    transformed: Vec<(String, Vec<u8>, bool)>,
+    transformed: Vec<Option<Vec<u8>>>,
 ) -> Result<PatchSet> {
     let mut changes = Vec::new();
     let mut replacements: HashMap<String, Vec<(BundleFile, Vec<u8>)>> = HashMap::new();
-    for ((candidate_path, file), (path, bytes, changed)) in candidates.iter().zip(transformed) {
-        if candidate_path != &path {
-            bail!("transformed patch target order mismatch: {candidate_path} != {path}");
-        }
-        if changed {
+    for ((path, file), bytes) in candidates.iter().zip(transformed) {
+        if let Some(bytes) = bytes {
             let bundle_name = index.bundle_name(file.bundle_index)?;
             changes.push(PatchChange {
-                path,
+                path: path.clone(),
                 bundle_name: bundle_name.to_string(),
                 old_size: file.size as usize,
                 new_size: bytes.len(),
@@ -218,7 +204,7 @@ fn build_patch_set_from_changed(
         if *changed.get(path).unwrap_or(&false) {
             let bytes = file_data
                 .remove(path)
-                .ok_or_else(|| anyhow!("changed patch target bytes missing: {path}"))?;
+                .ok_or_else(|| anyhow::anyhow!("changed patch target bytes missing: {path}"))?;
             let bundle_name = index.bundle_name(file.bundle_index)?;
             changes.push(PatchChange {
                 path: path.clone(),
@@ -258,7 +244,7 @@ mod tests {
             "env.bundle.bin",
             6,
         )]);
-        let file = *index
+        let file = index
             .file_by_path("metadata/environmentsettings/test.env")
             .unwrap();
         let candidates = vec![("metadata/environmentsettings/test.env".to_string(), file)];
@@ -295,15 +281,12 @@ mod tests {
 
     #[test]
     fn duplicate_selected_patches_do_not_create_missing_target_errors() {
-        let mut index =
+        let index =
             BundleIndex::for_test_paths(&[("metadata/environmentsettings/test.env", "env", 12)]);
 
-        let candidates = collect_patch_targets(
-            &mut index,
-            &[PatchId::Atmosphere, PatchId::Atmosphere],
-            None,
-        )
-        .unwrap();
+        let candidates =
+            collect_patch_targets(&index, &[PatchId::Atmosphere, PatchId::Atmosphere], None)
+                .unwrap();
         let candidates = dedup_candidates(candidates);
 
         assert_eq!(candidates.len(), 1);
@@ -312,13 +295,13 @@ mod tests {
 
     #[test]
     fn broad_environment_patches_share_one_target_scan_result() {
-        let mut index = BundleIndex::for_test_paths(&[
+        let index = BundleIndex::for_test_paths(&[
             ("metadata/environmentsettings/test.env", "env", 12),
             ("metadata/environmentsettings/ignored.txt", "env", 12),
         ]);
 
         let candidates = collect_patch_targets(
-            &mut index,
+            &index,
             &[PatchId::Atmosphere, PatchId::Shadow, PatchId::Light],
             None,
         )
@@ -331,7 +314,7 @@ mod tests {
 
     #[test]
     fn direct_patch_targets_must_match_exact_paths() {
-        let mut index = BundleIndex::for_test_paths(&[
+        let index = BundleIndex::for_test_paths(&[
             ("shaders/minimap_visibility_pixel.hlsl", "shader", 12),
             ("x/shaders/minimap_blending_pixel.hlsl", "shader", 12),
             (
@@ -342,8 +325,7 @@ mod tests {
         ]);
 
         let candidates =
-            collect_patch_targets(&mut index, &[PatchId::Minimap, PatchId::AtlasFog], None)
-                .unwrap();
+            collect_patch_targets(&index, &[PatchId::Minimap, PatchId::AtlasFog], None).unwrap();
         let paths = candidates
             .into_iter()
             .map(|(path, _)| path)
@@ -360,10 +342,10 @@ mod tests {
 
     #[test]
     fn missing_selected_patch_target_still_errors() {
-        let mut index =
+        let index =
             BundleIndex::for_test_paths(&[("metadata/environmentsettings/test.env", "env", 12)]);
 
-        let err = collect_patch_targets(&mut index, &[PatchId::Minimap], None).unwrap_err();
+        let err = collect_patch_targets(&index, &[PatchId::Minimap], None).unwrap_err();
 
         assert!(
             err.to_string()
@@ -373,7 +355,7 @@ mod tests {
 
     #[test]
     fn capture_driven_patches_discover_expected_path_families() {
-        let mut index = BundleIndex::for_test_paths(&[
+        let index = BundleIndex::for_test_paths(&[
             (
                 "metadata/effects/spells/fireball/fireball.ao",
                 "effects",
@@ -399,7 +381,7 @@ mod tests {
         ]);
 
         let candidates = collect_patch_targets(
-            &mut index,
+            &index,
             &[
                 PatchId::SkillSounds,
                 PatchId::MonsterSounds,
@@ -429,7 +411,7 @@ mod tests {
     fn per_skill_levels_filter_effect_target_collection() {
         use super::super::effect_skills::{EffectLevel, EffectSkillOverride};
 
-        let mut index = BundleIndex::for_test_paths(&[
+        let index = BundleIndex::for_test_paths(&[
             (
                 "metadata/effects/spells/cold_herald_of_ice/ao/ice_explosion.ao",
                 "effects",
@@ -468,8 +450,7 @@ mod tests {
         )
         .unwrap();
 
-        let candidates =
-            collect_patch_targets(&mut index, &[PatchId::Effects], Some(&filter)).unwrap();
+        let candidates = collect_patch_targets(&index, &[PatchId::Effects], Some(&filter)).unwrap();
         let paths = dedup_candidates(candidates)
             .into_iter()
             .map(|(path, _)| path)
@@ -493,7 +474,7 @@ mod tests {
     #[test]
     fn per_monster_paths_filter_effect_target_collection() {
         let kept = "metadata/effects/spells/monsters_effects/act3/anchoritemother/idle.ao";
-        let mut index = BundleIndex::for_test_paths(&[
+        let index = BundleIndex::for_test_paths(&[
             (kept, "effects", 12),
             (
                 "metadata/effects/spells/monsters_effects/act3/anchoritemother/death.ao",
@@ -509,7 +490,7 @@ mod tests {
         let filter = EffectsFilter::new(&[], BTreeSet::from([kept.to_string()])).unwrap();
 
         let candidates = collect_patch_targets(
-            &mut index,
+            &index,
             &[PatchId::Effects, PatchId::MonsterSounds],
             Some(&filter),
         )
@@ -538,7 +519,7 @@ mod tests {
     fn full_skill_folders_still_flow_to_other_selected_patches() {
         use super::super::effect_skills::{EffectLevel, EffectSkillOverride};
 
-        let mut index = BundleIndex::for_test_paths(&[
+        let index = BundleIndex::for_test_paths(&[
             (
                 "metadata/effects/spells/fireball/fireball.ao",
                 "effects",
@@ -556,7 +537,7 @@ mod tests {
         .unwrap();
 
         let candidates = collect_patch_targets(
-            &mut index,
+            &index,
             &[PatchId::Effects, PatchId::SkillSounds],
             Some(&filter),
         )
@@ -575,7 +556,7 @@ mod tests {
     fn all_full_effect_selection_is_a_valid_noop() {
         use super::super::effect_skills::{EffectLevel, EffectSkillOverride};
 
-        let mut index = BundleIndex::for_test_paths(&[(
+        let index = BundleIndex::for_test_paths(&[(
             "metadata/effects/spells/fireball/fireball.ao",
             "effects",
             12,
@@ -590,7 +571,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            collect_patch_targets(&mut index, &[PatchId::Effects], Some(&filter))
+            collect_patch_targets(&index, &[PatchId::Effects], Some(&filter))
                 .unwrap()
                 .is_empty()
         );
@@ -600,8 +581,7 @@ mod tests {
     fn full_effect_selection_without_base_targets_reports_game_version_error() {
         use super::super::effect_skills::{EffectLevel, EffectSkillOverride};
 
-        let mut index =
-            BundleIndex::for_test_paths(&[("metadata/unrelated/file.ao", "unrelated", 12)]);
+        let index = BundleIndex::for_test_paths(&[("metadata/unrelated/file.ao", "unrelated", 12)]);
         let filter = EffectsFilter::new(
             &[EffectSkillOverride {
                 folder: "fireball".to_string(),
@@ -611,8 +591,7 @@ mod tests {
         )
         .unwrap();
 
-        let err =
-            collect_patch_targets(&mut index, &[PatchId::Effects], Some(&filter)).unwrap_err();
+        let err = collect_patch_targets(&index, &[PatchId::Effects], Some(&filter)).unwrap_err();
 
         let msg = err.to_string();
         assert!(msg.contains("no matching files in this game version"));
@@ -622,13 +601,12 @@ mod tests {
     #[test]
     fn sound_patch_skips_character_selection_assets() {
         let startup_scene = "Metadata/Terrain/CharacterSelection/CharacterSelectionGallows/Gallows_MainBuilding_fx.ao";
-        let mut index = BundleIndex::for_test_paths(&[
+        let index = BundleIndex::for_test_paths(&[
             (startup_scene, "startup", 12),
             ("metadata/terrain/trees/tree.ao", "terrain", 12),
         ]);
 
-        let candidates =
-            collect_patch_targets(&mut index, &[PatchId::DisableSounds], None).unwrap();
+        let candidates = collect_patch_targets(&index, &[PatchId::DisableSounds], None).unwrap();
         let paths = dedup_candidates(candidates)
             .into_iter()
             .map(|(path, _)| path)
@@ -701,7 +679,7 @@ mod tests {
             .zip(&names)
             .map(|((path, bytes), name)| (*path, name.as_str(), bytes.len() as u32))
             .collect();
-        let mut index = BundleIndex::for_test_paths(&entries);
+        let index = BundleIndex::for_test_paths(&entries);
         let store = BundleStore::new(temp.path());
         let params = PatchParams {
             effect_skills: vec![
@@ -720,7 +698,7 @@ mod tests {
             vec![PatchId::Effects, PatchId::Particles],
             vec![PatchId::Particles, PatchId::Effects],
         ] {
-            let result = compute_patch_set(&store, &mut index, &patches, &params).unwrap();
+            let result = compute_patch_set(&store, &index, &patches, &params).unwrap();
             let changed: BTreeSet<_> = result.changes.iter().map(|c| c.path.as_str()).collect();
             assert_eq!(
                 changed,
@@ -732,7 +710,7 @@ mod tests {
             );
         }
         // Protection also holds with only Particles selected.
-        let result = compute_patch_set(&store, &mut index, &[PatchId::Particles], &params).unwrap();
+        let result = compute_patch_set(&store, &index, &[PatchId::Particles], &params).unwrap();
         assert_eq!(result.changes.len(), 1);
         assert_eq!(
             result.changes[0].path,
@@ -745,7 +723,7 @@ mod tests {
         };
         let result = compute_patch_set(
             &store,
-            &mut index,
+            &index,
             &[PatchId::Effects, PatchId::Particles],
             &reduced,
         )

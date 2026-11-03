@@ -8,6 +8,7 @@ mod effect_dependencies;
 mod effect_skills;
 mod minimap;
 mod monster_effects;
+mod mtx_effects;
 mod other_effects;
 mod targeting;
 mod text;
@@ -31,6 +32,7 @@ pub use minimap::MinimapStyle;
 pub use monster_effects::{
     MonsterEffectCatalogEntry, MonsterEffectOverride, build_monster_effect_catalog,
 };
+pub use mtx_effects::{MtxCatalogEntry, build_mtx_catalog};
 pub use other_effects::{OtherEffectCatalogEntry, build_other_effect_catalog};
 pub(crate) use text::decode_utf16;
 pub use transform::audit_transform;

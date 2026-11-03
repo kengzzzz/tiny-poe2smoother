@@ -496,7 +496,7 @@ int EncodeArray_AdvRLE(uint8 *dst, uint8 *dst_end, const uint8 *src, int src_siz
     cost = outbytes;
   }
   *cost_ptr = cost + GetTime_AdvRLE(platforms, src_size) * speed_tradeoff + 5;
-  delete temp;
+  delete[] temp; // tiny-poe2smoother: was scalar delete on new[].
   return outbytes;
 }
 

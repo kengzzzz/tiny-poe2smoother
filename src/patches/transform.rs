@@ -120,10 +120,7 @@ pub(super) fn transform(
         PatchId::PostProcess => post_process(bytes, ctx.options),
         PatchId::Delirium => delirium(bytes),
         PatchId::Particles => {
-            if ctx
-                .effects
-                .is_some_and(|filter| filter.level_for(path) == EffectLevel::Full)
-            {
+            if keeps_original(path, ctx) {
                 Ok(bytes.to_vec())
             } else {
                 particles(path, bytes)
@@ -133,11 +130,22 @@ pub(super) fn transform(
         PatchId::DisableSounds => strip_sounds(path, bytes),
         PatchId::SkillSounds => strip_sounds(path, bytes),
         PatchId::MonsterSounds => strip_sounds(path, bytes),
-        PatchId::MtxSoft => mtx_soft(path, bytes, ctx.options),
+        PatchId::MtxSoft => {
+            if keeps_original(path, ctx) {
+                Ok(bytes.to_vec())
+            } else {
+                mtx_soft(path, bytes, ctx.options)
+            }
+        }
         PatchId::CompactModLines => compact_mod_lines(bytes, ctx.options),
         PatchId::MonsterHpBar => monster_hp_bar(bytes),
         PatchId::BlackScreen => black_screen(bytes),
     }
+}
+
+fn keeps_original(path: &str, ctx: TransformCtx<'_>) -> bool {
+    ctx.effects
+        .is_some_and(|filter| filter.level_for(path) == EffectLevel::Full)
 }
 
 fn camera(path: &str, bytes: &[u8], zoom: f64) -> Result<Vec<u8>> {
@@ -805,6 +813,27 @@ SoundEvents {}\r\n}";
         )
         .unwrap();
         assert_eq!(ao, ao_in);
+    }
+
+    #[test]
+    fn mtx_soft_leaves_kept_files_alone() {
+        let kept = "metadata/effects/microtransactions/misc/uniques/berekthetaming/fx/fire.pet";
+        let other = "metadata/effects/microtransactions/misc/uniques/other/fx/fire.pet";
+        let stuff = encode_utf16_bom("particle data");
+        let filter = EffectsFilter::new(&[], [kept.to_string()].into()).unwrap();
+        let ctx = TransformCtx {
+            effects: Some(&filter),
+            ..TransformCtx::default()
+        };
+
+        assert_eq!(
+            transform(PatchId::MtxSoft, kept, &stuff, ctx).unwrap(),
+            stuff
+        );
+        assert_eq!(
+            transform(PatchId::MtxSoft, other, &stuff, ctx).unwrap(),
+            encode_utf16_bom("0")
+        );
     }
 
     #[test]

@@ -1,10 +1,13 @@
-use super::compression::{decompress_bundle, decompress_bundle_slices};
+use super::compression::{
+    OOZ_SAFE_SPACE, bundle_uncompressed_size, decompress_bundle, pack_bundle_serial,
+    visit_bundle_slices, visit_bundle_slices_from,
+};
 use super::ggpk::{
     GgpkArchive, GgpkFileSpan, GgpkPatchPlan, GgpkPdirEntry, ggpk_file_record, ggpk_find_file,
     ggpk_find_pdir, ggpk_name_hash, ggpk_pdir_record,
 };
-use super::hashing::{HashMode, hash_fnv1a};
-use super::index::{BundleFile, BundleIndex, BundleInfo, DirectoryRecord};
+use super::hashing::hash_fnv1a;
+use super::index::{BundleFile, BundleIndex, PathList};
 use crate::backup::GgpkBackupMeta;
 use crate::install::{InstallLayout, detect_install_layout, normalized_game_dir};
 use anyhow::{Context, Result, anyhow, bail};
@@ -13,10 +16,11 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fs;
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::SystemTime;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
+use std::thread::JoinHandle;
+use std::time::{Duration, SystemTime};
 
 #[derive(Clone)]
 pub struct BundleStore {
@@ -37,8 +41,14 @@ struct CacheKey {
     mtime: u128,
 }
 
-const CACHE_MAGIC: &[u8; 4] = b"2SI4";
+const CACHE_MAGIC: &[u8; 4] = b"2SI6";
 const CACHE_MIGRATION_MARKER: &str = "index-cache-v3.migrated";
+
+static SHARED_INDEX: Mutex<Option<(CacheKey, Weak<BundleIndex>)>> = Mutex::new(None);
+
+fn shared_index() -> MutexGuard<'static, Option<(CacheKey, Weak<BundleIndex>)>> {
+    SHARED_INDEX.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 fn default_cache_dir() -> PathBuf {
     dirs::data_local_dir()
@@ -130,139 +140,276 @@ fn retire_legacy_caches_with(
     }
 }
 
-/// Caps a count by the remaining bytes so a corrupt cache can't force a huge allocation.
-fn checked_count(c: &Cursor<&[u8]>, count: u64, unit: u64) -> Option<usize> {
-    let remaining = (c.get_ref().len() as u64).saturating_sub(c.position());
-    (count.checked_mul(unit)? <= remaining).then_some(count as usize)
+fn read_cache_section(reader: &mut impl Read, remaining: &mut u64) -> Option<Vec<u8>> {
+    let len = reader.read_u64::<LittleEndian>().ok()?;
+    *remaining = remaining.checked_sub(8)?.checked_sub(len)?;
+    let mut bytes = vec![0; usize::try_from(len).ok()?];
+    reader.read_exact(&mut bytes).ok()?;
+    Some(bytes)
 }
 
-fn parse_index_cache(data: &[u8], key: &CacheKey) -> Option<BundleIndex> {
-    let mut c = Cursor::new(data);
+fn write_cache_section(writer: &mut impl Write, bytes: &[u8]) -> std::io::Result<()> {
+    writer.write_u64::<LittleEndian>(bytes.len() as u64)?;
+    writer.write_all(bytes)
+}
+
+/// `len` bounds every section, so a corrupt length can't force a huge allocation.
+fn parse_index_cache(mut reader: impl Read, len: u64, key: &CacheKey) -> Option<BundleIndex> {
     let mut magic = [0u8; 4];
-    c.read_exact(&mut magic).ok()?;
+    reader.read_exact(&mut magic).ok()?;
     if &magic != CACHE_MAGIC {
         return None;
     }
-    let source_len = c.read_u64::<LittleEndian>().ok()?;
-    let source_len = checked_count(&c, source_len, 1)?;
-    let mut source_bytes = vec![0u8; source_len];
-    c.read_exact(&mut source_bytes).ok()?;
-    let cached_source = String::from_utf8(source_bytes).ok()?;
-    let cached_size: u64 = c.read_u64::<LittleEndian>().ok()?;
-    let cached_mtime: u128 = c.read_u128::<LittleEndian>().ok()?;
-    if cached_source != key.source || cached_size != key.size || cached_mtime != key.mtime {
+    let mut remaining = len.checked_sub(4)?;
+    let cached_source = read_cache_section(&mut reader, &mut remaining)?;
+    remaining = remaining.checked_sub(24)?;
+    let cached_size = reader.read_u64::<LittleEndian>().ok()?;
+    let cached_mtime = reader.read_u128::<LittleEndian>().ok()?;
+    if cached_source != key.source.as_bytes()
+        || cached_size != key.size
+        || cached_mtime != key.mtime
+    {
         return None;
     }
-    let rd_len = c.read_u64::<LittleEndian>().ok()?;
-    let rd_len = checked_count(&c, rd_len, 1)?;
-    let mut raw_decompressed = vec![0u8; rd_len];
-    c.read_exact(&mut raw_decompressed).ok()?;
-    let bcount = c.read_u64::<LittleEndian>().ok()?;
-    // name length (u32) + uncompressed_size (u32)
-    let bcount = checked_count(&c, bcount, 8)?;
-    let mut bundles = Vec::with_capacity(bcount);
-    for _ in 0..bcount {
-        let nlen = c.read_u32::<LittleEndian>().ok()?;
-        let nlen = checked_count(&c, u64::from(nlen), 1)?;
-        let mut nb = vec![0u8; nlen];
-        c.read_exact(&mut nb).ok()?;
-        let size_pos = c.position() as usize;
-        let uncompressed_size = c.read_u32::<LittleEndian>().ok()?;
-        bundles.push(BundleInfo {
-            name: String::from_utf8(nb).ok()?,
-            uncompressed_size,
-            size_pos,
-        });
+    let raw_decompressed = read_cache_section(&mut reader, &mut remaining)?;
+    // Real path text is about 1.8x the raw index. This only stops absurd headers.
+    let text_budget = (raw_decompressed.len() as u64).saturating_mul(4);
+    let paths = read_path_blocks(&mut reader, &mut remaining, text_budget)?;
+    if remaining != 0 {
+        return None;
     }
-    let fcount = c.read_u64::<LittleEndian>().ok()?;
-    // hash + record_pos (u64 each) + bundle_index + offset + size (u32 each)
-    let fcount = checked_count(&c, fcount, 28)?;
-    let mut files = HashMap::with_capacity(fcount);
-    let mut file_order = Vec::with_capacity(fcount);
-    for _ in 0..fcount {
-        let hash = c.read_u64::<LittleEndian>().ok()?;
-        let record_pos = c.read_u64::<LittleEndian>().ok()? as usize;
-        let bundle_index = c.read_u32::<LittleEndian>().ok()?;
-        let offset = c.read_u32::<LittleEndian>().ok()?;
-        let size = c.read_u32::<LittleEndian>().ok()?;
-        if bundle_index as usize >= bundles.len() {
-            return None;
+    BundleIndex::with_paths(raw_decompressed, paths).ok()
+}
+
+/// Decodes each block on the pool while the next is read, so few compressed blocks are
+/// held at once.
+fn read_path_blocks(
+    reader: &mut impl Read,
+    remaining: &mut u64,
+    mut text_budget: u64,
+) -> Option<PathList> {
+    *remaining = remaining.checked_sub(4)?;
+    let count = reader.read_u32::<LittleEndian>().ok()? as usize;
+    if count as u64 > *remaining / 16 {
+        return None;
+    }
+    let slots: Vec<OnceLock<Option<(String, usize)>>> =
+        std::iter::repeat_with(OnceLock::new).take(count).collect();
+    let all_read = rayon::in_place_scope(|scope| {
+        for slot in &slots {
+            let Some(packed) = read_cache_section(reader, remaining) else {
+                return false;
+            };
+            // Oodle trusts its input, so damaged blocks must never reach it.
+            let Some(rest) = remaining.checked_sub(8) else {
+                return false;
+            };
+            *remaining = rest;
+            if reader.read_u64::<LittleEndian>().ok() != Some(checksum(&packed)) {
+                return false;
+            }
+            let Some(size) = bundle_uncompressed_size(&packed)
+                .ok()
+                .and_then(|size| u64::try_from(size).ok())
+                .filter(|&size| size <= text_budget)
+            else {
+                return false;
+            };
+            text_budget -= size;
+            scope.spawn(move |_| {
+                let block = decompress_bundle(&packed)
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+                    .and_then(PathList::checked_block);
+                let _ = slot.set(block);
+            });
         }
-        file_order.push(hash);
-        files.insert(
-            hash,
-            BundleFile {
-                hash,
-                bundle_index,
-                offset,
-                size,
-                record_pos,
-            },
-        );
+        true
+    });
+    if !all_read {
+        return None;
     }
-    let hm_byte = c.read_u8().ok()?;
-    let hash_mode = match hm_byte {
-        0 => HashMode::Murmur64A,
-        1 => HashMode::Fnv1A,
-        _ => return None,
-    };
-    let file_count_pos = c.read_u64::<LittleEndian>().ok()? as usize;
-    let dirlen = c.read_u64::<LittleEndian>().ok()?;
-    let dirlen = checked_count(&c, dirlen, 1)?;
-    let mut directory_bytes_compressed = vec![0u8; dirlen];
-    c.read_exact(&mut directory_bytes_compressed).ok()?;
-    let dcount = c.read_u64::<LittleEndian>().ok()?;
-    // path_hash (u64) + offset + size + recursive_size (u32 each)
-    let dcount = checked_count(&c, dcount, 20)?;
-    let mut directories = Vec::with_capacity(dcount);
-    for _ in 0..dcount {
-        directories.push(DirectoryRecord {
-            path_hash: c.read_u64::<LittleEndian>().ok()?,
-            offset: c.read_u32::<LittleEndian>().ok()?,
-            size: c.read_u32::<LittleEndian>().ok()?,
-            _recursive_size: c.read_u32::<LittleEndian>().ok()?,
-        });
+    let mut blocks = Vec::with_capacity(count);
+    let mut len = 0;
+    for slot in slots {
+        let (block, block_len) = slot.into_inner()??;
+        blocks.push(block);
+        len += block_len;
     }
-    let has_paths = c.read_u8().ok()? != 0;
-    let paths = if has_paths {
-        let pcount = c.read_u64::<LittleEndian>().ok()?;
-        // length prefix (u64) per path
-        let pcount = checked_count(&c, pcount, 8)?;
-        let mut p = Vec::with_capacity(pcount);
-        for _ in 0..pcount {
-            let plen = c.read_u64::<LittleEndian>().ok()?;
-            let plen = checked_count(&c, plen, 1)?;
-            let mut pb = vec![0u8; plen];
-            c.read_exact(&mut pb).ok()?;
-            p.push(String::from_utf8(pb).ok()?);
-        }
-        Some(p)
-    } else {
-        None
-    };
-    Some(BundleIndex {
-        raw_decompressed,
-        bundles,
-        hash_mode,
-        files,
-        file_order,
-        file_count_pos,
-        directory_bytes_compressed,
-        directories,
-        paths,
+    Some(PathList::from_blocks(blocks, len))
+}
+
+fn write_index_cache(
+    writer: &mut impl Write,
+    index: &BundleIndex,
+    key: &CacheKey,
+) -> std::io::Result<()> {
+    writer.write_all(CACHE_MAGIC)?;
+    write_cache_section(writer, key.source.as_bytes())?;
+    writer.write_u64::<LittleEndian>(key.size)?;
+    writer.write_u128::<LittleEndian>(key.mtime)?;
+    write_cache_section(writer, &index.raw_decompressed)?;
+    // Paths compress about 4x, which halves the read on every cached start.
+    let blocks = index.paths().blocks();
+    writer
+        .write_u32::<LittleEndian>(u32::try_from(blocks.len()).map_err(std::io::Error::other)?)?;
+    for block in blocks {
+        let packed = pack_bundle_serial(block.as_bytes()).map_err(std::io::Error::other)?;
+        write_cache_section(writer, &packed)?;
+        writer.write_u64::<LittleEndian>(checksum(&packed))?;
+    }
+    Ok(())
+}
+
+const CACHE_TEMP_SUFFIX: &str = ".tps-tmp";
+/// A live writer keeps touching its temp, so one this old was left by a killed app.
+const STALE_CACHE_TEMP_AGE: Duration = Duration::from_secs(60);
+
+static CACHE_WRITES: Mutex<Vec<(PathBuf, JoinHandle<()>)>> = Mutex::new(Vec::new());
+
+fn cache_writes() -> MutexGuard<'static, Vec<(PathBuf, JoinHandle<()>)>> {
+    CACHE_WRITES.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn source_key(source_path: &std::path::Path, source: &str) -> Result<CacheKey> {
+    let meta = fs::metadata(source_path)?;
+    let mtime = meta
+        .modified()?
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_nanos();
+    Ok(CacheKey {
+        source: source.to_string(),
+        size: meta.len(),
+        mtime,
     })
 }
 
-fn write_cache_file(
-    path: &std::path::Path,
-    tmp: &std::path::Path,
-    data: &[u8],
-    write: impl FnOnce(&std::path::Path, &[u8]) -> std::io::Result<()>,
-) {
-    let result = write(tmp, data).and_then(|_| fs::rename(tmp, path));
-    if result.is_err() {
-        let _ = fs::remove_file(tmp);
+/// Runs after the index is returned. It holds no game file handle or mapping, so Apply
+/// and Restore can still rewrite or truncate game data meanwhile.
+struct CacheWrite {
+    source_path: PathBuf,
+    key: CacheKey,
+    path: PathBuf,
+    index: Arc<BundleIndex>,
+}
+
+impl CacheWrite {
+    fn spawn(self) {
+        let mut writes = cache_writes();
+        writes.retain(|(_, handle)| !handle.is_finished());
+        if writes.iter().any(|(path, _)| *path == self.path) {
+            return;
+        }
+        let path = self.path.clone();
+        let spawned = std::thread::Builder::new()
+            .name("index-cache-write".into())
+            .spawn(move || {
+                if let Err(err) = self.write() {
+                    tracing::debug!("index cache not written: {err:#}");
+                }
+            });
+        if let Ok(handle) = spawned {
+            writes.push((path, handle));
+        }
     }
+
+    fn write(&self) -> Result<()> {
+        let dir = self
+            .path
+            .parent()
+            .ok_or_else(|| anyhow!("cache path has no parent"))?;
+        fs::create_dir_all(dir)?;
+        retire_legacy_caches(dir);
+        remove_stale_cache_temps(dir, &self.path, STALE_CACHE_TEMP_AGE);
+        publish_cache(
+            &self.path,
+            |file| {
+                let mut writer = BufWriter::new(file);
+                write_index_cache(&mut writer, &self.index, &self.key)?;
+                writer.flush()
+            },
+            // The game may have updated while writing, so don't publish a stale snapshot.
+            || {
+                source_key(&self.source_path, &self.key.source)
+                    .ok()
+                    .as_ref()
+                    == Some(&self.key)
+            },
+        )
+    }
+}
+
+/// Renames a synced temp over `path` only if `still_valid`, so readers never see a
+/// partial or stale file.
+fn publish_cache(
+    path: &std::path::Path,
+    write: impl FnOnce(&mut fs::File) -> std::io::Result<()>,
+    still_valid: impl FnOnce() -> bool,
+) -> Result<()> {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        bail!("not a file path: {}", path.display());
+    };
+    let mut temp = tempfile::Builder::new()
+        .prefix(&format!(".{}.", name.to_string_lossy()))
+        .suffix(CACHE_TEMP_SUFFIX)
+        .tempfile_in(dir)?;
+    write(temp.as_file_mut())?;
+    temp.as_file().sync_all()?;
+    if !still_valid() {
+        bail!("game data changed while caching");
+    }
+    temp.persist(path)?;
+    Ok(())
+}
+
+/// Also removes the `.tmp<pid>` temps that older versions left.
+fn remove_stale_cache_temps(dir: &std::path::Path, path: &std::path::Path, min_age: Duration) {
+    let (Some(name), Some(stem)) = (path.file_name(), path.file_stem()) else {
+        return;
+    };
+    let temp_prefix = format!(".{}.", name.to_string_lossy());
+    let old_prefix = format!("{}.tmp", stem.to_string_lossy());
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        let ours = (file_name.starts_with(&temp_prefix) && file_name.ends_with(CACHE_TEMP_SUFFIX))
+            || file_name
+                .strip_prefix(&old_prefix)
+                .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()));
+        let old_enough = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= min_age);
+        if ours && old_enough {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Detects damaged cache blocks. Not cryptographic.
+fn checksum(bytes: &[u8]) -> u64 {
+    const K: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut lanes = [K, K.rotate_left(17), K.rotate_left(31), K.rotate_left(47)];
+    let (words, tail) = bytes.as_chunks::<32>();
+    for chunk in words {
+        for (lane, word) in lanes.iter_mut().zip(chunk.as_chunks::<8>().0) {
+            *lane = (*lane ^ u64::from_le_bytes(*word))
+                .wrapping_mul(K)
+                .rotate_left(29);
+        }
+    }
+    let mut hash = lanes.iter().fold(bytes.len() as u64, |hash, &lane| {
+        (hash ^ lane).wrapping_mul(K).rotate_left(27)
+    });
+    for &byte in tail {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(K).rotate_left(5);
+    }
+    hash ^ (hash >> 32)
 }
 
 impl BundleStore {
@@ -352,125 +499,107 @@ impl BundleStore {
         crate::timing!("cache_read");
         retire_legacy_caches(&self.cache_dir);
         let key_before = self.cache_key().ok()??;
-        let data = fs::read(self.cache_path()).ok()?;
-        let index = parse_index_cache(&data, &key_before)?;
+        let file = fs::File::open(self.cache_path()).ok()?;
+        let len = file.metadata().ok()?.len();
+        let index = parse_index_cache(file, len, &key_before)?;
         let key_after = self.cache_key().ok()??;
         (key_before == key_after).then_some(index)
     }
 
-    fn write_cache(&self, index: &BundleIndex, source_key: &CacheKey) {
-        retire_legacy_caches(&self.cache_dir);
-        if self.cache_key().ok().flatten().as_ref() != Some(source_key) {
-            return;
-        }
-        let mut data = Vec::new();
-        data.extend_from_slice(CACHE_MAGIC);
-        data.write_u64::<LittleEndian>(source_key.source.len() as u64)
-            .ok();
-        data.extend_from_slice(source_key.source.as_bytes());
-        data.write_u64::<LittleEndian>(source_key.size).ok();
-        data.write_u128::<LittleEndian>(source_key.mtime).ok();
-        data.write_u64::<LittleEndian>(index.raw_decompressed.len() as u64)
-            .ok();
-        data.extend_from_slice(&index.raw_decompressed);
-        data.write_u64::<LittleEndian>(index.bundles.len() as u64)
-            .ok();
-        for b in &index.bundles {
-            data.write_u32::<LittleEndian>(b.name.len() as u32).ok();
-            data.extend_from_slice(b.name.as_bytes());
-            data.write_u32::<LittleEndian>(b.uncompressed_size).ok();
-        }
-        data.write_u64::<LittleEndian>(index.files.len() as u64)
-            .ok();
-        for h in &index.file_order {
-            let f = &index.files[h];
-            data.write_u64::<LittleEndian>(f.hash).ok();
-            data.write_u64::<LittleEndian>(f.record_pos as u64).ok();
-            data.write_u32::<LittleEndian>(f.bundle_index).ok();
-            data.write_u32::<LittleEndian>(f.offset).ok();
-            data.write_u32::<LittleEndian>(f.size).ok();
-        }
-        data.write_u8(match index.hash_mode {
-            HashMode::Murmur64A => 0,
-            HashMode::Fnv1A => 1,
-        })
-        .ok();
-        data.write_u64::<LittleEndian>(index.file_count_pos as u64)
-            .ok();
-        data.write_u64::<LittleEndian>(index.directory_bytes_compressed.len() as u64)
-            .ok();
-        data.extend_from_slice(&index.directory_bytes_compressed);
-        data.write_u64::<LittleEndian>(index.directories.len() as u64)
-            .ok();
-        for d in &index.directories {
-            data.write_u64::<LittleEndian>(d.path_hash).ok();
-            data.write_u32::<LittleEndian>(d.offset).ok();
-            data.write_u32::<LittleEndian>(d.size).ok();
-            data.write_u32::<LittleEndian>(d._recursive_size).ok();
-        }
-        if let Some(ref p) = index.paths {
-            data.write_u8(1).ok();
-            data.write_u64::<LittleEndian>(p.len() as u64).ok();
-            for s in p {
-                data.write_u64::<LittleEndian>(s.len() as u64).ok();
-                data.extend_from_slice(s.as_bytes());
-            }
+    fn source_path(&self) -> Option<PathBuf> {
+        if matches!(self.layout, InstallLayout::ContentGgpk) {
+            Some(self.content_path.clone())
         } else {
-            data.write_u8(0).ok();
+            self.index_path.exists().then(|| self.index_path.clone())
         }
-        // The game may have updated while serializing, so don't publish a stale snapshot.
-        if self.cache_key().ok().flatten().as_ref() != Some(source_key) {
-            return;
+    }
+
+    fn cache_write(&self, index: Arc<BundleIndex>, key: &CacheKey) -> Option<CacheWrite> {
+        Some(CacheWrite {
+            source_path: self.source_path()?,
+            key: key.clone(),
+            path: self.cache_path(),
+            index,
+        })
+    }
+
+    #[cfg(test)]
+    fn write_cache(&self, index: BundleIndex, key: &CacheKey) {
+        if let Some(job) = self.cache_write(Arc::new(index), key) {
+            let _ = job.write();
         }
-        let path = self.cache_path();
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
+    }
+
+    /// Waits for background cache writes. Short-lived tools call this before exiting.
+    pub fn flush_cache_writes() {
+        let writes = std::mem::take(&mut *cache_writes());
+        for (_, handle) in writes {
+            let _ = handle.join();
         }
-        // Write-then-rename so readers never see a torn file.
-        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-        write_cache_file(&path, &tmp, &data, |tmp, data| fs::write(tmp, data));
     }
 
     pub fn clear_cache(&self) {
         retire_legacy_caches(&self.cache_dir);
+        let mut shared = shared_index();
+        if shared
+            .as_ref()
+            .is_some_and(|(key, _)| key.source == self.cache_source)
+        {
+            *shared = None;
+        }
+        drop(shared);
         let p = self.cache_path();
         if p.exists() {
             let _ = fs::remove_file(&p);
         }
     }
 
+    /// For Apply and Restore. It never reads the cache, so cached bytes can't reach the
+    /// game index.
     pub fn open_index(&mut self) -> Result<BundleIndex> {
-        crate::timing!("index_read");
-        let source_key_before = self.refresh_source_snapshot()?;
-        if let Some(cached) = self.read_cache() {
-            self.ensure_source_unchanged(&source_key_before, "loading")?;
-            tracing::debug!("using cached index metadata");
-            return Ok(cached);
-        }
-        // Collapse concurrent misses into one rebuild. Late callers re-read the cache.
-        static REBUILD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = REBUILD_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let source_key_before = self.refresh_source_snapshot()?;
-        if let Some(cached) = self.read_cache() {
-            self.ensure_source_unchanged(&source_key_before, "loading")?;
-            tracing::debug!("using index metadata cached by concurrent rebuild");
-            return Ok(cached);
-        }
+        let source_key = self.refresh_source_snapshot()?;
+        self.rebuild_index(&source_key)
+    }
+
+    fn rebuild_index(&self, source_key: &Option<CacheKey>) -> Result<BundleIndex> {
+        crate::timing!("index_rebuild");
         let bytes = self.read_index_bytes()?;
-        crate::timing!("index_decompress");
         let decompressed =
             decompress_bundle(&bytes).context("failed to decompress bundle index")?;
-        crate::timing!("index_parse");
-        let mut index = BundleIndex::parse(decompressed)?;
-        // Cache built paths: they dominate warm-launch cost.
-        index.ensure_paths_built()?;
-        self.ensure_source_unchanged(&source_key_before, "building")?;
-        if let Some(source_key) = source_key_before.as_ref() {
-            self.write_cache(&index, source_key);
+        drop(bytes);
+        let index = BundleIndex::parse(decompressed)?;
+        self.ensure_source_unchanged(source_key, "building")?;
+        Ok(index)
+    }
+
+    /// Overlapping readers share one index, freed when the last one drops it. A miss
+    /// returns once the index is built and writes the cache in the background.
+    pub fn open_shared_index(&mut self) -> Result<Arc<BundleIndex>> {
+        let mut shared = shared_index();
+        let Some(key) = self.refresh_source_snapshot()? else {
+            return self.rebuild_index(&None).map(Arc::new);
+        };
+        if let Some((held_key, held)) = shared.as_ref()
+            && *held_key == key
+            && let Some(index) = held.upgrade()
+        {
+            return Ok(index);
         }
-        self.ensure_source_unchanged(&source_key_before, "caching")?;
+        let source_key = Some(key.clone());
+        let index = match self.read_cache() {
+            Some(cached) => {
+                self.ensure_source_unchanged(&source_key, "loading")?;
+                Arc::new(cached)
+            }
+            None => {
+                let index = Arc::new(self.rebuild_index(&source_key)?);
+                if let Some(job) = self.cache_write(index.clone(), &key) {
+                    job.spawn();
+                }
+                index
+            }
+        };
+        *shared = Some((key, Arc::downgrade(&index)));
         Ok(index)
     }
 
@@ -495,18 +624,8 @@ impl BundleStore {
         let file = index
             .file_by_path(path)
             .ok_or_else(|| anyhow!("path not found in bundle index: {path}"))?;
-        let bundle_name = index.bundle_name(file.bundle_index)?;
-        let compressed = self
-            .read_storage_file_cow(&storage_bundle_path(bundle_name))
-            .with_context(|| format!("failed to read {}", self.bundle_display_path(bundle_name)))?;
-        let mut slices = decompress_bundle_slices(&compressed, &[(file.offset, file.size)])
-            .with_context(|| {
-                format!(
-                    "failed to decompress {}",
-                    self.bundle_display_path(bundle_name)
-                )
-            })?;
-        Ok(slices.pop().expect("one span requested"))
+        let mut bytes = self.visit_files_batch(index, &[file], |_, bytes| Ok(bytes))?;
+        Ok(bytes.pop().expect("one file requested"))
     }
 
     pub fn read_bundle(&self, bundle_name: &str) -> Result<Vec<u8>> {
@@ -548,33 +667,79 @@ impl BundleStore {
         index: &BundleIndex,
         files: &[BundleFile],
     ) -> Result<HashMap<u64, Vec<u8>>> {
-        let mut by_bundle: HashMap<u32, Vec<&BundleFile>> = HashMap::new();
-        for file in files {
-            by_bundle.entry(file.bundle_index).or_default().push(file);
+        let bytes = self.visit_files_batch(index, files, |_, bytes| Ok(bytes))?;
+        Ok(files.iter().map(|file| file.hash).zip(bytes).collect())
+    }
+
+    /// Calls `visit` as each file is decoded. Results keep the order of `files`.
+    pub fn visit_files_batch<T: Send>(
+        &self,
+        index: &BundleIndex,
+        files: &[BundleFile],
+        visit: impl Fn(usize, Vec<u8>) -> Result<T> + Sync,
+    ) -> Result<Vec<T>> {
+        let mut by_bundle: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (i, file) in files.iter().enumerate() {
+            by_bundle.entry(file.bundle_index).or_default().push(i);
         }
         let groups: Vec<_> = by_bundle.into_iter().collect();
-        let per_bundle: Vec<Vec<(u64, Vec<u8>)>> = groups
+        let per_bundle: Vec<Vec<(usize, Result<T>)>> = groups
             .par_iter()
-            .map(|(bundle_index, files)| {
+            .map(|(bundle_index, members)| {
                 let name = index.bundle_name(*bundle_index)?;
-                let compressed = self
-                    .read_storage_file_cow(&storage_bundle_path(name))
-                    .with_context(|| {
-                        format!("failed to read {}", self.bundle_display_path(name))
-                    })?;
-                let spans: Vec<(u32, u32)> =
-                    files.iter().map(|file| (file.offset, file.size)).collect();
-                let slices = decompress_bundle_slices(&compressed, &spans).with_context(|| {
+                let spans: Vec<(u32, u32)> = members
+                    .iter()
+                    .map(|&i| (files[i].offset, files[i].size))
+                    .collect();
+                let mut out = Vec::with_capacity(members.len());
+                let collect = |k: usize, bytes| {
+                    let i = members[k];
+                    out.push((i, visit(i, bytes)));
+                };
+                let decoded = if matches!(self.layout, InstallLayout::ContentGgpk) {
+                    let compressed = self
+                        .read_storage_file_cow(&storage_bundle_path(name))
+                        .with_context(|| {
+                            format!("failed to read {}", self.bundle_display_path(name))
+                        })?;
+                    visit_bundle_slices(&compressed, &spans, collect)
+                } else {
+                    // Read only the needed chunks. GGPK is mapped, so it skips this.
+                    let path = self.bundle_path(name);
+                    let mut file = fs::File::open(&path)
+                        .with_context(|| format!("failed to read {}", path.display()))?;
+                    let len = file.metadata()?.len();
+                    visit_bundle_slices_from(
+                        usize::try_from(len)?,
+                        |offset, len| {
+                            // Zeroed slack in case Oodle reads past the chunk end.
+                            let mut buf = vec![0; len + OOZ_SAFE_SPACE];
+                            file.seek(SeekFrom::Start(offset as u64))?;
+                            file.read_exact(&mut buf[..len])?;
+                            buf.truncate(len);
+                            Ok(std::borrow::Cow::Owned(buf))
+                        },
+                        &spans,
+                        collect,
+                    )
+                };
+                decoded.with_context(|| {
                     format!("failed to decompress {}", self.bundle_display_path(name))
                 })?;
-                Ok(files
-                    .iter()
-                    .zip(slices)
-                    .map(|(file, bytes)| (file.hash, bytes))
-                    .collect())
+                Ok(out)
             })
             .collect::<Result<_>>()?;
-        Ok(per_bundle.into_iter().flatten().collect())
+        let mut slots: Vec<Option<T>> = std::iter::repeat_with(|| None).take(files.len()).collect();
+        for (i, result) in per_bundle.into_iter().flatten() {
+            slots[i] = Some(result?);
+        }
+        slots
+            .into_iter()
+            .zip(files)
+            .map(|(slot, file)| {
+                slot.ok_or_else(|| anyhow!("no bytes decoded for file {:016x}", file.hash))
+            })
+            .collect()
     }
 
     fn read_storage_file(&self, rel_path: &str) -> Result<Vec<u8>> {
@@ -805,7 +970,7 @@ pub(super) fn storage_bundle_path(bundle_name: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     use std::path::Path;
@@ -823,40 +988,136 @@ mod tests {
         }
     }
 
-    #[test]
-    fn corrupt_index_cache_is_rejected_without_huge_allocations() {
-        let key = CacheKey {
+    fn test_key() -> CacheKey {
+        CacheKey {
             source: "src".to_string(),
             size: 1,
             mtime: 2,
-        };
+        }
+    }
+
+    fn parse_cache_bytes(bytes: &[u8], key: &CacheKey) -> Option<BundleIndex> {
+        parse_index_cache(bytes, bytes.len() as u64, key)
+    }
+
+    fn cached_paths(index: &BundleIndex) -> Vec<&str> {
+        index.paths().iter().collect()
+    }
+
+    #[test]
+    fn corrupt_index_cache_is_rejected_without_huge_allocations() {
+        let key = test_key();
         // Truncated header and wrong magic.
-        assert!(parse_index_cache(b"2SI2", &key).is_none());
-        assert!(parse_index_cache(b"XXXXXXXXXXXXXXXX", &key).is_none());
+        assert!(parse_cache_bytes(b"2SI2", &key).is_none());
+        assert!(parse_cache_bytes(b"XXXXXXXXXXXXXXXX", &key).is_none());
 
         // Valid magic + matching key, then corrupt lengths.
         let mut header = Vec::new();
         header.extend_from_slice(CACHE_MAGIC);
-        header
-            .write_u64::<LittleEndian>(key.source.len() as u64)
-            .unwrap();
-        header.extend_from_slice(key.source.as_bytes());
+        write_cache_section(&mut header, key.source.as_bytes()).unwrap();
         header.write_u64::<LittleEndian>(key.size).unwrap();
         header.write_u128::<LittleEndian>(key.mtime).unwrap();
 
         // Absurd raw_decompressed length: must be rejected, not allocated.
         let mut absurd_len = header.clone();
         absurd_len.write_u64::<LittleEndian>(u64::MAX).unwrap();
-        assert!(parse_index_cache(&absurd_len, &key).is_none());
+        assert!(parse_cache_bytes(&absurd_len, &key).is_none());
 
-        // Absurd file count after empty sections.
         let mut absurd_count = header;
-        absurd_count.write_u64::<LittleEndian>(0).unwrap(); // raw_decompressed len
-        absurd_count.write_u64::<LittleEndian>(0).unwrap(); // bundle count
-        absurd_count
-            .write_u64::<LittleEndian>(u64::MAX / 4)
-            .unwrap(); // file count
-        assert!(parse_index_cache(&absurd_count, &key).is_none());
+        write_cache_section(&mut absurd_count, &u32::MAX.to_le_bytes()).unwrap();
+        write_cache_section(&mut absurd_count, b"").unwrap();
+        assert!(parse_cache_bytes(&absurd_count, &key).is_none());
+    }
+
+    #[test]
+    fn index_cache_round_trip_keeps_raw_bytes_and_paths() {
+        let key = test_key();
+        let index = BundleIndex::for_test_paths(&[
+            ("Metadata/First.dat", "first", 3),
+            ("Metadata/Second.dat", "second", 4),
+        ]);
+        let mut bytes = Vec::new();
+        write_index_cache(&mut bytes, &index, &key).unwrap();
+
+        let cached = parse_cache_bytes(&bytes, &key).unwrap();
+
+        assert_eq!(cached.raw_decompressed, index.raw_decompressed);
+        assert_eq!(cached_paths(&cached), cached_paths(&index));
+        let second = cached.file_by_path("Metadata/Second.dat").unwrap();
+        assert_eq!(second.size, 4);
+        assert_eq!(cached.bundle_name(second.bundle_index).unwrap(), "second");
+    }
+
+    #[test]
+    fn index_cache_keeps_the_order_of_many_path_blocks() {
+        let key = test_key();
+        let mut index = BundleIndex::for_test_paths(&[
+            ("Metadata/First.dat", "first", 3),
+            ("Metadata/Second.dat", "second", 4),
+            ("Metadata/Third.dat", "third", 5),
+        ]);
+        index.paths_mut_for_test().split_blocks_for_test();
+        let mut bytes = Vec::new();
+        write_index_cache(&mut bytes, &index, &key).unwrap();
+
+        let cached = parse_cache_bytes(&bytes, &key).unwrap();
+
+        assert_eq!(cached_paths(&cached), cached_paths(&index));
+        assert_eq!(cached.paths().len(), 3);
+    }
+
+    #[test]
+    fn path_block_with_an_absurd_size_is_rejected_before_decoding() {
+        let key = test_key();
+        let index = BundleIndex::for_test_paths(&[("Metadata/First.dat", "first", 3)]);
+        let mut bytes = Vec::new();
+        write_index_cache(&mut bytes, &index, &key).unwrap();
+        let packed = pack_bundle_serial(b"Metadata/First.dat\0").unwrap();
+        let block_end = bytes.len() - 8;
+        let block_start = block_end - packed.len();
+        assert_eq!(&bytes[block_start..block_end], packed.as_slice());
+        // The 64-bit uncompressed size sits 20 bytes into the bundle header.
+        bytes[block_start + 20..block_start + 28].copy_from_slice(&(1u64 << 40).to_le_bytes());
+        // A matching checksum, so the size limit is what rejects it.
+        let sum = checksum(&bytes[block_start..block_end]);
+        bytes[block_end..].copy_from_slice(&sum.to_le_bytes());
+
+        assert!(parse_cache_bytes(&bytes, &key).is_none());
+    }
+
+    #[test]
+    fn damaged_path_block_is_rejected_before_decoding() {
+        let key = test_key();
+        let index = BundleIndex::for_test_paths(&[("Metadata/First.dat", "first", 3)]);
+        let mut bytes = Vec::new();
+        write_index_cache(&mut bytes, &index, &key).unwrap();
+        let last_block_byte = bytes.len() - 9;
+        bytes[last_block_byte] ^= 0x40;
+
+        assert!(parse_cache_bytes(&bytes, &key).is_none());
+    }
+
+    #[test]
+    fn damaged_index_cache_is_rejected() {
+        let key = test_key();
+        let index = BundleIndex::for_test_paths(&[("Metadata/First.dat", "first", 3)]);
+        let mut bytes = Vec::new();
+        write_index_cache(&mut bytes, &index, &key).unwrap();
+
+        for len in 0..bytes.len() {
+            assert!(parse_cache_bytes(&bytes[..len], &key).is_none(), "{len}");
+        }
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert!(parse_cache_bytes(&longer, &key).is_none());
+        let mut unterminated = bytes.clone();
+        *unterminated.last_mut().unwrap() = b'x';
+        assert!(parse_cache_bytes(&unterminated, &key).is_none());
+        let stale = CacheKey {
+            mtime: 3,
+            ..test_key()
+        };
+        assert!(parse_cache_bytes(&bytes, &stale).is_none());
     }
 
     #[test]
@@ -873,14 +1134,17 @@ mod tests {
         fs::write(game.join("Content.ggpk"), b"updated-ggpk").unwrap();
         assert_ne!(store.cache_key().unwrap().unwrap(), source_key_before);
 
-        store.write_cache(&stale_index, &source_key_before);
+        store.write_cache(stale_index, &source_key_before);
 
         assert!(!store.cache_path().exists());
         assert!(store.read_cache().is_none());
     }
 
     #[test]
-    fn open_index_remaps_replaced_content_before_caching() {
+    fn shared_open_remaps_replaced_content_before_caching() {
+        let _slot = SHARED_SLOT_TESTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let temp = tempfile::tempdir().unwrap();
         let game = temp.path().join("game");
         fs::create_dir_all(&game).unwrap();
@@ -892,8 +1156,10 @@ mod tests {
         );
         let mut store = BundleStore::new_with_cache_dir(game.clone(), temp.path().join("cache"));
 
-        let old = store.open_index().unwrap();
+        let old = store.open_shared_index().unwrap();
         assert!(old.has_bundle_prefix("old"));
+        drop(old);
+        BundleStore::flush_cache_writes();
 
         let replacement = game.join("Content.replacement.ggpk");
         write_test_ggpk(
@@ -904,13 +1170,137 @@ mod tests {
         fs::remove_file(&content).unwrap();
         fs::rename(replacement, &content).unwrap();
 
-        let rebuilt = store.open_index().unwrap();
+        let rebuilt = store.open_shared_index().unwrap();
         assert!(rebuilt.has_bundle_prefix("replacement"));
         assert!(!rebuilt.has_bundle_prefix("old"));
+        drop(rebuilt);
+        BundleStore::flush_cache_writes();
 
-        let cached = store.open_index().unwrap();
+        let cached = store.read_cache().expect("background write should publish");
         assert!(cached.has_bundle_prefix("replacement"));
         assert!(!cached.has_bundle_prefix("old"));
+    }
+
+    #[test]
+    fn owned_open_never_reads_the_cache() {
+        let _slot = SHARED_SLOT_TESTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let temp = tempfile::tempdir().unwrap();
+        let (mut store, _) = loose_store(temp.path(), "real");
+        // Right key, wrong content, like a damaged or forged file.
+        let key = store.cache_key().unwrap().unwrap();
+        let forged =
+            BundleIndex::parse(decompress_bundle(&test_index_bytes(&["forged"])).unwrap()).unwrap();
+        store.write_cache(forged, &key);
+
+        assert!(store.open_index().unwrap().has_bundle_prefix("real"));
+        assert!(
+            store
+                .open_shared_index()
+                .unwrap()
+                .has_bundle_prefix("forged")
+        );
+    }
+
+    /// Keeps other tests from replacing the single shared slot mid-test.
+    static SHARED_SLOT_TESTS: Mutex<()> = Mutex::new(());
+
+    fn loose_store(temp: &Path, bundle: &str) -> (BundleStore, PathBuf) {
+        let game = temp.join("game");
+        fs::create_dir_all(game.join("Bundles2")).unwrap();
+        let index_path = game.join("Bundles2/_.index.bin");
+        fs::write(&index_path, test_index_bytes(&[bundle])).unwrap();
+        (
+            BundleStore::new_with_cache_dir(game, temp.join("cache")),
+            index_path,
+        )
+    }
+
+    #[test]
+    fn overlapping_readers_share_an_index_until_the_last_one_drops_it() {
+        let _slot = SHARED_SLOT_TESTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let temp = tempfile::tempdir().unwrap();
+        let (store, _) = loose_store(temp.path(), "first");
+
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let mut store = store.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.open_shared_index().unwrap()
+                })
+            })
+            .collect();
+        let held: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert!(held.iter().all(|index| Arc::ptr_eq(index, &held[0])));
+
+        let freed = Arc::downgrade(&held[0]);
+        drop(held);
+        // The background cache write holds the index until the file is written.
+        BundleStore::flush_cache_writes();
+        assert!(freed.upgrade().is_none());
+    }
+
+    #[test]
+    fn changed_source_never_reuses_the_shared_index() {
+        let _slot = SHARED_SLOT_TESTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let temp = tempfile::tempdir().unwrap();
+        let (mut store, index_path) = loose_store(temp.path(), "first");
+        let old = store.open_shared_index().unwrap();
+
+        // A new size changes the key even with a coarse mtime.
+        fs::write(&index_path, test_index_bytes(&["replacement"])).unwrap();
+        let new = store.open_shared_index().unwrap();
+
+        assert!(old.has_bundle_prefix("first"));
+        assert!(new.has_bundle_prefix("replacement"));
+    }
+
+    #[test]
+    fn clearing_the_cache_also_forgets_the_shared_index() {
+        let _slot = SHARED_SLOT_TESTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let temp = tempfile::tempdir().unwrap();
+        let (mut store, _) = loose_store(temp.path(), "first");
+        let first = store.open_shared_index().unwrap();
+
+        store.clear_cache();
+        let second = store.open_shared_index().unwrap();
+
+        assert!(!Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn apply_edits_never_reach_a_shared_index() {
+        let _slot = SHARED_SLOT_TESTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let temp = tempfile::tempdir().unwrap();
+        let (mut store, _) = loose_store(temp.path(), "first");
+        let shared = store.open_shared_index().unwrap();
+
+        let mut owned = store.open_index().unwrap();
+        owned.create_custom_bundle("TinyPoe2Smoother_").unwrap();
+
+        assert!(owned.has_bundle_prefix("TinyPoe2Smoother_"));
+        assert!(!shared.has_bundle_prefix("TinyPoe2Smoother_"));
+        assert!(
+            !store
+                .open_shared_index()
+                .unwrap()
+                .has_bundle_prefix("TinyPoe2Smoother_")
+        );
     }
 
     #[cfg(unix)]
@@ -1018,7 +1408,7 @@ mod tests {
             let index = BundleIndex::for_test_paths(&[("Metadata/Test.dat", "test", 3)]);
             let source_key = direct.cache_key().unwrap().unwrap();
 
-            direct.write_cache(&index, &source_key);
+            direct.write_cache(index, &source_key);
             assert!(!cache_dir.join("index-cache.bin").exists());
             assert!(cache_dir.join(CACHE_MIGRATION_MARKER).exists());
             assert!(direct.cache_path().exists());
@@ -1026,7 +1416,7 @@ mod tests {
             let cached = aliased
                 .read_cache()
                 .expect("alias should read direct cache");
-            assert_eq!(cached.paths.unwrap(), vec!["Metadata/Test.dat".to_string()]);
+            assert_eq!(cached_paths(&cached), ["Metadata/Test.dat"]);
 
             aliased.clear_cache();
             assert!(!direct.cache_path().exists());
@@ -1163,48 +1553,140 @@ mod tests {
         assert_eq!(direct.cache_path(), alternate_store.cache_path());
     }
 
-    #[test]
-    fn failed_cache_write_removes_partial_temp_file() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("index-cache.bin");
-        let tmp = temp.path().join("index-cache.tmp");
-
-        write_cache_file(&path, &tmp, b"partial cache", |tmp, data| {
-            fs::write(tmp, data)?;
-            Err(std::io::Error::other("injected write failure"))
-        });
-
-        assert!(!tmp.exists());
-        assert!(!path.exists());
+    fn dir_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
     }
 
     #[test]
-    fn failed_cache_rename_removes_temp_file() {
+    fn failed_cache_write_removes_its_temp_file() {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("index-cache.bin");
-        let tmp = temp.path().join("index-cache.tmp");
-        fs::create_dir(&path).unwrap();
+        let path = temp.path().join("index-cache-v3-0000000000000000.bin");
 
-        write_cache_file(&path, &tmp, b"complete cache", |tmp, data| {
-            fs::write(tmp, data)
-        });
+        let result = publish_cache(
+            &path,
+            |file| {
+                file.write_all(b"partial cache")?;
+                Err(std::io::Error::other("injected write failure"))
+            },
+            || true,
+        );
 
-        assert!(!tmp.exists());
-        assert!(path.is_dir());
+        assert!(result.is_err());
+        assert!(dir_names(temp.path()).is_empty());
     }
 
     #[test]
-    fn successful_cache_write_leaves_final_file() {
+    fn changed_source_stops_the_publish_and_removes_the_temp_file() {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("index-cache.bin");
-        let tmp = temp.path().join("index-cache.tmp");
+        let path = temp.path().join("index-cache-v3-0000000000000000.bin");
+        fs::write(&path, b"previous cache").unwrap();
 
-        write_cache_file(&path, &tmp, b"complete cache", |tmp, data| {
-            fs::write(tmp, data)
-        });
+        let result = publish_cache(&path, |file| file.write_all(b"stale cache"), || false);
 
-        assert!(!tmp.exists());
-        assert_eq!(fs::read(path).unwrap(), b"complete cache");
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"previous cache");
+        assert_eq!(
+            dir_names(temp.path()),
+            ["index-cache-v3-0000000000000000.bin"]
+        );
+    }
+
+    #[test]
+    fn successful_cache_write_leaves_only_the_final_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("index-cache-v3-0000000000000000.bin");
+
+        publish_cache(&path, |file| file.write_all(b"complete cache"), || true).unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"complete cache");
+        assert_eq!(
+            dir_names(temp.path()),
+            ["index-cache-v3-0000000000000000.bin"]
+        );
+    }
+
+    #[test]
+    fn only_old_temps_of_this_cache_are_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("index-cache-v3-0000000000000000.bin");
+        let names = [
+            ".index-cache-v3-0000000000000000.bin.a1b2c3.tps-tmp",
+            "index-cache-v3-0000000000000000.tmp4242",
+            ".index-cache-v3-0000000000000000.bin.young1.tps-tmp",
+            ".index-cache-v3-1111111111111111.bin.other1.tps-tmp",
+            "index-cache-v3-0000000000000000.bin",
+        ];
+        for name in names {
+            fs::write(temp.path().join(name), b"x").unwrap();
+        }
+        let old = SystemTime::now() - Duration::from_secs(600);
+        for name in [names[0], names[1], names[3], names[4]] {
+            fs::File::options()
+                .write(true)
+                .open(temp.path().join(name))
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+
+        remove_stale_cache_temps(temp.path(), &path, STALE_CACHE_TEMP_AGE);
+
+        assert_eq!(
+            dir_names(temp.path()),
+            [
+                ".index-cache-v3-0000000000000000.bin.young1.tps-tmp",
+                ".index-cache-v3-1111111111111111.bin.other1.tps-tmp",
+                "index-cache-v3-0000000000000000.bin",
+            ]
+        );
+    }
+
+    #[test]
+    fn damaged_cache_with_a_good_header_is_rewritten() {
+        let _slot = SHARED_SLOT_TESTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let temp = tempfile::tempdir().unwrap();
+        let (mut store, _) = loose_store(temp.path(), "first");
+        drop(store.open_shared_index().unwrap());
+        BundleStore::flush_cache_writes();
+        let path = store.cache_path();
+        let mut bytes = fs::read(&path).unwrap();
+        let len = bytes.len();
+        bytes[len - 9] ^= 0x40;
+        fs::write(&path, &bytes).unwrap();
+        assert!(store.read_cache().is_none());
+
+        drop(store.open_shared_index().unwrap());
+        BundleStore::flush_cache_writes();
+
+        assert!(store.read_cache().is_some());
+    }
+
+    #[test]
+    fn shared_miss_writes_the_cache_after_returning() {
+        let _slot = SHARED_SLOT_TESTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let temp = tempfile::tempdir().unwrap();
+        let (mut store, _) = loose_store(temp.path(), "first");
+
+        let index = store.open_shared_index().unwrap();
+        BundleStore::flush_cache_writes();
+        drop(index);
+
+        let cached = store.read_cache().expect("cache should be readable");
+        assert!(cached.has_bundle_prefix("first"));
+        assert_eq!(
+            dir_names(&temp.path().join("cache")).len(),
+            2,
+            "cache and migration marker only"
+        );
     }
 
     #[test]
@@ -1351,7 +1833,16 @@ mod tests {
         crate::bundle::pack_uncompressed_bundle(&raw).unwrap()
     }
 
-    fn write_test_ggpk_files(path: &Path, dir_name: &str, files: &[(&str, &[u8])]) {
+    pub(crate) fn patch_test_ggpk(game: &Path, bundle_name: &str, index: &[u8]) -> GgpkBackupMeta {
+        let store = BundleStore::new(game);
+        let plan = store
+            .prepare_ggpk_patch(bundle_name, b"new-bundle", index)
+            .unwrap();
+        store.apply_ggpk_patch(&plan).unwrap();
+        plan.backup
+    }
+
+    pub(crate) fn write_test_ggpk_files(path: &Path, dir_name: &str, files: &[(&str, &[u8])]) {
         let root_pdir_size = pdir_record_size("", 1);
         let dir_pdir_size = pdir_record_size(dir_name, files.len());
         let root_offset = 20u64;

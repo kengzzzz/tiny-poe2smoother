@@ -379,6 +379,7 @@ int CompressBlock_Leviathan(uint8 *src_in, uint8 *dst_in, int src_size, int leve
   coder.last_chunk_type = -1;
   SetupEncoder_Leviathan(&coder, src_size, level, compressopts, src_window_base, src_in);
   int n = Compress(&coder, src_in, dst_in, src_size, src_window_base, lrm);
+  FreeLzHasher(&coder);
   return n;
 }
 
@@ -394,6 +395,7 @@ int CompressBlock_Kraken(uint8 *src_in, uint8 *dst_in, int src_size, int level,
   coder.last_chunk_type = -1;
   SetupEncoder_Kraken(&coder, src_size, level, compressopts, src_window_base, src_in);
   int n = Compress(&coder, src_in, dst_in, src_size, src_window_base, lrm);
+  FreeLzHasher(&coder);
   return n;
 }
 
@@ -409,6 +411,7 @@ int CompressBlock_Mermaid(int codec_id, uint8 *src_in, uint8 *dst_in, int src_si
   coder.last_chunk_type = -1;
   SetupEncoder_Mermaid(&coder, codec_id, src_size, level, compressopts, src_window_base, src_in);
   int n = Compress(&coder, src_in, dst_in, src_size, src_window_base, lrm);
+  FreeLzHasher(&coder);
   return n;
 }
 

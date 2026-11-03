@@ -14,6 +14,14 @@ ooz_shim.cpp is new (this project): thin extern "C" wrappers around
 CompressBlock and GetCompressedBufferSizeNeeded so Rust FFI binds
 unmangled symbol names.
 
+Changes from upstream (this project, 2026-11-02): compress.h, compress.cpp
+and match_hasher.h free the match hasher after each compressed block.
+Upstream leaked the hasher and its hash table, about 512 KB per 256 KB
+Mermaid chunk. MermaidWriter frees its buffer, which upstream leaked. The
+entropy-only quantum decoders copy raw data into the output, which upstream
+skipped. The RLE encoder uses delete[] for its new[] buffer. All changes are
+marked with "tiny-poe2smoother" comments.
+
 Note: this code was already statically linked into release binaries of
 this project via the poe_bundle crate; vendoring it here only makes the
 provenance visible in-repo.

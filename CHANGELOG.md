@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.8.0 - 2026-11-03
+
+Choose which MTX effects to remove.
+
+### New
+- MTX editor: click "Edit MTX…" on the MTX effects patch to choose which effects to remove and which to keep. Everything is still removed by default.
+- Search the MTX list by name or by effect file. For example, `twister` finds The Taming.
+
+### Changes
+- A kept MTX effect also keeps the files it uses, even with Effects or Particles on.
+- Skills and monsters kept in the effects editor now also keep any MTX files they use.
+- MTX effects: the description now says it also removes some unique item visuals. This was already the case.
+- Uses much less memory and starts up to three times faster on slow PCs, even right after a game update.
+- Apply, Restore, and the effect editors also use much less memory.
+- Uses less disk space.
+
+### Fixes
+- Standalone client: Restore no longer says "No backup found" after it worked.
+- Memory no longer keeps growing each time you click Apply.
+- Apply and Restore no longer refuse to run when a browser, editor, script, or Path of Exile 1 is open.
+
 ## 0.7.0 - 2026-10-27
 
 A redesigned window, profiles, and new patches.

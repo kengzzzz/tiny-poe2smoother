@@ -86,7 +86,15 @@ struct LzCoder {
   int compressor_file_id;
   LzScratchBlock lvsymstats_scratch;
   int last_chunk_type;
+  // tiny-poe2smoother: frees `hasher` with its real type. Upstream leaks it per block.
+  void (*free_hasher)(void *hasher);
 };
+
+inline void FreeLzHasher(LzCoder *coder) {
+  if (coder->hasher && coder->free_hasher)
+    coder->free_hasher(coder->hasher);
+  coder->hasher = NULL;
+}
 
 int EncodeLzOffsets(uint8 *dst, uint8 *dst_end, uint8 *u8_offs, uint32 *u32_offs, int offs_count,
                               int opts, float speed_tradeoff, int platforms,
@@ -112,6 +120,7 @@ template<typename T, int MaxPreload = 0x4000000>
 void CreateLzHasher(LzCoder *coder, const uint8 *src_base, const uint8 *src_start, int hash_bits, int min_match_len = 0) {
   T *hasher = new T;
   coder->hasher = hasher;
+  coder->free_hasher = [](void *p) { delete static_cast<T *>(p); };
   hasher->AllocateHash(hash_bits, min_match_len);
   if (src_start == src_base) {
     hasher->SetBaseWithoutPreload(src_start);

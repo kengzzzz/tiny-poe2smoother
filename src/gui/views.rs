@@ -291,6 +291,7 @@ fn draw_patch(app: &mut GuiApp, ui: &mut egui::Ui, patch: PatchId) {
         PatchId::Particles if !app.selected_patches.contains(&PatchId::Effects) => {
             draw_effects_row(app, ui)
         }
+        PatchId::MtxSoft => draw_mtx_row(app, ui),
         _ => {}
     }
 }
@@ -440,6 +441,33 @@ fn draw_effects_row(app: &mut GuiApp, ui: &mut egui::Ui) {
     });
 }
 
+fn draw_mtx_row(app: &mut GuiApp, ui: &mut egui::Ui) {
+    if app.status.is_none() {
+        return;
+    }
+    ui.add_space(4.0);
+    widgets::indented(ui, |ui| {
+        ui.horizontal(|ui| {
+            if small_action(ui, "Edit MTX…") {
+                app.show_mtx_editor = true;
+            }
+            ui.label(theme::caption_text(&format!(
+                "{} kept original",
+                app.kept_original_mtx_count()
+            )));
+        });
+        if app.every_mtx_kept() {
+            ui.label(
+                egui::RichText::new(
+                    "Every effect is kept. Check at least one, or uncheck this patch.",
+                )
+                .size(11.5)
+                .color(palette::WARNING),
+            );
+        }
+    });
+}
+
 fn effects_caption(app: &GuiApp) -> String {
     let skills = app.kept_original_effect_skill_count();
     let monsters = app.kept_original_monster_count();
@@ -571,7 +599,8 @@ fn draw_modals(app: &mut GuiApp, ctx: &egui::Context) {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.add(widgets::primary_button("Apply")).clicked() {
                     app.confirm_apply = false;
-                    if is_game_running() {
+                    if is_game_running(app.status.as_ref().map(|status| status.game_dir.as_path()))
+                    {
                         app.show_game_running_dialog = true;
                     } else {
                         match app.patch_request() {
@@ -615,7 +644,8 @@ fn draw_modals(app: &mut GuiApp, ctx: &egui::Context) {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.add(widgets::danger_button("Restore")).clicked() {
                     app.confirm_restore = false;
-                    if is_game_running() {
+                    if is_game_running(app.status.as_ref().map(|status| status.game_dir.as_path()))
+                    {
                         app.show_game_running_dialog = true;
                     } else {
                         app.spawn_restore();
@@ -637,6 +667,10 @@ fn draw_modals(app: &mut GuiApp, ctx: &egui::Context) {
 
     if app.show_effects_editor {
         editors::draw_effects_editor(app, ctx);
+    }
+
+    if app.show_mtx_editor {
+        editors::draw_mtx_editor(app, ctx);
     }
 
     if app.show_game_running_dialog {

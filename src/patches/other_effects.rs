@@ -14,7 +14,7 @@ pub struct OtherEffectCatalogEntry {
 }
 
 pub fn build_other_effect_catalog(
-    paths: &[String],
+    paths: impl IntoIterator<Item = impl AsRef<str>>,
     skills: &[EffectSkillCatalogEntry],
 ) -> Vec<OtherEffectCatalogEntry> {
     let owned: BTreeSet<_> = skills
@@ -23,6 +23,7 @@ pub fn build_other_effect_catalog(
         .collect();
     let mut folders = BTreeSet::new();
     for path in paths {
+        let path = path.as_ref();
         if !(ends_with_path_ci(path, ".ao") || ends_with_path_ci(path, ".aoc")) {
             continue;
         }
@@ -81,7 +82,7 @@ fn display_folder(folder: &str) -> String {
     }
 }
 
-fn humanize(value: &str) -> String {
+pub(super) fn humanize(value: &str) -> String {
     value
         .split(['_', '/', '\\'])
         .filter(|word| !word.is_empty())
