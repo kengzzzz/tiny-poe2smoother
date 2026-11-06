@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Changes
+- The effects editor stays smooth when many effects are unchecked.
+
+### Fixes
+- The effects editor no longer runs off the screen when the game isn't found or the window is small.
+- The effects summary on the main screen now updates right away when you switch to another game folder.
+
 ## 0.8.0 - 2026-11-03
 
 Choose which MTX effects to remove.

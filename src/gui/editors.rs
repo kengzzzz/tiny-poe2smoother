@@ -1,4 +1,5 @@
 use eframe::egui;
+use std::sync::Arc;
 use tiny_poe2smoother::patches::{
     ColorModEntry, EffectLevel, PRESET_COLORS, PatchId, default_color_mods,
 };
@@ -8,7 +9,8 @@ use super::widgets::{self, count_label, small_action};
 use crate::{ColorRowRef, EffectsEditorTab, GuiApp};
 
 const COLOR_ROW_HEIGHT: f32 = 26.0;
-const MTX_PREFIX: &str = "metadata/effects/microtransactions/";
+/// Card margins and strokes, the gap and button row under every list, and room to the window edge.
+const DIALOG_RESERVED_HEIGHT: f32 = 2.0 * 21.0 + 6.0 + 10.0 + 34.0 + 2.0 * 12.0;
 
 pub fn draw_color_editor(app: &mut GuiApp, ctx: &egui::Context) {
     let modal = egui::Modal::new(egui::Id::unique("color_mods_editor"))
@@ -35,25 +37,18 @@ pub fn draw_color_editor(app: &mut GuiApp, ctx: &egui::Context) {
                     ui.label(theme::caption_text("Loading mod catalog from game files…"));
                 });
                 ui.add_space(4.0);
-            } else if let Some(error) = app.catalog_error.clone() {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!("Mod catalog unavailable: {error}"))
-                            .size(11.5)
-                            .color(palette::WARNING),
-                    );
-                    if small_action(ui, "Retry") {
-                        app.catalog_error = None;
-                        app.ensure_catalog_loading();
-                    }
-                });
+            } else if let Some(error) = &app.catalog_error {
+                if catalog_error_row(ui, "Mod catalog", error, "") {
+                    app.catalog_error = None;
+                    app.ensure_catalog_loading();
+                }
                 ui.add_space(4.0);
             }
 
             app.refresh_color_filter();
             let row_count = app.color_filter_rows.len();
             egui::ScrollArea::vertical()
-                .max_height(380.0)
+                .max_height(list_max_height(ui))
                 .auto_shrink([false, true])
                 .show_rows(ui, COLOR_ROW_HEIGHT, row_count, |ui, range| {
                     for i in range {
@@ -165,6 +160,7 @@ const MTX_DESCRIPTION: &str = "Checked effects are removed (default) · uncheck 
      also keeps the files it uses, even with Effects or Particles on.";
 
 pub fn draw_effects_editor(app: &mut GuiApp, ctx: &egui::Context) {
+    app.invalidate_effect_catalogs_if_stale();
     let modal = egui::Modal::new(egui::Id::unique("effects_editor"))
         .frame(widgets::card().inner_margin(20))
         .backdrop_color(egui::Color32::from_black_alpha(140))
@@ -215,18 +211,11 @@ fn draw_effects_skills_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
             ui.label(theme::caption_text("Loading skill list from game files…"));
         });
         ui.add_space(4.0);
-    } else if let Some(error) = app.effect_catalog_error.clone() {
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(format!("Skill list unavailable: {error}"))
-                    .size(11.5)
-                    .color(palette::WARNING),
-            );
-            if small_action(ui, "Retry") {
-                app.effect_catalog_error = None;
-                app.ensure_effect_catalog_loading();
-            }
-        });
+    } else if let Some(error) = &app.effect_catalog_error {
+        if catalog_error_row(ui, "Skill list", error, "") {
+            app.effect_catalog_error = None;
+            app.ensure_effect_catalog_loading();
+        }
         ui.add_space(4.0);
     }
 
@@ -238,35 +227,26 @@ fn draw_effects_skills_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
             ));
         });
         ui.add_space(4.0);
-    } else if app.other_catalog.is_none()
-        && let Some(error) = app.other_catalog_error.clone()
+    } else if app.effect_catalog.is_some()
+        && app.other_catalog.is_none()
+        && let Some(error) = &app.other_catalog_error
     {
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(format!(
-                    "Shared effects unavailable: {error}. Reductions that need them stay pending."
-                ))
-                .size(11.5)
-                .color(palette::WARNING),
-            );
-            if small_action(ui, "Retry") {
-                app.other_catalog_error = None;
-                app.ensure_other_effect_catalog_loading();
-            }
-        });
+        let note = ". Reductions that need them stay pending.";
+        if catalog_error_row(ui, "Shared effects", error, note) {
+            app.other_catalog_error = None;
+            app.ensure_other_effect_catalog_loading();
+        }
         ui.add_space(4.0);
     }
 
     app.refresh_effects_filter();
     let row_count = app.effects_filter_rows.len();
-    let bulk_folders: Vec<String> = {
-        let catalog = app.effect_catalog.as_deref().unwrap_or_default();
+    let catalog = app.effect_catalog.as_deref().unwrap_or_default();
+    let can_bulk_reduce = app.can_reduce_effect_folder_set(
         app.effects_filter_rows
             .iter()
-            .flat_map(|&idx| catalog[idx].folders.iter().cloned())
-            .collect()
-    };
-    let can_bulk_reduce = app.can_reduce_effect_folders(&bulk_folders);
+            .flat_map(|&idx| &catalog[idx].folders),
+    );
     draw_effects_list_header(
         ui,
         |ui| {
@@ -283,8 +263,9 @@ fn draw_effects_skills_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
     // Per-tab salt, or the lists would share one scroll offset.
     egui::ScrollArea::vertical()
         .id_salt("effects_skills_list")
-        .max_height(380.0)
-        .auto_shrink([false, false])
+        .max_height(list_max_height(ui))
+        // A failed list has no rows, so it shouldn't hold the dialog open past the window.
+        .auto_shrink([false, app.effect_catalog_error.is_some()])
         .show_rows(ui, COLOR_ROW_HEIGHT, row_count, |ui, range| {
             for i in range {
                 let idx = app.effects_filter_rows[i];
@@ -312,66 +293,51 @@ fn draw_effects_skills_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
 
 /// Reducing under an inherited parent expands it first.
 fn draw_effect_skill_row(app: &mut GuiApp, ui: &mut egui::Ui, idx: usize) {
-    let (folders, display, active_skill_id, action_type, level) = {
-        let Some(catalog) = &app.effect_catalog else {
-            return;
-        };
-        let row = &catalog[idx];
-        (
-            row.folders.clone(),
-            row.display.clone(),
-            row.active_skill_id.clone(),
-            row.action_type.clone(),
-            app.effect_level_for_folders(&row.folders),
-        )
+    let Some(catalog) = &app.effect_catalog else {
+        return;
     };
-    let reducible = app.can_reduce_effect_folders(&folders);
+    let row = &catalog[idx];
+    let level = app.effect_level_for_folders(&row.folders);
+    let reducible = app.can_reduce_effect_folders(&row.folders);
     let mixed = level.is_none();
     let mut reduced = level == Some(EffectLevel::Reduced);
     let blocked = level != Some(EffectLevel::Reduced) && !reducible;
-    let hover = format!(
-        "{}\n{}\n{}",
-        active_skill_id,
-        action_type,
-        folders.join("\n")
-    );
-    let hover = if blocked {
-        format!("{hover}\nWaiting for skill/shared lists to preserve sibling visuals…")
-    } else {
-        hover
-    };
-    ui.allocate_ui_with_layout(
-        egui::vec2(ui.available_width(), COLOR_ROW_HEIGHT),
-        egui::Layout::left_to_right(egui::Align::Center),
-        |ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            let toggle = ui.add_enabled_ui(!blocked, |ui| {
-                ui.add(egui::Checkbox::without_text(&mut reduced).indeterminate(mixed))
-            });
-            let toggle = toggle.inner;
-            if toggle.changed() {
-                let new_level = if reduced {
-                    EffectLevel::Reduced
-                } else {
-                    EffectLevel::Full
-                };
-                app.set_skill_folders_level(&folders, new_level);
-            }
-            ui.add_space(4.0);
-            ui.add(
-                egui::Label::new(egui::RichText::new(&display).size(11.5).color(
-                    if level == Some(EffectLevel::Reduced) {
-                        palette::TEXT_MUTED
-                    } else {
-                        palette::TEXT
-                    },
-                ))
-                .truncate(),
-            )
-            .on_hover_text(&hover);
-            toggle.on_hover_text(hover);
-        },
-    );
+    let hover = row_hover(&row.hover, blocked);
+    let changed = ui
+        .allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), COLOR_ROW_HEIGHT),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let toggle = ui.add_enabled_ui(!blocked, |ui| {
+                    ui.add(egui::Checkbox::without_text(&mut reduced).indeterminate(mixed))
+                });
+                let toggle = toggle.inner;
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(egui::RichText::new(&row.display).size(11.5).color(
+                        if level == Some(EffectLevel::Reduced) {
+                            palette::TEXT_MUTED
+                        } else {
+                            palette::TEXT
+                        },
+                    ))
+                    .truncate(),
+                )
+                .on_hover_text(hover.clone());
+                toggle.on_hover_text(hover).changed()
+            },
+        )
+        .inner;
+    if changed {
+        let folders = row.folders.clone();
+        let new_level = if reduced {
+            EffectLevel::Reduced
+        } else {
+            EffectLevel::Full
+        };
+        app.set_skill_folders_level(&folders, new_level);
+    }
 }
 
 fn draw_effects_others_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
@@ -393,18 +359,11 @@ fn draw_effects_others_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
             ));
         });
         ui.add_space(4.0);
-    } else if let Some(error) = app.other_catalog_error.clone() {
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(format!("Shared effects list unavailable: {error}"))
-                    .size(11.5)
-                    .color(palette::WARNING),
-            );
-            if small_action(ui, "Retry") {
-                app.other_catalog_error = None;
-                app.ensure_other_effect_catalog_loading();
-            }
-        });
+    } else if let Some(error) = &app.other_catalog_error {
+        if catalog_error_row(ui, "Shared effects list", error, "") {
+            app.other_catalog_error = None;
+            app.ensure_other_effect_catalog_loading();
+        }
         ui.add_space(4.0);
     }
 
@@ -416,35 +375,26 @@ fn draw_effects_others_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
             ));
         });
         ui.add_space(4.0);
-    } else if app.effect_catalog.is_none()
-        && let Some(error) = app.effect_catalog_error.clone()
+    } else if app.other_catalog.is_some()
+        && app.effect_catalog.is_none()
+        && let Some(error) = &app.effect_catalog_error
     {
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(format!(
-                    "Skill list unavailable: {error}. Reductions that need it stay pending."
-                ))
-                .size(11.5)
-                .color(palette::WARNING),
-            );
-            if small_action(ui, "Retry") {
-                app.effect_catalog_error = None;
-                app.ensure_effect_catalog_loading();
-            }
-        });
+        let note = ". Reductions that need it stay pending.";
+        if catalog_error_row(ui, "Skill list", error, note) {
+            app.effect_catalog_error = None;
+            app.ensure_effect_catalog_loading();
+        }
         ui.add_space(4.0);
     }
 
     app.refresh_others_filter();
     let row_count = app.others_filter_rows.len();
-    let bulk_folders: Vec<String> = {
-        let catalog = app.other_catalog.as_deref().unwrap_or_default();
+    let catalog = app.other_catalog.as_deref().unwrap_or_default();
+    let can_bulk_reduce = app.can_reduce_effect_folder_set(
         app.others_filter_rows
             .iter()
-            .map(|&idx| catalog[idx].folder.clone())
-            .collect()
-    };
-    let can_bulk_reduce = app.can_reduce_effect_folders(&bulk_folders);
+            .map(|&idx| &catalog[idx].folder),
+    );
     draw_effects_list_header(
         ui,
         |ui| {
@@ -461,8 +411,8 @@ fn draw_effects_others_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
     // Per-tab salt, or the lists would share one scroll offset.
     egui::ScrollArea::vertical()
         .id_salt("effects_others_list")
-        .max_height(380.0)
-        .auto_shrink([false, false])
+        .max_height(list_max_height(ui))
+        .auto_shrink([false, app.other_catalog_error.is_some()])
         .show_rows(ui, COLOR_ROW_HEIGHT, row_count, |ui, range| {
             for i in range {
                 let idx = app.others_filter_rows[i];
@@ -490,60 +440,50 @@ fn draw_effects_others_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
 
 /// Reducing under an inherited parent expands it first so siblings stay Full.
 fn draw_other_effect_row(app: &mut GuiApp, ui: &mut egui::Ui, idx: usize) {
-    let (folder, display, level) = {
-        let Some(catalog) = &app.other_catalog else {
-            return;
-        };
-        let row = &catalog[idx];
-        (
-            row.folder.clone(),
-            row.display.clone(),
-            app.other_effect_level(&row.folder),
-        )
+    let Some(catalog) = &app.other_catalog else {
+        return;
     };
-    let reducible = app.can_reduce_effect_folders(std::slice::from_ref(&folder));
+    let row = &catalog[idx];
+    let level = app.other_effect_level(&row.folder);
+    let reducible = app.can_reduce_effect_folders(std::slice::from_ref(&row.folder));
     let mut reduced = level == EffectLevel::Reduced;
     let blocked = level == EffectLevel::Full && !reducible;
-    let hover = format!("metadata/effects/spells/{folder}");
-    let hover = if blocked {
-        format!("{hover}\nWaiting for skill/shared lists to preserve sibling visuals…")
-    } else {
-        hover
-    };
-    ui.allocate_ui_with_layout(
-        egui::vec2(ui.available_width(), COLOR_ROW_HEIGHT),
-        egui::Layout::left_to_right(egui::Align::Center),
-        |ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            let toggle = ui.add_enabled_ui(!blocked, |ui| {
-                ui.add(egui::Checkbox::without_text(&mut reduced))
-            });
-            let toggle = toggle.inner;
-            if toggle.changed() {
-                app.set_other_effect_level(
-                    &folder,
-                    if reduced {
-                        EffectLevel::Reduced
-                    } else {
-                        EffectLevel::Full
-                    },
-                );
-            }
-            ui.add_space(4.0);
-            ui.add(
-                egui::Label::new(egui::RichText::new(&display).size(11.5).color(
-                    if level == EffectLevel::Reduced {
-                        palette::TEXT_MUTED
-                    } else {
-                        palette::TEXT
-                    },
-                ))
-                .truncate(),
-            )
-            .on_hover_text(&hover);
-            toggle.on_hover_text(hover);
-        },
-    );
+    let hover = row_hover(&row.hover, blocked);
+    let changed = ui
+        .allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), COLOR_ROW_HEIGHT),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let toggle = ui.add_enabled_ui(!blocked, |ui| {
+                    ui.add(egui::Checkbox::without_text(&mut reduced))
+                });
+                let toggle = toggle.inner;
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(egui::RichText::new(&row.display).size(11.5).color(
+                        if level == EffectLevel::Reduced {
+                            palette::TEXT_MUTED
+                        } else {
+                            palette::TEXT
+                        },
+                    ))
+                    .truncate(),
+                )
+                .on_hover_text(hover.clone());
+                toggle.on_hover_text(hover).changed()
+            },
+        )
+        .inner;
+    if changed {
+        let folder = row.folder.clone();
+        let new_level = if reduced {
+            EffectLevel::Reduced
+        } else {
+            EffectLevel::Full
+        };
+        app.set_other_effect_level(&folder, new_level);
+    }
 }
 
 fn draw_effects_monsters_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
@@ -565,18 +505,11 @@ fn draw_effects_monsters_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
             ));
         });
         ui.add_space(4.0);
-    } else if let Some(error) = app.monster_catalog_error.clone() {
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(format!("Monster list unavailable: {error}"))
-                    .size(11.5)
-                    .color(palette::WARNING),
-            );
-            if small_action(ui, "Retry") {
-                app.monster_catalog_error = None;
-                app.ensure_monster_catalog_loading();
-            }
-        });
+    } else if let Some(error) = &app.monster_catalog_error {
+        if catalog_error_row(ui, "Monster list", error, "") {
+            app.monster_catalog_error = None;
+            app.ensure_monster_catalog_loading();
+        }
         ui.add_space(4.0);
     }
 
@@ -624,8 +557,8 @@ fn draw_effects_monsters_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
     ui.add_space(4.0);
     egui::ScrollArea::vertical()
         .id_salt("effects_monsters_list")
-        .max_height(380.0)
-        .auto_shrink([false, false])
+        .max_height(list_max_height(ui))
+        .auto_shrink([false, app.monster_catalog_error.is_some()])
         .show_rows(ui, COLOR_ROW_HEIGHT, row_count, |ui, range| {
             for i in range {
                 let idx = app.monsters_filter_rows[i];
@@ -695,7 +628,7 @@ fn draw_mtx_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
     ui.add_space(4.0);
     egui::ScrollArea::vertical()
         .id_salt("mtx_list")
-        .max_height(380.0)
+        .max_height(list_max_height(ui))
         .auto_shrink([false, false])
         .show_rows(ui, COLOR_ROW_HEIGHT, row_count, |ui, range| {
             for i in range {
@@ -722,11 +655,7 @@ fn draw_mtx_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
 
 fn draw_mtx_list_row(app: &mut GuiApp, ui: &mut egui::Ui, idx: usize) {
     let row = &app.mtx_catalog[idx];
-    let folder = row.folder.clone();
-    let display = row.display.clone();
-    let context = row.context.clone();
-    let mut removed = !app.kept_mtx.contains(&folder);
-    let hover = format!("{MTX_PREFIX}{folder}");
+    let mut removed = !app.kept_mtx.contains(&row.folder);
     ui.allocate_ui_with_layout(
         egui::vec2(ui.available_width(), COLOR_ROW_HEIGHT),
         egui::Layout::left_to_right(egui::Align::Center),
@@ -735,33 +664,37 @@ fn draw_mtx_list_row(app: &mut GuiApp, ui: &mut egui::Ui, idx: usize) {
             let toggle = ui.add(egui::Checkbox::without_text(&mut removed));
             if toggle.changed() {
                 if removed {
-                    app.kept_mtx.remove(&folder);
+                    app.kept_mtx.remove(&row.folder);
                 } else {
-                    app.kept_mtx.insert(folder);
+                    app.kept_mtx.insert(row.folder.clone());
                 }
             }
             ui.add_space(4.0);
             ui.add(
-                egui::Label::new(egui::RichText::new(&display).size(11.5).color(if removed {
-                    palette::TEXT_MUTED
-                } else {
-                    palette::TEXT
-                }))
+                egui::Label::new(
+                    egui::RichText::new(&row.display)
+                        .size(11.5)
+                        .color(if removed {
+                            palette::TEXT_MUTED
+                        } else {
+                            palette::TEXT
+                        }),
+                )
                 .truncate(),
             )
-            .on_hover_text(&hover);
-            if !context.is_empty() {
+            .on_hover_text(Arc::clone(&row.hover));
+            if !row.context.is_empty() {
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(monster_context_label(&context))
+                        egui::RichText::new(monster_context_label(&row.context))
                             .size(11.5)
                             .color(palette::TEXT_MUTED),
                     )
                     .truncate(),
                 )
-                .on_hover_text(&hover);
+                .on_hover_text(Arc::clone(&row.hover));
             }
-            toggle.on_hover_text(hover);
+            toggle.on_hover_text(Arc::clone(&row.hover));
         },
     );
 }
@@ -801,13 +734,10 @@ fn draw_monster_row(app: &mut GuiApp, ui: &mut egui::Ui, idx: usize) {
         return;
     };
     let row = &catalog[idx];
-    let keys = row.monster_keys.clone();
-    let display = row.display.clone();
-    let context = row.context.clone();
-    let level = app.monster_level_for_keys(&keys);
+    let keys = &row.monster_keys;
+    let level = app.monster_level_for_keys(keys);
     let mixed = level.is_none();
     let mut reduced = level == Some(EffectLevel::Reduced);
-    let hover = hover_key_list(&keys);
     ui.allocate_ui_with_layout(
         egui::vec2(ui.available_width(), COLOR_ROW_HEIGHT),
         egui::Layout::left_to_right(egui::Align::Center),
@@ -820,7 +750,7 @@ fn draw_monster_row(app: &mut GuiApp, ui: &mut egui::Ui, idx: usize) {
                 } else {
                     EffectLevel::Full
                 };
-                for key in &keys {
+                for key in keys {
                     if new_level == EffectLevel::Reduced {
                         app.monster_overrides.remove(key);
                     } else {
@@ -830,7 +760,7 @@ fn draw_monster_row(app: &mut GuiApp, ui: &mut egui::Ui, idx: usize) {
             }
             ui.add_space(4.0);
             ui.add(
-                egui::Label::new(egui::RichText::new(&display).size(11.5).color(
+                egui::Label::new(egui::RichText::new(&row.display).size(11.5).color(
                     if level == Some(EffectLevel::Reduced) {
                         palette::TEXT_MUTED
                     } else {
@@ -839,9 +769,9 @@ fn draw_monster_row(app: &mut GuiApp, ui: &mut egui::Ui, idx: usize) {
                 ))
                 .truncate(),
             )
-            .on_hover_text(&hover);
+            .on_hover_text(Arc::clone(&row.hover));
             // Truncate the muted context suffix so the name keeps priority.
-            if let Some(context) = &context {
+            if let Some(context) = &row.context {
                 ui.add(
                     egui::Label::new(
                         egui::RichText::new(monster_context_label(context))
@@ -850,9 +780,9 @@ fn draw_monster_row(app: &mut GuiApp, ui: &mut egui::Ui, idx: usize) {
                     )
                     .truncate(),
                 )
-                .on_hover_text(&hover);
+                .on_hover_text(Arc::clone(&row.hover));
             }
-            toggle.on_hover_text(hover);
+            toggle.on_hover_text(Arc::clone(&row.hover));
         },
     );
 }
@@ -861,18 +791,42 @@ fn monster_context_label(context: &str) -> String {
     format!("· {context}")
 }
 
-fn hover_key_list(keys: &[String]) -> String {
-    const MAX_HOVER_KEYS: usize = 12;
-    let mut hover = keys
-        .iter()
-        .take(MAX_HOVER_KEYS)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join("\n");
-    if keys.len() > MAX_HOVER_KEYS {
-        hover.push_str(&format!("\n… {} more", keys.len() - MAX_HOVER_KEYS));
+/// A list takes the height the window has left, so its dialog never runs off screen.
+fn list_max_height(ui: &egui::Ui) -> f32 {
+    let above = ui.cursor().min.y - ui.max_rect().min.y;
+    (ui.ctx().content_rect().height() - above - DIALOG_RESERVED_HEIGHT).clamp(120.0, 380.0)
+}
+
+/// Errors can carry several lines of help, so the row shows the first and hovers the rest.
+fn catalog_error_row(ui: &mut egui::Ui, list: &str, error: &str, note: &str) -> bool {
+    let first = error
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('.');
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            egui::RichText::new(format!("{list} unavailable: {first}{note}"))
+                .size(11.5)
+                .color(palette::WARNING),
+        )
+        .on_hover_text(error);
+        small_action(ui, "Retry")
+    })
+    .inner
+}
+
+/// Blocked rows are rare, so only they pay for a copy.
+fn row_hover(hover: &Arc<egui::RichText>, blocked: bool) -> egui::WidgetText {
+    if blocked {
+        format!(
+            "{}\nWaiting for skill/shared lists to preserve sibling visuals…",
+            hover.text()
+        )
+        .into()
+    } else {
+        Arc::clone(hover).into()
     }
-    hover
 }
 
 #[cfg(test)]
@@ -976,6 +930,7 @@ mod tests {
     fn monster_row(display: &str, keys: &[&str], named: bool) -> crate::MonsterCatalogRow {
         let monster_keys: Vec<String> = keys.iter().map(|key| key.to_string()).collect();
         crate::MonsterCatalogRow {
+            hover: Default::default(),
             display_lower: display.to_lowercase(),
             search_lower: format!("{} {}", display.to_lowercase(), monster_keys.join(" ")),
             display: display.to_string(),
@@ -1060,6 +1015,7 @@ mod tests {
         theme::install_fonts(&ctx);
         let mut app = GuiApp {
             mtx_catalog: vec![crate::MtxRow {
+                hover: Default::default(),
                 folder: "foot_prints".to_string(),
                 display: "Foot Prints".to_string(),
                 context: String::new(),
@@ -1125,6 +1081,7 @@ mod tests {
         let ctx = egui::Context::default();
         theme::install_fonts(&ctx);
         let row = |folder: &str, display: &str, context: &str| crate::MtxRow {
+            hover: Default::default(),
             search_lower: format!("{display} {context} {folder}").to_lowercase(),
             display_lower: display.to_lowercase(),
             folder: folder.to_string(),
@@ -1161,6 +1118,7 @@ mod tests {
 
     fn other_row(folder: &str, display: &str) -> crate::OtherEffectRow {
         crate::OtherEffectRow {
+            hover: Default::default(),
             display_lower: display.to_lowercase(),
             search_lower: format!("{display} {folder}").to_lowercase(),
             folder: folder.to_string(),

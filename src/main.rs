@@ -4,8 +4,9 @@ mod gui;
 
 use eframe::egui;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -24,6 +25,7 @@ use tiny_poe2smoother::patches::{
 };
 
 const PREFS_KEY: &str = "tiny-poe2smoother.gui.v1";
+const MTX_PREFIX: &str = "metadata/effects/microtransactions/";
 const MIN_INNER_SIZE: [f32; 2] = [840.0, 620.0];
 /// Taskbar, title bar, and cascade offset.
 const SCREEN_MARGIN: f32 = 110.0;
@@ -159,11 +161,11 @@ type ColorFilterKey = (String, usize, usize);
 /// One row may own several folders when the game splits a skill's visuals.
 struct EffectFolderRow {
     folders: Vec<String>,
-    active_skill_id: String,
-    action_type: String,
     display: String,
     display_lower: String,
     search_lower: String,
+    /// An `Arc`, so handing it to egui every frame doesn't copy the text.
+    hover: Arc<egui::RichText>,
 }
 
 /// One row owns every variant sharing a display name. Unnamed rows hide behind
@@ -175,6 +177,7 @@ struct MonsterCatalogRow {
     search_lower: String,
     context: Option<String>,
     named: bool,
+    hover: Arc<egui::RichText>,
 }
 
 struct OtherEffectRow {
@@ -182,6 +185,7 @@ struct OtherEffectRow {
     display: String,
     display_lower: String,
     search_lower: String,
+    hover: Arc<egui::RichText>,
 }
 
 struct MtxRow {
@@ -191,6 +195,7 @@ struct MtxRow {
     display_lower: String,
     search_lower: String,
     file_words: String,
+    hover: Arc<egui::RichText>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -582,6 +587,7 @@ impl GuiApp {
     }
 
     fn spawn_status(&mut self) {
+        self.invalidate_catalogs_if_stale();
         let game_dir = self.game_dir();
         let loader = self.status_loader;
         self.status = None;
@@ -703,6 +709,7 @@ impl GuiApp {
 
     fn apply_status(&mut self, status: AppStatus) {
         self.game_dir_input = display_path(&status.game_dir);
+        self.invalidate_catalogs_if_stale();
         self.mtx_catalog = mtx_catalog_rows(&status.mtx_catalog);
         self.mtx_filter_key = None;
         self.status = Some(status);
@@ -765,8 +772,8 @@ impl GuiApp {
     }
 
     /// Overrides survive. Only the catalog and its caches reset.
-    fn invalidate_stat_catalog_if_stale(&mut self, game_dir: &Option<PathBuf>) {
-        if self.stat_catalog_dir.as_deref() != game_dir.as_deref() {
+    fn invalidate_stat_catalog_if_stale(&mut self, game_dir: Option<&Path>) {
+        if self.stat_catalog_dir.as_deref() != game_dir {
             self.stat_catalog = None;
             self.catalog_task = None;
             self.catalog_error = None;
@@ -778,7 +785,7 @@ impl GuiApp {
     /// Not `spawn`, which would lock the whole UI while the editor should stay usable.
     fn ensure_catalog_loading(&mut self) {
         let game_dir = self.game_dir();
-        self.invalidate_stat_catalog_if_stale(&game_dir);
+        self.invalidate_stat_catalog_if_stale(game_dir.as_deref());
         if self.stat_catalog.is_some() || self.catalog_task.is_some() {
             return;
         }
@@ -894,8 +901,8 @@ impl GuiApp {
     }
 
     /// Overrides survive because stale folders simply match no path.
-    fn invalidate_effect_catalog_if_stale(&mut self, game_dir: &Option<PathBuf>) {
-        if self.effect_catalog_dir.as_deref() != game_dir.as_deref() {
+    fn invalidate_effect_catalog_if_stale(&mut self, game_dir: Option<&Path>) {
+        if self.effect_catalog_dir.as_deref() != game_dir {
             self.effect_catalog = None;
             self.effect_catalog_task = None;
             self.effect_catalog_error = None;
@@ -907,7 +914,7 @@ impl GuiApp {
     /// Not `spawn`, so the editor stays usable while it loads.
     fn ensure_effect_catalog_loading(&mut self) {
         let game_dir = self.game_dir();
-        self.invalidate_effect_catalog_if_stale(&game_dir);
+        self.invalidate_effect_catalog_if_stale(game_dir.as_deref());
         if self.effect_catalog.is_some() || self.effect_catalog_task.is_some() {
             return;
         }
@@ -1015,8 +1022,13 @@ impl GuiApp {
     }
 
     fn effective_effect_level(&self, folder: &str) -> EffectLevel {
-        let folder = folder.to_ascii_lowercase();
-        if self.effect_overrides.get(&folder).copied() == Some(EffectLevel::Full) {
+        // Catalog folders are already lowercase, so the caption's per-folder calls don't allocate.
+        let folder: Cow<str> = if folder.bytes().any(|b| b.is_ascii_uppercase()) {
+            Cow::Owned(folder.to_ascii_lowercase())
+        } else {
+            Cow::Borrowed(folder)
+        };
+        if self.effect_overrides.get(folder.as_ref()).copied() == Some(EffectLevel::Full) {
             return EffectLevel::Full;
         }
         let bytes = folder.as_bytes();
@@ -1037,46 +1049,70 @@ impl GuiApp {
             || self.selected_patches.contains(&PatchId::Particles)
     }
 
-    fn effect_ancestors_for_removal(&self, removal: &[String]) -> Vec<String> {
+    fn effect_ancestors_for_removal<'a>(
+        &'a self,
+        removal: &'a [String],
+    ) -> impl Iterator<Item = &'a str> {
+        self.full_effect_keys().filter(move |key| {
+            removal
+                .iter()
+                .any(|folder| is_folder_ancestor_ignore_case(key, folder))
+        })
+    }
+
+    fn full_effect_keys(&self) -> impl Iterator<Item = &str> {
         self.effect_overrides
             .iter()
             .filter(|(_, level)| **level == EffectLevel::Full)
-            .map(|(key, _)| key.clone())
-            .filter(|key| {
-                let key_lower = key.to_ascii_lowercase();
-                removal
-                    .iter()
-                    .any(|folder| is_folder_ancestor(&key_lower, &folder.to_ascii_lowercase()))
-            })
-            .collect()
+            .map(|(key, _)| key.as_str())
     }
 
     /// Only broad-ancestor migration needs catalogs. Ground-only ancestors need just Others.
-    fn can_reduce_effect_folders(&mut self, removal: &[String]) -> bool {
-        if removal.is_empty() {
-            return true;
-        }
+    fn effect_ancestor_blocked(&self, ancestor: &str) -> bool {
+        self.other_catalog.is_none()
+            || (self.effect_catalog.is_none() && !is_ground_effects_scope(ancestor))
+    }
+
+    fn effect_catalogs_loaded(&self) -> bool {
+        self.effect_catalog.is_some() && self.other_catalog.is_some()
+    }
+
+    fn invalidate_effect_catalogs_if_stale(&mut self) {
         let game_dir = self.game_dir();
-        self.invalidate_effect_catalog_if_stale(&game_dir);
-        self.invalidate_other_effect_catalog_if_stale(&game_dir);
-        let removal: Vec<String> = removal
-            .iter()
-            .map(|folder| folder.to_ascii_lowercase())
-            .collect();
-        let ancestors = self.effect_ancestors_for_removal(&removal);
-        if ancestors.is_empty() {
-            return true;
-        }
-        for ancestor in &ancestors {
-            if is_ground_effects_scope(ancestor) {
-                if self.other_catalog.is_none() {
-                    return false;
-                }
-            } else if self.effect_catalog.is_none() || self.other_catalog.is_none() {
-                return false;
-            }
-        }
-        true
+        self.invalidate_effect_catalog_if_stale(game_dir.as_deref());
+        self.invalidate_other_effect_catalog_if_stale(game_dir.as_deref());
+    }
+
+    /// Runs when the install changes, because the main screen counts with these lists
+    /// even while the editor is closed.
+    fn invalidate_catalogs_if_stale(&mut self) {
+        self.invalidate_effect_catalogs_if_stale();
+        let game_dir = self.game_dir();
+        self.invalidate_monster_catalog_if_stale(game_dir.as_deref());
+    }
+
+    /// The editor drops stale catalogs once per frame, before any row calls this.
+    fn can_reduce_effect_folders(&self, removal: &[String]) -> bool {
+        self.effect_catalogs_loaded()
+            || self
+                .effect_ancestors_for_removal(removal)
+                .all(|ancestor| !self.effect_ancestor_blocked(ancestor))
+    }
+
+    /// Same answer as `can_reduce_effect_folders` on all of `folders`, without collecting them.
+    /// It runs every frame while a catalog loads.
+    fn can_reduce_effect_folder_set<'a>(
+        &self,
+        mut folders: impl Iterator<Item = &'a String>,
+    ) -> bool {
+        self.effect_catalogs_loaded()
+            || !folders.any(|folder| {
+                folder.contains('/')
+                    && self.full_effect_keys().any(|key| {
+                        is_folder_ancestor_ignore_case(key, folder)
+                            && self.effect_ancestor_blocked(key)
+                    })
+            })
     }
 
     /// Runs every repaint, so it stays linear.
@@ -1120,8 +1156,8 @@ impl GuiApp {
     }
 
     /// Overrides survive because stale folders simply match no path.
-    fn invalidate_other_effect_catalog_if_stale(&mut self, game_dir: &Option<PathBuf>) {
-        if self.other_catalog_dir.as_deref() != game_dir.as_deref() {
+    fn invalidate_other_effect_catalog_if_stale(&mut self, game_dir: Option<&Path>) {
+        if self.other_catalog_dir.as_deref() != game_dir {
             self.other_catalog = None;
             self.other_catalog_task = None;
             self.other_catalog_error = None;
@@ -1132,7 +1168,7 @@ impl GuiApp {
 
     fn ensure_other_effect_catalog_loading(&mut self) {
         let game_dir = self.game_dir();
-        self.invalidate_other_effect_catalog_if_stale(&game_dir);
+        self.invalidate_other_effect_catalog_if_stale(game_dir.as_deref());
         if self.other_catalog.is_some() || self.other_catalog_task.is_some() {
             return;
         }
@@ -1249,14 +1285,15 @@ impl GuiApp {
         if removal.is_empty() {
             return true;
         }
-        let game_dir = self.game_dir();
-        self.invalidate_effect_catalog_if_stale(&game_dir);
-        self.invalidate_other_effect_catalog_if_stale(&game_dir);
+        self.invalidate_effect_catalogs_if_stale();
         let removal: Vec<String> = removal
             .iter()
             .map(|folder| folder.to_ascii_lowercase())
             .collect();
-        let ancestors = self.effect_ancestors_for_removal(&removal);
+        let ancestors: Vec<String> = self
+            .effect_ancestors_for_removal(&removal)
+            .map(str::to_owned)
+            .collect();
         if ancestors.is_empty() {
             return true;
         }
@@ -1269,23 +1306,11 @@ impl GuiApp {
                 return false;
             }
         }
-        let skill_folders: Vec<String> = self
-            .effect_catalog
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .flat_map(|row| row.folders.iter().cloned())
-            .collect();
-        let other_folders: Vec<String> = self
-            .other_catalog
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .map(|row| row.folder.clone())
-            .collect();
+        let skill_catalog = self.effect_catalog.as_deref().unwrap_or_default();
+        let other_catalog = self.other_catalog.as_deref().unwrap_or_default();
         for ancestor in ancestors {
             if !is_ground_effects_scope(&ancestor) {
-                for folder in &skill_folders {
+                for folder in skill_catalog.iter().flat_map(|row| &row.folders) {
                     if !is_folder_equal_or_descendant(folder, &ancestor) {
                         continue;
                     }
@@ -1300,7 +1325,7 @@ impl GuiApp {
                         .or_insert(EffectLevel::Full);
                 }
             }
-            for folder in &other_folders {
+            for folder in other_catalog.iter().map(|row| &row.folder) {
                 if !is_folder_equal_or_descendant(folder, &ancestor) {
                     continue;
                 }
@@ -1332,8 +1357,8 @@ impl GuiApp {
     }
 
     /// Overrides survive because stale keys resolve to no paths.
-    fn invalidate_monster_catalog_if_stale(&mut self, game_dir: &Option<PathBuf>) {
-        if self.monster_catalog_dir.as_deref() != game_dir.as_deref() {
+    fn invalidate_monster_catalog_if_stale(&mut self, game_dir: Option<&Path>) {
+        if self.monster_catalog_dir.as_deref() != game_dir {
             self.monster_catalog = None;
             self.monster_catalog_task = None;
             self.monster_catalog_error = None;
@@ -1356,7 +1381,7 @@ impl GuiApp {
     /// Reads every monster metadata file, so it starts only when its tab is shown.
     fn ensure_monster_catalog_loading(&mut self) {
         let game_dir = self.game_dir();
-        self.invalidate_monster_catalog_if_stale(&game_dir);
+        self.invalidate_monster_catalog_if_stale(game_dir.as_deref());
         if self.monster_catalog.is_some() || self.monster_catalog_task.is_some() {
             return;
         }
@@ -1539,6 +1564,7 @@ fn monster_effect_catalog_rows(entries: Vec<MonsterEffectCatalogEntry>) -> Vec<M
                 entry.display
             };
             MonsterCatalogRow {
+                hover: Arc::new(egui::RichText::new(hover_key_list(&entry.monster_keys))),
                 monster_keys: entry.monster_keys,
                 display_lower,
                 display,
@@ -1548,6 +1574,15 @@ fn monster_effect_catalog_rows(entries: Vec<MonsterEffectCatalogEntry>) -> Vec<M
             }
         })
         .collect()
+}
+
+fn hover_key_list(keys: &[String]) -> String {
+    const MAX_HOVER_KEYS: usize = 12;
+    let mut hover = keys[..keys.len().min(MAX_HOVER_KEYS)].join("\n");
+    if keys.len() > MAX_HOVER_KEYS {
+        hover.push_str(&format!("\n… {} more", keys.len() - MAX_HOVER_KEYS));
+    }
+    hover
 }
 
 /// Caps the visible context. The full set stays searchable.
@@ -1573,10 +1608,15 @@ fn effect_skill_catalog_rows(entries: Vec<EffectSkillCatalogEntry>) -> Vec<Effec
                 entry.action_type.to_lowercase(),
                 entry.folders.join(" ")
             );
+            let hover = format!(
+                "{}\n{}\n{}",
+                entry.active_skill_id,
+                entry.action_type,
+                entry.folders.join("\n")
+            );
             EffectFolderRow {
+                hover: Arc::new(egui::RichText::new(hover)),
                 folders: entry.folders,
-                active_skill_id: entry.active_skill_id,
-                action_type: entry.action_type,
                 display_lower: entry.display.to_lowercase(),
                 display: entry.display,
                 search_lower,
@@ -1592,21 +1632,23 @@ fn is_folder_ancestor(ancestor: &str, path: &str) -> bool {
         && path.as_bytes().get(ancestor.len()) == Some(&b'/')
 }
 
+fn is_folder_ancestor_ignore_case(ancestor: &str, path: &str) -> bool {
+    let (path, ancestor) = (path.as_bytes(), ancestor.as_bytes());
+    path.len() > ancestor.len()
+        && path[ancestor.len()] == b'/'
+        && path[..ancestor.len()].eq_ignore_ascii_case(ancestor)
+}
+
 fn is_folder_equal_or_descendant(path: &str, ancestor: &str) -> bool {
     path == ancestor || is_folder_ancestor(ancestor, path)
 }
 
 /// Never assigned to skills, so expanding these needs only the Others catalog.
 fn is_ground_effects_scope(folder: &str) -> bool {
-    matches!(
-        folder
-            .split('/')
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase()
-            .as_str(),
-        "ground_effects" | "ground_effects_v2" | "ground_effects_v3"
-    )
+    let top = folder.split('/').next().unwrap_or("");
+    ["ground_effects", "ground_effects_v2", "ground_effects_v3"]
+        .iter()
+        .any(|scope| top.eq_ignore_ascii_case(scope))
 }
 
 /// Equal to, above, or below an Others folder. Empty lists claim nothing.
@@ -1629,6 +1671,9 @@ fn other_effect_catalog_rows(entries: Vec<OtherEffectCatalogEntry>) -> Vec<Other
                 display_lower: entry.display.to_lowercase(),
                 display: entry.display,
                 search_lower,
+                hover: Arc::new(egui::RichText::new(format!(
+                    "metadata/effects/spells/{folder}"
+                ))),
                 folder,
             }
         })
@@ -1650,6 +1695,7 @@ fn mtx_catalog_rows(entries: &[MtxCatalogEntry]) -> Vec<MtxRow> {
             display: entry.display.clone(),
             context: entry.context.clone(),
             file_words: entry.file_words.clone(),
+            hover: Arc::new(egui::RichText::new(format!("{MTX_PREFIX}{}", entry.folder))),
         })
         .collect()
 }
@@ -1755,6 +1801,54 @@ mod tests {
 
         assert_eq!(app.game_dir_input, "custom-install");
         assert!(app.status.as_ref().unwrap().patch_state.can_restore());
+    }
+
+    fn app_with_lists_for(install: &str) -> GuiApp {
+        GuiApp {
+            game_dir_input: install.to_string(),
+            effect_catalog: Some(Vec::new()),
+            effect_catalog_dir: Some(PathBuf::from(install)),
+            other_catalog: Some(Vec::new()),
+            other_catalog_dir: Some(PathBuf::from(install)),
+            monster_catalog: Some(Vec::new()),
+            monster_catalog_dir: Some(PathBuf::from(install)),
+            status_loader: |path| Ok(patched_status(path.unwrap())),
+            ..GuiApp::default()
+        }
+    }
+
+    #[test]
+    fn choosing_another_install_drops_lists_from_the_old_one() {
+        let mut app = app_with_lists_for("install-a");
+        app.select_game_dir(PathBuf::from("install-b"));
+        assert!(app.effect_catalog.is_none());
+        assert!(app.other_catalog.is_none());
+        assert!(app.monster_catalog.is_none());
+        finish_status_task(&mut app);
+        assert_eq!(app.game_dir_input, "install-b");
+    }
+
+    #[test]
+    fn autodetect_finding_another_install_drops_lists_from_the_old_one() {
+        let mut app = GuiApp {
+            status_loader: |_| Ok(patched_status(PathBuf::from("detected-install"))),
+            ..app_with_lists_for("install-a")
+        };
+        app.spawn_autodetect();
+        assert!(app.effect_catalog.is_some());
+        finish_status_task(&mut app);
+        assert!(app.effect_catalog.is_none());
+        assert!(app.other_catalog.is_none());
+        assert!(app.monster_catalog.is_none());
+    }
+
+    #[test]
+    fn status_refresh_for_the_same_install_keeps_lists() {
+        let mut app = app_with_lists_for("install-a");
+        app.apply_status(patched_status(PathBuf::from("install-a")));
+        assert!(app.effect_catalog.is_some());
+        assert!(app.other_catalog.is_some());
+        assert!(app.monster_catalog.is_some());
     }
 
     #[test]
@@ -2226,6 +2320,7 @@ mod tests {
     fn monster_row(display: &str, keys: &[&str]) -> MonsterCatalogRow {
         let monster_keys: Vec<String> = keys.iter().map(|key| key.to_string()).collect();
         MonsterCatalogRow {
+            hover: Default::default(),
             display_lower: display.to_lowercase(),
             search_lower: format!("{} {}", display.to_lowercase(), monster_keys.join(" ")),
             display: display.to_string(),
@@ -2403,12 +2498,12 @@ mod tests {
         );
 
         // Same dir: nothing is discarded.
-        app.invalidate_monster_catalog_if_stale(&Some(PathBuf::from("/install/A")));
+        app.invalidate_monster_catalog_if_stale(Some(Path::new("/install/A")));
         assert!(app.monster_catalog.is_some());
         assert_eq!(app.monsters_filter_rows, vec![0]);
 
         // Different dir: catalog + filter cache reset, overrides untouched.
-        app.invalidate_monster_catalog_if_stale(&Some(PathBuf::from("/install/B")));
+        app.invalidate_monster_catalog_if_stale(Some(Path::new("/install/B")));
         assert!(app.monster_catalog.is_none());
         assert!(app.monster_catalog_task.is_none());
         assert!(app.monster_catalog_error.is_none());
@@ -2700,9 +2795,8 @@ mod tests {
                 .map(|(folder, display)| {
                     let display = display.to_string();
                     EffectFolderRow {
+                        hover: Default::default(),
                         folders: vec![folder.to_string()],
-                        active_skill_id: display.to_lowercase().replace(' ', "_"),
-                        action_type: display.replace(' ', ""),
                         display_lower: display.to_lowercase(),
                         display,
                         search_lower: folder.to_string(),
@@ -2726,9 +2820,8 @@ mod tests {
     fn effect_catalog_invalidates_only_when_game_dir_changes() {
         let mut app = GuiApp {
             effect_catalog: Some(vec![EffectFolderRow {
+                hover: Default::default(),
                 folders: vec!["fireball".to_string()],
-                active_skill_id: "fireball".to_string(),
-                action_type: "GreaterFireball".to_string(),
                 display: "Fireball".to_string(),
                 display_lower: "fireball".to_string(),
                 search_lower: "fireball greaterfireball".to_string(),
@@ -2742,13 +2835,13 @@ mod tests {
             .insert("fireball".to_string(), EffectLevel::Full);
 
         // Same dir: nothing is discarded.
-        app.invalidate_effect_catalog_if_stale(&Some(PathBuf::from("/install/A")));
+        app.invalidate_effect_catalog_if_stale(Some(Path::new("/install/A")));
         assert!(app.effect_catalog.is_some());
         assert!(app.effects_filter_key.is_some());
         assert_eq!(app.effects_filter_rows, vec![0]);
 
         // Different dir: catalog + filter cache reset, overrides untouched.
-        app.invalidate_effect_catalog_if_stale(&Some(PathBuf::from("/install/B")));
+        app.invalidate_effect_catalog_if_stale(Some(Path::new("/install/B")));
         assert!(app.effect_catalog.is_none());
         assert!(app.effect_catalog_task.is_none());
         assert!(app.effect_catalog_error.is_none());
@@ -2765,9 +2858,8 @@ mod tests {
         let mut app = GuiApp {
             effect_catalog: Some(vec![
                 EffectFolderRow {
+                    hover: Default::default(),
                     folders: vec!["fire_heraldofash".to_string(), "herald_of_fire".to_string()],
-                    active_skill_id: "herald_of_ash".to_string(),
-                    action_type: "HeraldOfAsh".to_string(),
                     display: "Herald of Ash".to_string(),
                     display_lower: "herald of ash".to_string(),
                     search_lower:
@@ -2775,9 +2867,8 @@ mod tests {
                             .to_string(),
                 },
                 EffectFolderRow {
+                    hover: Default::default(),
                     folders: vec!["fireball".to_string()],
-                    active_skill_id: "fireball".to_string(),
-                    action_type: "GreaterFireball".to_string(),
                     display: "Fireball".to_string(),
                     display_lower: "fireball".to_string(),
                     search_lower: "fireball greaterfireball".to_string(),
@@ -2807,17 +2898,15 @@ mod tests {
         let mut app = GuiApp {
             effect_catalog: Some(vec![
                 EffectFolderRow {
+                    hover: Default::default(),
                     folders: vec!["lightning_herald".to_string(), "herald_of_thunder".to_string()],
-                    active_skill_id: "herald_of_thunder".to_string(),
-                    action_type: "HeraldOfThunder".to_string(),
                     display: "Herald of Thunder".to_string(),
                     display_lower: "herald of thunder".to_string(),
                     search_lower: "herald of thunder herald_of_thunder heraldofthunder lightning_herald herald_of_thunder".to_string(),
                 },
                 EffectFolderRow {
+                    hover: Default::default(),
                     folders: vec!["fireball".to_string()],
-                    active_skill_id: "fireball".to_string(),
-                    action_type: "GreaterFireball".to_string(),
                     display: "Fireball".to_string(),
                     display_lower: "fireball".to_string(),
                     search_lower: "fireball greaterfireball".to_string(),
@@ -2863,9 +2952,8 @@ mod tests {
         assert_eq!(app.kept_original_effect_skill_count(), 2);
 
         app.effect_catalog = Some(vec![EffectFolderRow {
+            hover: Default::default(),
             folders: vec!["fireball".to_string()],
-            active_skill_id: "fireball".to_string(),
-            action_type: "GreaterFireball".to_string(),
             display: "Fireball".to_string(),
             display_lower: "fireball".to_string(),
             search_lower: "fireball greaterfireball".to_string(),
@@ -2901,8 +2989,10 @@ mod tests {
             herald.folders,
             vec!["fire_heraldofash".to_string(), "herald_of_fire".to_string()]
         );
-        assert_eq!(herald.active_skill_id, "herald_of_ash");
-        assert_eq!(herald.action_type, "HeraldOfAsh");
+        assert_eq!(
+            herald.hover.text(),
+            "herald_of_ash\nHeraldOfAsh\nfire_heraldofash\nherald_of_fire"
+        );
         assert!(herald.search_lower.contains("herald_of_ash"));
         assert!(herald.search_lower.contains("heraldofash"));
         assert!(herald.search_lower.contains("fire_heraldofash"));
@@ -3014,9 +3104,8 @@ mod tests {
         let mut app = GuiApp {
             other_catalog: Some(other_effect_catalog_rows(other_catalog_entries())),
             effect_catalog: Some(vec![EffectFolderRow {
+                hover: Default::default(),
                 folders: vec!["fireball".to_string()],
-                active_skill_id: "fireball".to_string(),
-                action_type: "GreaterFireball".to_string(),
                 display: "Fireball".to_string(),
                 display_lower: "fireball".to_string(),
                 search_lower: "fireball greaterfireball".to_string(),
@@ -3102,9 +3191,8 @@ mod tests {
             .insert("ground_effects".to_string(), EffectLevel::Full);
 
         app.effect_catalog = Some(vec![EffectFolderRow {
+            hover: Default::default(),
             folders: vec!["fireball".to_string()],
-            active_skill_id: "fireball".to_string(),
-            action_type: "GreaterFireball".to_string(),
             display: "Fireball".to_string(),
             display_lower: "fireball".to_string(),
             search_lower: "fireball greaterfireball".to_string(),
@@ -3124,9 +3212,8 @@ mod tests {
 
     fn supports_skill_row() -> EffectFolderRow {
         EffectFolderRow {
+            hover: Default::default(),
             folders: vec!["supports/runicsupports/bitterdead".to_string()],
-            active_skill_id: "bitterdead".to_string(),
-            action_type: "RunicSupport".to_string(),
             display: "Bitterdead".to_string(),
             display_lower: "bitterdead".to_string(),
             search_lower: "bitterdead supports/runicsupports/bitterdead".to_string(),
@@ -3324,12 +3411,11 @@ mod tests {
         assert_eq!(app.kept_original_effect_skill_count(), 1);
 
         app.effect_catalog = Some(vec![EffectFolderRow {
+            hover: Default::default(),
             folders: vec![
                 "supports/runicsupports/bitterdead".to_string(),
                 "fireball".to_string(),
             ],
-            active_skill_id: "mixed".to_string(),
-            action_type: "Mixed".to_string(),
             display: "Mixed".to_string(),
             display_lower: "mixed".to_string(),
             search_lower: "mixed".to_string(),
@@ -3439,13 +3525,13 @@ mod tests {
         app.effect_overrides
             .insert("ground_effects/fire".to_string(), EffectLevel::Full);
 
-        app.invalidate_other_effect_catalog_if_stale(&Some(PathBuf::from("/install/A")));
+        app.invalidate_other_effect_catalog_if_stale(Some(Path::new("/install/A")));
         assert!(app.other_catalog.is_some());
         assert!(app.others_filter_key.is_some());
         assert_eq!(app.others_filter_rows, vec![0]);
 
         // Different dir resets catalog + cache, keeping overrides.
-        app.invalidate_other_effect_catalog_if_stale(&Some(PathBuf::from("/install/B")));
+        app.invalidate_other_effect_catalog_if_stale(Some(Path::new("/install/B")));
         assert!(app.other_catalog.is_none());
         assert!(app.other_catalog_task.is_none());
         assert!(app.other_catalog_error.is_none());
