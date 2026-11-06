@@ -485,8 +485,8 @@ impl BundleStore {
         Ok(key_before)
     }
 
-    fn ensure_source_unchanged(&self, source_key: &Option<CacheKey>, phase: &str) -> Result<()> {
-        if &self.cache_key()? != source_key {
+    fn ensure_source_unchanged(&self, source_key: Option<&CacheKey>, phase: &str) -> Result<()> {
+        if self.cache_key()?.as_ref() != source_key {
             bail!(
                 "game data changed while {phase} the bundle index. \
                  Wait for Steam or the standalone launcher to finish updating, then retry"
@@ -558,10 +558,10 @@ impl BundleStore {
     /// game index.
     pub fn open_index(&mut self) -> Result<BundleIndex> {
         let source_key = self.refresh_source_snapshot()?;
-        self.rebuild_index(&source_key)
+        self.rebuild_index(source_key.as_ref())
     }
 
-    fn rebuild_index(&self, source_key: &Option<CacheKey>) -> Result<BundleIndex> {
+    fn rebuild_index(&self, source_key: Option<&CacheKey>) -> Result<BundleIndex> {
         crate::timing!("index_rebuild");
         let bytes = self.read_index_bytes()?;
         let decompressed =
@@ -577,7 +577,7 @@ impl BundleStore {
     pub fn open_shared_index(&mut self) -> Result<Arc<BundleIndex>> {
         let mut shared = shared_index();
         let Some(key) = self.refresh_source_snapshot()? else {
-            return self.rebuild_index(&None).map(Arc::new);
+            return self.rebuild_index(None).map(Arc::new);
         };
         if let Some((held_key, held)) = shared.as_ref()
             && *held_key == key
@@ -585,14 +585,13 @@ impl BundleStore {
         {
             return Ok(index);
         }
-        let source_key = Some(key.clone());
         let index = match self.read_cache() {
             Some(cached) => {
-                self.ensure_source_unchanged(&source_key, "loading")?;
+                self.ensure_source_unchanged(Some(&key), "loading")?;
                 Arc::new(cached)
             }
             None => {
-                let index = Arc::new(self.rebuild_index(&source_key)?);
+                let index = Arc::new(self.rebuild_index(Some(&key))?);
                 if let Some(job) = self.cache_write(index.clone(), &key) {
                     job.spawn();
                 }
@@ -752,10 +751,7 @@ impl BundleStore {
             let span = self.ggpk_file_span(rel_path)?.ok_or_else(|| {
                 anyhow!("{} not found in {}", rel_path, self.content_path.display())
             })?;
-            let ggpk = self
-                .ggpk
-                .as_ref()
-                .ok_or_else(|| anyhow!("failed to open {}", self.content_path.display()))?;
+            let ggpk = self.ggpk()?;
             let end = span.begin + span.len;
             return ggpk
                 .mmap
@@ -784,12 +780,12 @@ impl BundleStore {
     }
 
     fn ggpk_file_span(&self, rel_path: &str) -> Result<Option<GgpkFileSpan>> {
-        ggpk_find_file(self.open_ggpk()?.as_ref(), rel_path)
+        ggpk_find_file(self.ggpk()?, rel_path)
     }
 
-    fn open_ggpk(&self) -> Result<Arc<GgpkArchive>> {
+    fn ggpk(&self) -> Result<&GgpkArchive> {
         self.ggpk
-            .clone()
+            .as_deref()
             .ok_or_else(|| anyhow!("failed to open {}", self.content_path.display()))
     }
 
@@ -799,8 +795,8 @@ impl BundleStore {
         custom_bundle_bytes: &[u8],
         index_bytes: &[u8],
     ) -> Result<GgpkPatchPlan> {
-        let ggpk = self.open_ggpk()?;
-        let bundles2 = ggpk_find_pdir(ggpk.as_ref(), "Bundles2")?.ok_or_else(|| {
+        let ggpk = self.ggpk()?;
+        let bundles2 = ggpk_find_pdir(ggpk, "Bundles2")?.ok_or_else(|| {
             anyhow!(
                 "Bundles2 directory not found in {}",
                 self.content_path.display()
