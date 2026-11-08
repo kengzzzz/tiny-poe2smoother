@@ -12,7 +12,7 @@ fn main() {
         println!("cargo:rustc-link-arg=-static-libstdc++");
         println!("cargo:rustc-link-arg=-static-libgcc");
         embed_windows_icon();
-    } else {
+    } else if target_env != "msvc" {
         println!("cargo:rustc-link-lib=dylib=stdc++");
     }
 }

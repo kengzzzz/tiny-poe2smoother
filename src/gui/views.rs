@@ -172,6 +172,10 @@ fn install_summary(status: &AppStatus) -> (String, egui::Color32) {
             ),
             palette::WARNING,
         ),
+        PatchState::RecoveryNeeded => (
+            format!("{layout} · game index is unreadable. Restore the backup or verify game files"),
+            palette::ERROR,
+        ),
         PatchState::PatchedMissingBackup => (
             format!(
                 "{layout} · patched but the backup is missing. Verify the game files in Steam or the launcher"
@@ -730,6 +734,7 @@ fn patch_state_pill(state: PatchState) -> (&'static str, egui::Color32) {
         PatchState::StaleBackup => ("Old backup", palette::WARNING),
         PatchState::PatchedMissingBackup => ("Backup missing", palette::ERROR),
         PatchState::OtherInstallBackup => ("Other install", palette::WARNING),
+        PatchState::RecoveryNeeded => ("Restore needed", palette::ERROR),
     }
 }
 

@@ -55,6 +55,28 @@ impl BackupStore {
         self.path.exists()
     }
 
+    /// Keep this handle alive for the entire Apply or Restore; never unlink the lock file.
+    pub(crate) fn lock(&self) -> Result<fs::File> {
+        let path = self.path.with_extension("lock");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("failed to open operation lock {}", path.display()))?;
+        file.try_lock().with_context(|| {
+            format!(
+                "could not lock {}. Another Apply or Restore may be running; close the other window and retry",
+                path.display()
+            )
+        })?;
+        Ok(file)
+    }
+
     pub fn remove(&self) -> Result<()> {
         match fs::remove_file(&self.path) {
             Ok(()) => Ok(()),
@@ -305,6 +327,42 @@ fn read_chunk(cursor: &mut Cursor<&[u8]>, len: u64) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operation_lock_is_shared_between_processes() {
+        const CHILD_PATH: &str = "TINY_SMOOTHER_TEST_LOCK_PATH";
+        const CHILD_LOCKED: &str = "TINY_SMOOTHER_TEST_EXPECT_LOCKED";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let store = BackupStore::for_path(PathBuf::from(path));
+            let expected_locked = std::env::var(CHILD_LOCKED).unwrap() == "true";
+            assert_eq!(store.lock().is_err(), expected_locked);
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let store = BackupStore::for_path(temp.path().join("poe2.bak"));
+        let child = |locked: bool| {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "backup::tests::operation_lock_is_shared_between_processes",
+                ])
+                .env(CHILD_PATH, store.path())
+                .env(CHILD_LOCKED, locked.to_string())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        let lock = store.lock().unwrap();
+        child(true);
+        drop(lock);
+        child(false);
+        assert!(store.path().with_extension("lock").exists());
+    }
 
     #[test]
     fn backup_round_trip() {

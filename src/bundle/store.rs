@@ -417,7 +417,7 @@ impl BundleStore {
         Self::new_with_cache_dir(game_dir.into(), default_cache_dir())
     }
 
-    fn new_with_cache_dir(game_dir: PathBuf, cache_dir: PathBuf) -> Self {
+    pub(crate) fn new_with_cache_dir(game_dir: PathBuf, cache_dir: PathBuf) -> Self {
         let bundles_dir = game_dir.join("Bundles2");
         let index_path = bundles_dir.join("_.index.bin");
         let content_path = game_dir.join("Content.ggpk");

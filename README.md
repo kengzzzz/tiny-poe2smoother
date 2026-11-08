@@ -67,8 +67,9 @@ Then run `poe2smoother`.
 
 ## Safety notes
 
-- Apply and Restore are blocked while Path of Exile 2 is running.
-- The backup lives in `tiny-poe2smoother/poe2.bak` under your local app data folder.
+- Apply and Restore are blocked while Path of Exile 2 is running. Only one app window can apply or restore at a time.
+- The backup lives in `tiny-poe2smoother/poe2.bak` under your local app data folder. It remains reserved for its recorded installation even if that drive is disconnected; reconnect it and Restore before patching another installation.
+- If the current bundle index is unreadable, Restore remains available when a usable backup exists. A missing loose-file index can also be restored; a missing `Content.ggpk` must be repaired with the standalone launcher.
 - If the game crashes or won't start, click **Restore**, then verify the game files in Steam or the standalone launcher.
 - If a game update changes the bundle layout, the app may refuse to patch until tiny-poe2smoother is updated.
 
