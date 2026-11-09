@@ -200,7 +200,8 @@ fn read_pdir_entries(
     if entries_start.saturating_add(u64::from(entries_len) * 12) > record_end {
         bail!("GGPK directory at {entries_start} lists more entries than it holds");
     }
-    let mut entries = Vec::with_capacity(entries_len as usize);
+    // A damaged size field can still pass the check above.
+    let mut entries = Vec::with_capacity((entries_len as usize).min(4096));
     let mut entry = Cursor::new(ggpk.mmap.as_ref());
     entry.set_position(entries_start);
     for _ in 0..entries_len {
