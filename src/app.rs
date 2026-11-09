@@ -771,6 +771,9 @@ mod tests {
                 format!("{err:#}").contains("Nothing was changed"),
                 "{err:#}"
             );
+            if layout == InstallLayout::LooseBundles {
+                assert!(format!("{err:#}").contains("failed to create"), "{err:#}");
+            }
             assert!(!backup.has_backup());
             assert_eq!(fs::read(&source).unwrap(), original);
         }

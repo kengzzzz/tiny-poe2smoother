@@ -83,7 +83,8 @@ pub fn apply_bundle_replacements(
     };
     let write_bundle = || -> Result<()> {
         if let Some(parent) = custom_path.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
         }
         atomic_write(&custom_path, &out).with_context(|| {
             format!(
