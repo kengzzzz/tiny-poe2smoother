@@ -906,7 +906,7 @@ impl BundleStore {
         })
     }
 
-    pub(super) fn apply_ggpk_patch(&self, plan: &GgpkPatchPlan) -> Result<()> {
+    pub(super) fn apply_ggpk_patch(&mut self, plan: &GgpkPatchPlan) -> Result<()> {
         let mut file = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -921,9 +921,15 @@ impl BundleStore {
         }
 
         file.seek(SeekFrom::Start(plan.backup.appended_start))?;
-        file.write_all(&plan.append_bytes)?;
-        file.flush()?;
-        file.sync_all()?;
+        if let Err(err) = file
+            .write_all(&plan.append_bytes)
+            .and_then(|()| file.sync_all())
+        {
+            // Drop our partial append now, so a later trim never has to guess what it owns.
+            self.ggpk = None;
+            let _ = file.set_len(plan.backup.appended_start);
+            return Err(err.into());
+        }
 
         file.seek(SeekFrom::Start(plan.backup.bundles2_offset_pos))?;
         file.write_u64::<LittleEndian>(plan.new_bundles2_offset)?;
@@ -1850,7 +1856,7 @@ pub(crate) mod tests {
         );
         let original_len = fs::metadata(&content).unwrap().len();
 
-        let store = BundleStore::new(&game);
+        let mut store = BundleStore::new(&game);
         let plan = store
             .prepare_ggpk_patch("TinyPoe2Smoother_0", b"new-bundle", b"new-index")
             .unwrap();
@@ -1891,7 +1897,7 @@ pub(crate) mod tests {
             ],
         );
         let original_len = fs::metadata(&content).unwrap().len();
-        let store = BundleStore::new(&game);
+        let mut store = BundleStore::new(&game);
         let plan = store
             .prepare_ggpk_patch("TinyPoe2Smoother_0", b"new-bundle", b"new-index")
             .unwrap();
@@ -1943,7 +1949,7 @@ pub(crate) mod tests {
             (b"first-bundle", b"first-index"),
             (b"later-bundle", b"later-index"),
         ] {
-            let store = BundleStore::new(&game);
+            let mut store = BundleStore::new(&game);
             let plan = store
                 .prepare_ggpk_patch("TinyPoe2Smoother_0", bundle, index)
                 .unwrap();
@@ -2036,7 +2042,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn patch_test_ggpk(game: &Path, bundle_name: &str, index: &[u8]) -> GgpkBackupMeta {
-        let store = BundleStore::new(game);
+        let mut store = BundleStore::new(game);
         let plan = store
             .prepare_ggpk_patch(bundle_name, b"new-bundle", index)
             .unwrap();

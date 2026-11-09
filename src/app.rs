@@ -244,7 +244,7 @@ fn apply_patches_with_store(request: PatchRequest, backup: BackupStore) -> Resul
             .to_string(),
     };
     let write_report = apply_bundle_replacements(
-        &store,
+        &mut store,
         &mut index,
         &patch_set.replacements,
         Some(&backup),

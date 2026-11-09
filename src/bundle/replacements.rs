@@ -16,7 +16,7 @@ pub struct BundleWriteReport {
 }
 
 pub fn apply_bundle_replacements(
-    store: &BundleStore,
+    store: &mut BundleStore,
     index: &mut BundleIndex,
     replacements: &HashMap<String, Vec<(BundleFile, Vec<u8>)>>,
     backup: Option<&BackupStore>,
