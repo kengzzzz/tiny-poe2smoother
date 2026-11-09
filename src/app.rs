@@ -772,6 +772,33 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn failed_steam_apply_removes_the_generated_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game");
+        write_shadow_fixture(&game, InstallLayout::LooseBundles);
+        let generated = game.join("Bundles2/TinyPoe2Smoother");
+        fs::create_dir_all(&generated).unwrap();
+        fs::set_permissions(&generated, fs::Permissions::from_mode(0o555)).unwrap();
+        let backup = BackupStore::for_path(temp.path().join("poe2.bak"));
+        let request = PatchRequest {
+            game_dir: Some(game.clone()),
+            patches: vec![PatchId::Shadow],
+            params: PatchParams::default(),
+        };
+
+        let err = apply_patches_with_store(request, backup.clone()).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("Nothing was changed"),
+            "{err:#}"
+        );
+        assert!(!backup.has_backup());
+        assert!(!generated.exists());
+    }
+
     fn patch_fixture(path: &str, data: &[u8]) -> (Vec<u8>, Vec<u8>) {
         let mut paths = 1u32.to_le_bytes().to_vec();
         paths.extend_from_slice(path.as_bytes());

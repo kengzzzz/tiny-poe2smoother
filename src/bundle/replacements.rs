@@ -72,6 +72,7 @@ pub fn apply_bundle_replacements(
 
     let custom_path = store.bundle_path(&custom_bundle_name);
     let drop_backup = || {
+        let _ = crate::backup::remove_generated_bundles(&store.game_dir);
         if let Some(backup) = backup {
             let _ = backup.remove();
         }
