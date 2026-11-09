@@ -961,8 +961,8 @@ impl BundleStore {
         check().unwrap_or(false)
     }
 
-    /// Fails when Content.ggpk changed after Apply.
-    pub fn ggpk_restore_target(&self, meta: GgpkBackupMeta) -> Result<BundleIndex> {
+    /// Returns the original index, decompressed. Fails when Content.ggpk changed after Apply.
+    pub fn ggpk_restore_target(&self, meta: GgpkBackupMeta) -> Result<Vec<u8>> {
         let ggpk = self.ggpk()?;
         let live = ggpk_find_pdir(ggpk, "Bundles2")?.context("Bundles2 directory not found")?;
         if live.parent_offset_pos != Some(meta.bundles2_offset_pos)
@@ -985,8 +985,8 @@ impl BundleStore {
         if ggpk_records_freed(ggpk, &[original.offset, index_offset]) {
             bail!("the original Bundles2 directory was freed");
         }
-        let bytes = &ggpk.mmap[span.begin..span.begin + span.len];
-        BundleIndex::parse(decompress_bundle(bytes)?).context("the original index is damaged")
+        decompress_bundle(&ggpk.mmap[span.begin..span.begin + span.len])
+            .context("the original index is damaged")
     }
 
     /// Trims appended records once nothing in Content.ggpk uses them.

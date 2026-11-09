@@ -287,13 +287,13 @@ fn restore_backup_with_store(game_dir: PathBuf, backup: BackupStore) -> Result<R
             );
         }
         let mut store = BundleStore::new(&game_dir);
-        let index = store.open_index().with_context(|| {
+        let patched = index_is_patched(&store.open_index().with_context(|| {
             format!(
                 "failed to read current index before restore: {}",
                 store.index_display_path()
             )
-        })?;
-        if !index_is_patched(&index) {
+        })?);
+        if !patched {
             trim_stale_ggpk_tail(&mut store, &entries)?;
             crate::backup::remove_generated_bundles(&game_dir)?;
             backup.remove().with_context(|| {
@@ -321,12 +321,19 @@ fn restore_backup_with_store(game_dir: PathBuf, backup: BackupStore) -> Result<R
                     backup.path().display()
                 )
             })?;
-            let original = store.ggpk_restore_target(meta).map_err(|err| {
-                anyhow!(
-                    "Content.ggpk changed after Apply, so Restore can't undo the patch safely.\n  Cause: {err:#}\n  {GGPK_REPAIR}"
-                )
-            })?;
-            if index_is_patched(&original) {
+            let original_is_patched = store
+                .ggpk_restore_target(meta)
+                .and_then(|raw| {
+                    let names = BundleIndex::bundle_names(&raw)
+                        .context("the original index is damaged")?;
+                    Ok(names.into_iter().any(is_patched_bundle))
+                })
+                .map_err(|err| {
+                    anyhow!(
+                        "Content.ggpk changed after Apply, so Restore can't undo the patch safely.\n  Cause: {err:#}\n  {GGPK_REPAIR}"
+                    )
+                })?;
+            if original_is_patched {
                 bail!("the backup points at an index that is already patched.\n  {GGPK_REPAIR}");
             }
             let index_display_path = store.index_display_path();
@@ -427,10 +434,18 @@ fn classify_patch_state(has_backup: bool, index_is_patched: bool) -> PatchState 
     }
 }
 
+const PATCHED_BUNDLE_PREFIXES: [&str; 3] = ["TinyPoe2Smoother/", "TinyPoe2Smoother_", "LibGGPK3/"];
+
 fn index_is_patched(index: &BundleIndex) -> bool {
-    index.has_bundle_prefix("TinyPoe2Smoother/")
-        || index.has_bundle_prefix("TinyPoe2Smoother_")
-        || index.has_bundle_prefix("LibGGPK3/")
+    PATCHED_BUNDLE_PREFIXES
+        .iter()
+        .any(|prefix| index.has_bundle_prefix(prefix))
+}
+
+fn is_patched_bundle(name: &str) -> bool {
+    PATCHED_BUNDLE_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
 }
 
 fn ensure_can_apply(
@@ -861,14 +876,17 @@ mod tests {
         );
     }
 
-    fn patched_test_ggpk(root: &Path) -> (PathBuf, BackupStore, crate::backup::GgpkBackupMeta) {
+    fn patched_test_ggpk(
+        root: &Path,
+        original_bundles: &[&str],
+    ) -> (PathBuf, BackupStore, crate::backup::GgpkBackupMeta) {
         use crate::bundle::store_tests::{patch_test_ggpk, write_test_ggpk_files};
         let game = root.join("game");
         fs::create_dir_all(&game).unwrap();
         write_test_ggpk_files(
             &game.join("Content.ggpk"),
             "Bundles2",
-            &[("_.index.bin", test_index_bytes(&[]).as_slice())],
+            &[("_.index.bin", test_index_bytes(original_bundles).as_slice())],
         );
         let meta = patch_test_ggpk(
             &game,
@@ -892,7 +910,7 @@ mod tests {
     fn ggpk_restore_refuses_when_bundles2_no_longer_points_at_the_patch() {
         use std::io::{Read, Seek, SeekFrom, Write};
         let temp = tempfile::tempdir().unwrap();
-        let (game, backup, meta) = patched_test_ggpk(temp.path());
+        let (game, backup, meta) = patched_test_ggpk(temp.path(), &[]);
         let mut file = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -920,7 +938,7 @@ mod tests {
     fn ggpk_restore_refuses_when_the_original_bundles2_is_gone() {
         use std::io::{Seek, SeekFrom, Write};
         let temp = tempfile::tempdir().unwrap();
-        let (game, backup, meta) = patched_test_ggpk(temp.path());
+        let (game, backup, meta) = patched_test_ggpk(temp.path(), &[]);
         let mut file = fs::OpenOptions::new()
             .write(true)
             .open(game.join("Content.ggpk"))
@@ -934,9 +952,17 @@ mod tests {
     }
 
     #[test]
+    fn ggpk_restore_refuses_when_the_original_index_is_patched() {
+        let temp = tempfile::tempdir().unwrap();
+        let (game, backup, _) = patched_test_ggpk(temp.path(), &["LibGGPK3/0"]);
+
+        assert_restore_refused(&game, &backup);
+    }
+
+    #[test]
     fn ggpk_restore_needs_the_ggpk_backup_data() {
         let temp = tempfile::tempdir().unwrap();
-        let (game, backup, _) = patched_test_ggpk(temp.path());
+        let (game, backup, _) = patched_test_ggpk(temp.path(), &[]);
         backup.remove().unwrap();
         backup
             .ensure_original_bytes(
