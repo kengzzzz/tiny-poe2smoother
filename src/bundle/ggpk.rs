@@ -365,16 +365,21 @@ pub(super) fn ggpk_tail_in_use(ggpk: &GgpkArchive, tail_start: u64) -> bool {
     if root.entries.iter().any(|entry| crosses(entry.offset)) {
         return true;
     }
-    let Some(bundles2) = root
+    let mut bundles2 = root
         .entries
         .iter()
-        .find(|entry| entry.name == "Bundles2")
-        .and_then(|entry| ggpk_pdir_at(ggpk, entry.offset).ok().flatten())
-    else {
+        .filter(|entry| entry.name == "Bundles2")
+        .peekable();
+    if bundles2.peek().is_none() {
         return true;
-    };
-    if bundles2.entries.iter().any(|entry| crosses(entry.offset)) {
-        return true;
+    }
+    for entry in bundles2 {
+        let Some(pdir) = ggpk_pdir_at(ggpk, entry.offset).ok().flatten() else {
+            return true;
+        };
+        if pdir.entries.iter().any(|entry| crosses(entry.offset)) {
+            return true;
+        }
     }
 
     let expected: [fn(&[u8; 4], &str) -> bool; 3] = [
@@ -838,6 +843,33 @@ mod tests {
                 .is_some()
         );
         assert!(ggpk_find_pdir(&archive, "Bundles2").unwrap().is_some());
+    }
+
+    #[test]
+    fn every_bundles2_in_the_root_is_checked() {
+        let entry = |offset| GgpkPdirEntry {
+            name: String::new(),
+            name_hash: 0,
+            offset,
+        };
+        let root_size = ggpk_pdir_record("", &[0; 32], &[entry(0), entry(0)], false)
+            .unwrap()
+            .len() as u64;
+        let empty = ggpk_pdir_record("Bundles2", &[0; 32], &[], false).unwrap();
+        let first = 28 + root_size;
+        let second = first + empty.len() as u64;
+        let index_at = second
+            + ggpk_pdir_record("Bundles2", &[0; 32], &[entry(0)], false)
+                .unwrap()
+                .len() as u64;
+        let mut bytes = root(&[28, 0]);
+        bytes
+            .extend(ggpk_pdir_record("", &[0; 32], &[entry(first), entry(second)], false).unwrap());
+        bytes.extend(empty);
+        bytes.extend(ggpk_pdir_record("Bundles2", &[0; 32], &[entry(index_at)], false).unwrap());
+        bytes.extend(file("_.index.bin", 0, b"index"));
+
+        assert!(tail_in_use(&bytes, index_at));
     }
 
     #[test]
