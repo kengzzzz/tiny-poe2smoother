@@ -880,7 +880,15 @@ mod tests {
         );
         assert!(!backup.has_backup());
         drop(lock);
-        assert!(backup.lock().is_ok());
+        // A process another test spawns holds a copy of the lock until it starts.
+        let relocked = (0..100).any(|_| {
+            let locked = backup.lock().is_ok();
+            if !locked {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            locked
+        });
+        assert!(relocked);
     }
 
     #[test]
