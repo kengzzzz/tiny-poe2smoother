@@ -157,7 +157,8 @@ fn read_pdir_entries(
     entries_start: u64,
     entries_len: u32,
 ) -> Result<Vec<GgpkPdirEntry>> {
-    let mut entries = Vec::with_capacity(entries_len as usize);
+    let room = ggpk.mmap.len().saturating_sub(entries_start as usize) / 12;
+    let mut entries = Vec::with_capacity((entries_len as usize).min(room));
     let mut entry = Cursor::new(ggpk.mmap.as_ref());
     entry.set_position(entries_start);
     for _ in 0..entries_len {
@@ -320,11 +321,11 @@ pub(super) fn ggpk_tail_in_use(ggpk: &GgpkArchive, tail_start: u64) -> bool {
     {
         return true;
     }
-    let Some(root) = children
-        .iter()
-        .find(|&&(_, _, tag)| &tag == b"PDIR")
-        .and_then(|&(offset, _, _)| ggpk_pdir_at(ggpk, offset).ok().flatten())
-    else {
+    let mut pdirs = children.iter().filter(|&&(_, _, tag)| &tag == b"PDIR");
+    let (Some(&(root, _, _)), None) = (pdirs.next(), pdirs.next()) else {
+        return true;
+    };
+    let Some(root) = ggpk_pdir_at(ggpk, root).ok().flatten() else {
         return true;
     };
     if root.entries.iter().any(|entry| crosses(entry.offset)) {
@@ -470,7 +471,11 @@ fn ggpk_find_record(
 }
 
 fn ggpk_record_name(ggpk: &GgpkArchive, offset: u64) -> Result<String> {
-    if offset as usize + 16 > ggpk.mmap.len() {
+    if usize::try_from(offset)
+        .ok()
+        .and_then(|offset| offset.checked_add(16))
+        .is_none_or(|end| end > ggpk.mmap.len())
+    {
         bail!("GGPK record offset {offset} is outside Content.ggpk");
     }
     let mut cursor = Cursor::new(ggpk.mmap.as_ref());
@@ -744,6 +749,24 @@ mod tests {
             let (bytes, _) = build(std::slice::from_ref(&index), referenced, None);
             assert_eq!(tail_in_use(&bytes, bytes.len() as u64 - 16), in_use);
         }
+    }
+
+    #[test]
+    fn a_second_header_directory_counts_as_in_use() {
+        let extra = |offset| {
+            let entry = GgpkPdirEntry {
+                name: String::new(),
+                name_hash: 0,
+                offset,
+            };
+            ggpk_pdir_record("Extra", &[0; 32], &[entry], false).unwrap()
+        };
+        let index = file("_.index.bin", 0, b"index");
+        let (_, offsets) = build(&[extra(0), index.clone()], &[], None);
+        let (mut bytes, _) = build(&[extra(offsets[1]), index], &[], None);
+        assert!(!tail_in_use(&bytes, offsets[1]));
+        bytes[20..28].copy_from_slice(&offsets[0].to_le_bytes());
+        assert!(tail_in_use(&bytes, offsets[1]));
     }
 
     #[test]
