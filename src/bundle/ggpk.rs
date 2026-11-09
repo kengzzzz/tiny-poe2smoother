@@ -273,8 +273,14 @@ pub(super) fn ggpk_file_at(ggpk: &GgpkArchive, offset: u64) -> Result<Option<Ggp
 }
 
 pub(super) fn is_generated_bundle(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    name.starts_with("tinypoe2smoother_") && name.ends_with(".bundle.bin")
+    let (prefix, suffix) = ("tinypoe2smoother_", ".bundle.bin");
+    name.len() >= prefix.len() + suffix.len()
+        && name
+            .get(..prefix.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+        && name
+            .get(name.len() - suffix.len()..)
+            .is_some_and(|end| end.eq_ignore_ascii_case(suffix))
 }
 
 fn record_header(data: &[u8], offset: u64) -> Option<(u64, [u8; 4])> {
@@ -870,6 +876,15 @@ mod tests {
         bytes.extend(file("_.index.bin", 0, b"index"));
 
         assert!(tail_in_use(&bytes, index_at));
+    }
+
+    #[test]
+    fn generated_bundle_names_ignore_case() {
+        assert!(is_generated_bundle("TinyPoe2Smoother_0.bundle.bin"));
+        assert!(is_generated_bundle("TINYPOE2SMOOTHER_3.BUNDLE.BIN"));
+        assert!(!is_generated_bundle("TinyPoe2Smoother_0.bundle"));
+        assert!(!is_generated_bundle("LibGGPK3_0.bundle.bin"));
+        assert!(!is_generated_bundle("\u{e9}".repeat(20).as_str()));
     }
 
     #[test]
