@@ -429,12 +429,26 @@ fn ggpk_find_record(
                 return Ok(None);
             }
 
-            let entries_start = cursor.position();
-            for i in 0..entries_len {
-                let mut entry = Cursor::new(ggpk.mmap.as_ref());
-                entry.set_position(entries_start + u64::from(i) * 12);
-                entry.seek(SeekFrom::Current(4))?;
-                let child_offset = entry.read_u64::<LittleEndian>()?;
+            let entries = (0..entries_len)
+                .map(|_| {
+                    Ok((
+                        cursor.read_u32::<LittleEndian>()?,
+                        cursor.read_u64::<LittleEndian>()?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let rest = wanted.get(path.len()..).unwrap_or_default();
+            let next = rest
+                .trim_start_matches('/')
+                .split('/')
+                .next()
+                .unwrap_or_default();
+            let next_hash = ggpk_name_hash(next);
+            // Try entries with the right name hash first. A cold disk then reads a few
+            // records instead of every sibling.
+            let hits = entries.iter().filter(|&&(hash, _)| hash == next_hash);
+            let misses = entries.iter().filter(|&&(hash, _)| hash != next_hash);
+            for &(_, child_offset) in hits.chain(misses) {
                 if let Some(span) = ggpk_find_record(ggpk, child_offset, &path, wanted, ancestors)?
                 {
                     return Ok(Some(span));
