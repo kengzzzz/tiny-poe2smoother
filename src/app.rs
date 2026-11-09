@@ -16,6 +16,8 @@ use rayon::prelude::*;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+const GGPK_REPAIR: &str = "Run PackCheck.exe in the game folder, then start the game to repair it";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PatchState {
     Clean,
@@ -295,7 +297,21 @@ fn restore_backup_with_store(game_dir: PathBuf, backup: BackupStore) -> Result<R
             InstallLayout::ContentGgpk
         );
         let mut restored_ggpk_index = 0;
-        if overlay_restore && let Some(meta) = ggpk_backup_meta(&entries)? {
+        if overlay_restore {
+            let meta = ggpk_backup_meta(&entries)?.ok_or_else(|| {
+                anyhow!(
+                    "the backup at {} has no Content.ggpk data, so it can't restore this install.\n  {GGPK_REPAIR}",
+                    backup.path().display()
+                )
+            })?;
+            let original = store.ggpk_restore_target(meta).map_err(|err| {
+                anyhow!(
+                    "Content.ggpk changed after Apply, so Restore can't undo the patch safely.\n  Cause: {err:#}\n  {GGPK_REPAIR}"
+                )
+            })?;
+            if index_is_patched(&original) {
+                bail!("the backup points at an index that is already patched.\n  {GGPK_REPAIR}");
+            }
             let index_display_path = store.index_display_path();
             store.restore_ggpk_backup(meta).map_err(|err| {
                 anyhow!("failed to restore {index_display_path}.\n  Cause: {err:#}")
@@ -774,6 +790,93 @@ mod tests {
             BundleStore::new(&game).read_index_bytes().unwrap(),
             original
         );
+    }
+
+    fn patched_test_ggpk(root: &Path) -> (PathBuf, BackupStore, crate::backup::GgpkBackupMeta) {
+        use crate::bundle::store_tests::{patch_test_ggpk, write_test_ggpk_files};
+        let game = root.join("game");
+        fs::create_dir_all(&game).unwrap();
+        write_test_ggpk_files(
+            &game.join("Content.ggpk"),
+            "Bundles2",
+            &[("_.index.bin", test_index_bytes(&[]).as_slice())],
+        );
+        let meta = patch_test_ggpk(
+            &game,
+            "TinyPoe2Smoother_0",
+            &test_index_bytes(&["TinyPoe2Smoother_0"]),
+        );
+        let backup = BackupStore::for_path(root.join("poe2.bak"));
+        backup.ensure_ggpk_backup_meta(&game, meta).unwrap();
+        (game, backup, meta)
+    }
+
+    fn assert_restore_refused(game: &Path, backup: &BackupStore) {
+        let before = fs::read(game.join("Content.ggpk")).unwrap();
+        let err = restore_backup_with_store(game.to_path_buf(), backup.clone()).unwrap_err();
+        assert!(format!("{err:#}").contains("PackCheck"), "{err:#}");
+        assert!(backup.has_backup());
+        assert_eq!(fs::read(game.join("Content.ggpk")).unwrap(), before);
+    }
+
+    #[test]
+    fn ggpk_restore_refuses_when_bundles2_no_longer_points_at_the_patch() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let temp = tempfile::tempdir().unwrap();
+        let (game, backup, meta) = patched_test_ggpk(temp.path());
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(game.join("Content.ggpk"))
+            .unwrap();
+        let mut pointer = [0u8; 8];
+        file.seek(SeekFrom::Start(meta.bundles2_offset_pos))
+            .unwrap();
+        file.read_exact(&mut pointer).unwrap();
+        let mut pdir = vec![0u8; (meta.appended_end - u64::from_le_bytes(pointer)) as usize];
+        file.seek(SeekFrom::Start(u64::from_le_bytes(pointer)))
+            .unwrap();
+        file.read_exact(&mut pdir).unwrap();
+        let moved = file.seek(SeekFrom::End(0)).unwrap();
+        file.write_all(&pdir).unwrap();
+        file.seek(SeekFrom::Start(meta.bundles2_offset_pos))
+            .unwrap();
+        file.write_all(&moved.to_le_bytes()).unwrap();
+        drop(file);
+
+        assert_restore_refused(&game, &backup);
+    }
+
+    #[test]
+    fn ggpk_restore_refuses_when_the_original_bundles2_is_gone() {
+        use std::io::{Seek, SeekFrom, Write};
+        let temp = tempfile::tempdir().unwrap();
+        let (game, backup, meta) = patched_test_ggpk(temp.path());
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(game.join("Content.ggpk"))
+            .unwrap();
+        file.seek(SeekFrom::Start(meta.original_bundles2_offset + 4))
+            .unwrap();
+        file.write_all(b"FREE").unwrap();
+        drop(file);
+
+        assert_restore_refused(&game, &backup);
+    }
+
+    #[test]
+    fn ggpk_restore_needs_the_ggpk_backup_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let (game, backup, _) = patched_test_ggpk(temp.path());
+        backup.remove().unwrap();
+        backup
+            .ensure_original_bytes(
+                &game,
+                &[(PathBuf::from("Bundles2/_.index.bin"), test_index_bytes(&[]))],
+            )
+            .unwrap();
+
+        assert_restore_refused(&game, &backup);
     }
 
     #[test]

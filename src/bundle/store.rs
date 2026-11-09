@@ -3,8 +3,9 @@ use super::compression::{
     visit_bundle_slices, visit_bundle_slices_from,
 };
 use super::ggpk::{
-    GgpkArchive, GgpkFileSpan, GgpkPatchPlan, GgpkPdirEntry, ggpk_file_record, ggpk_find_file,
-    ggpk_find_pdir, ggpk_name_hash, ggpk_pdir_record,
+    GgpkArchive, GgpkFileSpan, GgpkPatchPlan, GgpkPdirEntry, ggpk_file_at, ggpk_file_record,
+    ggpk_find_file, ggpk_find_pdir, ggpk_name_hash, ggpk_pdir_at, ggpk_pdir_record,
+    ggpk_tail_in_use,
 };
 use super::hashing::hash_fnv1a;
 use super::index::{BundleFile, BundleIndex, PathList};
@@ -906,24 +907,49 @@ impl BundleStore {
         Ok(())
     }
 
-    /// Trims appended records once the Bundles2 pointer is original again.
+    /// Fails when Content.ggpk changed after Apply.
+    pub fn ggpk_restore_target(&self, meta: GgpkBackupMeta) -> Result<BundleIndex> {
+        let ggpk = self.ggpk()?;
+        let live = ggpk_find_pdir(ggpk, "Bundles2")?.context("Bundles2 directory not found")?;
+        if live.parent_offset_pos != Some(meta.bundles2_offset_pos)
+            || !(meta.appended_start..meta.appended_end).contains(&live.offset)
+            || (ggpk.mmap.len() as u64) < meta.appended_end
+        {
+            bail!("Bundles2 no longer points at the patch");
+        }
+        let original = ggpk_pdir_at(ggpk, meta.original_bundles2_offset)?
+            .filter(|pdir| pdir.name == live.name && pdir.digest == live.digest)
+            .context("the original Bundles2 directory is gone")?;
+        let span = original
+            .entries
+            .iter()
+            .find(|entry| entry.name.eq_ignore_ascii_case("_.index.bin"))
+            .and_then(|entry| ggpk_file_at(ggpk, entry.offset).transpose())
+            .transpose()?
+            .context("the original index is gone")?;
+        let bytes = &ggpk.mmap[span.begin..span.begin + span.len];
+        BundleIndex::parse(decompress_bundle(bytes)?).context("the original index is damaged")
+    }
+
+    /// Trims appended records once nothing in Content.ggpk uses them.
     pub fn trim_restored_ggpk_tail(&mut self, meta: GgpkBackupMeta) -> Result<bool> {
-        let mut file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&self.content_path)
-            .with_context(|| format!("failed to open {}", self.content_path.display()))?;
         // An interrupted Apply can leave a partial append.
-        let len = file.metadata()?.len();
+        let len = fs::metadata(&self.content_path)?.len();
         if len <= meta.appended_start || len > meta.appended_end {
             return Ok(false);
         }
-        file.seek(SeekFrom::Start(meta.bundles2_offset_pos))?;
-        if file.read_u64::<LittleEndian>()? != meta.original_bundles2_offset {
+        if ggpk_tail_in_use(
+            &GgpkArchive::from_file(&self.content_path)?,
+            meta.appended_start,
+        )? {
             return Ok(false);
         }
         // Fails on Windows while any process maps the file.
         self.ggpk = None;
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&self.content_path)
+            .with_context(|| format!("failed to open {}", self.content_path.display()))?;
         file.set_len(meta.appended_start).with_context(|| {
             format!(
                 "failed to shrink {}.\n  Close programs that use it and retry",
@@ -1803,6 +1829,50 @@ pub(crate) mod tests {
         assert_eq!(
             BundleStore::new(&game).read_index_bytes().unwrap(),
             b"old-index"
+        );
+    }
+
+    #[test]
+    fn trim_keeps_a_tail_that_another_tool_wrote_into() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game");
+        fs::create_dir_all(&game).unwrap();
+        let content = game.join("Content.ggpk");
+        write_test_ggpk_files(
+            &content,
+            "Bundles2",
+            &[("_.index.bin", b"old-index".as_slice())],
+        );
+        let store = BundleStore::new(&game);
+        let meta = store
+            .prepare_ggpk_patch("TinyPoe2Smoother_0", b"new-bundle", b"new-index")
+            .unwrap()
+            .backup;
+        let bundles2 = ggpk_find_pdir(store.ggpk().unwrap(), "Bundles2")
+            .unwrap()
+            .unwrap();
+        drop(store);
+
+        let mut file = fs::OpenOptions::new().write(true).open(&content).unwrap();
+        let tool_index = file.seek(SeekFrom::End(0)).unwrap();
+        file.write_all(&file_record("_.index.bin", b"tool-index"))
+            .unwrap();
+        let entry_offset = bundles2.offset + 48 + utf16_nul_bytes("Bundles2").len() as u64 + 4;
+        file.seek(SeekFrom::Start(entry_offset)).unwrap();
+        file.write_u64::<LittleEndian>(tool_index).unwrap();
+        drop(file);
+        let len = fs::metadata(&content).unwrap().len();
+        assert!(len > meta.appended_start && len <= meta.appended_end);
+
+        assert!(
+            !BundleStore::new(&game)
+                .trim_restored_ggpk_tail(meta)
+                .unwrap()
+        );
+        assert_eq!(fs::metadata(&content).unwrap().len(), len);
+        assert_eq!(
+            BundleStore::new(&game).read_index_bytes().unwrap(),
+            b"tool-index"
         );
     }
 

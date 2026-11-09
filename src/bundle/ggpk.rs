@@ -2,6 +2,7 @@ use super::hashing::murmur2_32;
 use crate::backup::GgpkBackupMeta;
 use anyhow::{Context, Result, anyhow, bail};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use std::collections::HashSet;
 use std::fs;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
@@ -112,26 +113,11 @@ fn ggpk_find_pdir_record(
             let name = read_ggpk_string(&mut cursor, ggpk.use_utf32())?;
             let path = join_ggpk_path(base, &name);
             if path == wanted {
-                let entries_start = cursor.position();
-                let mut entries = Vec::with_capacity(entries_len as usize);
-                for i in 0..entries_len {
-                    let entry_pos = entries_start + u64::from(i) * 12;
-                    let mut entry = Cursor::new(ggpk.mmap.as_ref());
-                    entry.set_position(entry_pos);
-                    let name_hash = entry.read_u32::<LittleEndian>()?;
-                    let child_offset = entry.read_u64::<LittleEndian>()?;
-                    let child_name = ggpk_record_name(ggpk, child_offset)?;
-                    entries.push(GgpkPdirEntry {
-                        name: child_name,
-                        name_hash,
-                        offset: child_offset,
-                    });
-                }
                 return Ok(Some(GgpkPdirRecord {
                     name,
                     offset,
                     digest,
-                    entries,
+                    entries: read_pdir_entries(ggpk, cursor.position(), entries_len)?,
                     parent_offset_pos,
                 }));
             }
@@ -163,6 +149,150 @@ fn ggpk_find_pdir_record(
     })();
     ancestors.pop();
     result
+}
+
+fn read_pdir_entries(
+    ggpk: &GgpkArchive,
+    entries_start: u64,
+    entries_len: u32,
+) -> Result<Vec<GgpkPdirEntry>> {
+    let mut entries = Vec::with_capacity(entries_len as usize);
+    let mut entry = Cursor::new(ggpk.mmap.as_ref());
+    entry.set_position(entries_start);
+    for _ in 0..entries_len {
+        let name_hash = entry.read_u32::<LittleEndian>()?;
+        let offset = entry.read_u64::<LittleEndian>()?;
+        entries.push(GgpkPdirEntry {
+            name: ggpk_record_name(ggpk, offset)?,
+            name_hash,
+            offset,
+        });
+    }
+    Ok(entries)
+}
+
+fn read_file_record(ggpk: &GgpkArchive, offset: u64) -> Result<(String, GgpkFileSpan)> {
+    let mut cursor = Cursor::new(ggpk.mmap.as_ref());
+    cursor.set_position(offset);
+    let record_size = u64::from(cursor.read_u32::<LittleEndian>()?);
+    if read_ggpk_record_tag(&mut cursor)? != "FILE" {
+        bail!("GGPK record at {offset} is not a file");
+    }
+    let _name_length = cursor.read_u32::<LittleEndian>()?;
+    cursor.seek(SeekFrom::Current(32))?;
+    let name = read_ggpk_string(&mut cursor, ggpk.use_utf32())?;
+    let data_start = cursor.position() as usize;
+    let record_end = usize::try_from(offset + record_size)?;
+    if record_end < data_start || record_end > ggpk.mmap.len() {
+        bail!("GGPK file record {name} has invalid bounds");
+    }
+    Ok((
+        name,
+        GgpkFileSpan {
+            begin: data_start,
+            len: record_end - data_start,
+        },
+    ))
+}
+
+pub(super) fn ggpk_pdir_at(ggpk: &GgpkArchive, offset: u64) -> Result<Option<GgpkPdirRecord>> {
+    if offset
+        .checked_add(16)
+        .is_none_or(|end| end > ggpk.mmap.len() as u64)
+    {
+        return Ok(None);
+    }
+    let mut cursor = Cursor::new(ggpk.mmap.as_ref());
+    cursor.set_position(offset);
+    let _record_size = cursor.read_u32::<LittleEndian>()?;
+    if read_ggpk_record_tag(&mut cursor)? != "PDIR" {
+        return Ok(None);
+    }
+    let _name_length = cursor.read_u32::<LittleEndian>()?;
+    let entries_len = cursor.read_u32::<LittleEndian>()?;
+    let mut digest = [0u8; 32];
+    cursor.read_exact(&mut digest)?;
+    let name = read_ggpk_string(&mut cursor, ggpk.use_utf32())?;
+    Ok(Some(GgpkPdirRecord {
+        name,
+        offset,
+        digest,
+        entries: read_pdir_entries(ggpk, cursor.position(), entries_len)?,
+        parent_offset_pos: None,
+    }))
+}
+
+pub(super) fn ggpk_file_at(ggpk: &GgpkArchive, offset: u64) -> Result<Option<GgpkFileSpan>> {
+    if offset
+        .checked_add(8)
+        .is_none_or(|end| end > ggpk.mmap.len() as u64)
+        || ggpk.mmap[offset as usize + 4..offset as usize + 8] != *b"FILE"
+    {
+        return Ok(None);
+    }
+    read_file_record(ggpk, offset).map(|(_, span)| Some(span))
+}
+
+/// True when a live or free record reaches `tail_start`, so cutting the file there loses data.
+pub(super) fn ggpk_tail_in_use(ggpk: &GgpkArchive, tail_start: u64) -> Result<bool> {
+    let data = ggpk.mmap.as_ref();
+    let char_size = if ggpk.use_utf32() { 4 } else { 2 };
+    let mut seen = HashSet::new();
+    let mut pending = vec![0u64];
+    while let Some(offset) = pending.pop() {
+        if !seen.insert(offset) {
+            continue;
+        }
+        let start = usize::try_from(offset)?;
+        let Some(header) = data.get(start..start.saturating_add(8)) else {
+            return Ok(true);
+        };
+        let size = u32::from_le_bytes(header[..4].try_into()?) as usize;
+        if offset.saturating_add(size.max(8) as u64) > tail_start {
+            return Ok(true);
+        }
+        let Some(record) = data.get(start..start + size) else {
+            return Ok(true);
+        };
+        let u32_at = |pos: usize| -> Result<u32> {
+            Ok(u32::from_le_bytes(
+                record
+                    .get(pos..pos + 4)
+                    .context("short GGPK record")?
+                    .try_into()?,
+            ))
+        };
+        let u64_at = |pos: usize| -> Result<u64> {
+            Ok(u64::from_le_bytes(
+                record
+                    .get(pos..pos + 8)
+                    .context("short GGPK record")?
+                    .try_into()?,
+            ))
+        };
+        match &header[4..8] {
+            b"GGPK" => {
+                for i in 0..size.saturating_sub(12) / 8 {
+                    pending.push(u64_at(12 + i * 8)?);
+                }
+            }
+            b"PDIR" => {
+                let name_len = u32_at(8)? as usize;
+                let entries = u32_at(12)? as usize;
+                let first = 16 + 32 + name_len * char_size;
+                for i in 0..entries {
+                    pending.push(u64_at(first + i * 12 + 4)?);
+                }
+            }
+            b"FREE" => match u64_at(8)? {
+                0 => {}
+                next => pending.push(next),
+            },
+            b"FILE" => {}
+            _ => return Ok(true),
+        }
+    }
+    Ok(false)
 }
 
 fn check_traversal_offset(ggpk: &GgpkArchive, offset: u64, ancestors: &[u64]) -> Result<()> {
@@ -232,22 +362,8 @@ fn ggpk_find_record(
             Ok(None)
         }
         "FILE" => {
-            let _name_length = cursor.read_u32::<LittleEndian>()?;
-            cursor.seek(SeekFrom::Current(32))?;
-            let filename = read_ggpk_string(&mut cursor, ggpk.use_utf32())?;
-            let path = join_ggpk_path(base, &filename);
-            if path != wanted {
-                return Ok(None);
-            }
-            let data_start = cursor.position() as usize;
-            let record_end = usize::try_from(offset + record_size)?;
-            if record_end < data_start || record_end > ggpk.mmap.len() {
-                bail!("GGPK file record for {wanted} has invalid bounds");
-            }
-            Ok(Some(GgpkFileSpan {
-                begin: data_start,
-                len: record_end - data_start,
-            }))
+            let (filename, span) = read_file_record(ggpk, offset)?;
+            Ok((join_ggpk_path(base, &filename) == wanted).then_some(span))
         }
         "FREE" => Ok(None),
         other => bail!("unsupported GGPK record type {other}"),
@@ -445,6 +561,24 @@ mod tests {
     #[test]
     fn overflowing_record_offset_returns_an_error_in_both_walkers() {
         assert_bad_traversal(&root(&[u64::MAX]), "outside");
+    }
+
+    #[test]
+    fn a_free_record_in_the_tail_counts_as_in_use() {
+        let pdir = ggpk_pdir_record("", &[0; 32], &[], false).unwrap();
+        let free = 28 + pdir.len() as u64;
+        let mut bytes = root(&[28, free]);
+        bytes.extend_from_slice(&pdir);
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(b"FREE");
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Content.ggpk");
+        fs::write(&path, &bytes).unwrap();
+        let archive = GgpkArchive::from_file(&path).unwrap();
+
+        assert!(ggpk_tail_in_use(&archive, free).unwrap());
+        assert!(!ggpk_tail_in_use(&archive, bytes.len() as u64).unwrap());
     }
 
     #[test]
