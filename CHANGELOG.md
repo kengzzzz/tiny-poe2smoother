@@ -4,6 +4,7 @@
 
 ### Changes
 - The effects editor stays smooth when many effects are unchecked.
+- Only one app window can Apply or Restore at a time.
 
 ### Fixes
 - Standalone client: Restore no longer breaks the game when the game files changed after Apply, for example after PackCheck or another mod tool. It asks you to run PackCheck and start the game instead.

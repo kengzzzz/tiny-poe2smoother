@@ -55,7 +55,7 @@ impl BackupStore {
         self.path.exists()
     }
 
-    /// Keep this handle alive for the entire Apply or Restore; never unlink the lock file.
+    /// Hold the handle for the whole operation. Deleting the file would let another window lock a new one.
     pub(crate) fn lock(&self) -> Result<fs::File> {
         let path = self.path.with_extension("lock");
         if let Some(parent) = path.parent() {
@@ -68,11 +68,13 @@ impl BackupStore {
             .truncate(false)
             .open(&path)
             .with_context(|| format!("failed to open operation lock {}", path.display()))?;
-        file.try_lock().with_context(|| {
-            format!(
-                "could not lock {}. Another Apply or Restore may be running; close the other window and retry",
-                path.display()
-            )
+        file.try_lock().map_err(|err| match err {
+            fs::TryLockError::WouldBlock => {
+                anyhow!("Another Apply or Restore is running. Close the other window and retry")
+            }
+            fs::TryLockError::Error(err) => {
+                anyhow::Error::new(err).context(format!("failed to lock {}", path.display()))
+            }
         })?;
         Ok(file)
     }
