@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.1 - 2026-11-09
 
 ### Changes
 - The effects editor stays smooth when many effects are unchecked.
