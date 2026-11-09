@@ -321,12 +321,13 @@ fn restore_backup_with_store(game_dir: PathBuf, backup: BackupStore) -> Result<R
                     backup.path().display()
                 )
             })?;
-            let original = store.ggpk_restore_target(meta).map_err(|err| {
-                anyhow!(
-                    "Content.ggpk changed after Apply, so Restore can't undo the patch safely.\n  Cause: {err:#}\n  {GGPK_REPAIR}"
-                )
-            })?;
-            if index_is_patched(&original) {
+            let original_is_patched =
+                index_is_patched(&store.ggpk_restore_target(meta).map_err(|err| {
+                    anyhow!(
+                        "Content.ggpk changed after Apply, so Restore can't undo the patch safely.\n  Cause: {err:#}\n  {GGPK_REPAIR}"
+                    )
+                })?);
+            if original_is_patched {
                 bail!("the backup points at an index that is already patched.\n  {GGPK_REPAIR}");
             }
             let index_display_path = store.index_display_path();
