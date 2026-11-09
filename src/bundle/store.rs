@@ -964,8 +964,8 @@ impl BundleStore {
         check().unwrap_or(false)
     }
 
-    /// Fails if Content.ggpk changed after Apply.
-    pub fn ggpk_restore_target(&self, meta: GgpkBackupMeta) -> Result<Vec<u8>> {
+    /// The original index without paths. Fails if Content.ggpk changed after Apply.
+    pub fn ggpk_restore_target(&self, meta: GgpkBackupMeta) -> Result<BundleIndex> {
         let ggpk = self.ggpk()?;
         let live = ggpk_find_pdir(ggpk, "Bundles2")?.context("Bundles2 directory not found")?;
         if live.parent_offset_pos != Some(meta.bundles2_offset_pos)
@@ -1006,6 +1006,7 @@ impl BundleStore {
             bail!("the original Bundles2 directory was freed");
         }
         decompress_bundle(&ggpk.mmap[span.begin..span.begin + span.len])
+            .and_then(BundleIndex::parse_records)
             .context("the original index is damaged")
     }
 

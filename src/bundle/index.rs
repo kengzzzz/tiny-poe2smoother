@@ -195,24 +195,6 @@ impl BundleIndex {
         index
     }
 
-    /// Reads only the bundle names.
-    pub fn bundle_names(raw_decompressed: &[u8]) -> Result<Vec<&str>> {
-        let mut cursor = Cursor::new(raw_decompressed);
-        let count = cursor.read_u32::<LittleEndian>()? as usize;
-        let mut names = Vec::with_capacity(count.min(raw_decompressed.len() / 8));
-        for _ in 0..count {
-            let len = cursor.read_u32::<LittleEndian>()? as usize;
-            let start = usize::try_from(cursor.position())?;
-            let name = start
-                .checked_add(len)
-                .and_then(|end| raw_decompressed.get(start..end))
-                .context("bundle name exceeds index data")?;
-            names.push(std::str::from_utf8(name).context("bundle name is not UTF-8")?);
-            cursor.set_position((start + len + 4) as u64);
-        }
-        Ok(names)
-    }
-
     pub fn parse(raw_decompressed: Vec<u8>) -> Result<Self> {
         let mut index = Self::parse_records(raw_decompressed)?;
         index.paths = index.build_paths()?;
@@ -225,7 +207,8 @@ impl BundleIndex {
         Ok(index)
     }
 
-    fn parse_records(raw_decompressed: Vec<u8>) -> Result<Self> {
+    /// Checks the whole index but skips the path list.
+    pub(super) fn parse_records(raw_decompressed: Vec<u8>) -> Result<Self> {
         let mut cursor = Cursor::new(raw_decompressed.as_slice());
         let bundle_count = cursor.read_u32::<LittleEndian>()? as usize;
         // Capped so a corrupt cache can't force a huge allocation.
