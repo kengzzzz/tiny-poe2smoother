@@ -139,11 +139,15 @@ pub fn preview_patches(request: PatchRequest) -> Result<PatchPreview> {
 }
 
 pub fn apply_patches(request: PatchRequest) -> Result<ApplyReport> {
+    apply_patches_with_store(request, BackupStore::from_default_location()?)
+}
+
+fn apply_patches_with_store(request: PatchRequest, backup: BackupStore) -> Result<ApplyReport> {
     crate::timing!("apply_patches_total");
+    let _lock = backup.lock()?;
     let game_dir = resolve_game_dir(request.game_dir)?;
     ensure_game_not_running(&game_dir)?;
     let mut store = BundleStore::new(&game_dir);
-    let backup = BackupStore::from_default_location()?;
 
     if !store.index_exists()? {
         bail!(
@@ -245,12 +249,13 @@ pub fn apply_patches(request: PatchRequest) -> Result<ApplyReport> {
 
 pub fn restore_backup(game_dir: Option<PathBuf>) -> Result<RestoreReport> {
     let game_dir = resolve_game_dir(game_dir)?;
-    ensure_game_not_running(&game_dir)?;
     let backup = BackupStore::from_default_location()?;
     restore_backup_with_store(game_dir, backup)
 }
 
 fn restore_backup_with_store(game_dir: PathBuf, backup: BackupStore) -> Result<RestoreReport> {
+    let _lock = backup.lock()?;
+    ensure_game_not_running(&game_dir)?;
     ensure_backup_is_for(&backup, &game_dir)?;
     let restored_files = if backup.has_backup() {
         let entries = backup
@@ -612,6 +617,132 @@ mod tests {
         assert_eq!(report.restored_files, 0);
         assert!(report.backup_removed);
         assert!(!backup.has_backup());
+    }
+
+    #[test]
+    fn apply_and_restore_round_trip_both_layouts() {
+        use crate::bundle::store_tests::write_test_ggpk_files;
+
+        for layout in [InstallLayout::LooseBundles, InstallLayout::ContentGgpk] {
+            let temp = tempfile::tempdir().unwrap();
+            let game = temp.path().join("game");
+            fs::create_dir_all(&game).unwrap();
+            let path = "metadata/environmentsettings/test.env";
+            let original_data: Vec<u8> = "\u{feff}{\"shadows_enabled\": true}"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect();
+            let (index_bytes, bundle_bytes) = patch_fixture(path, &original_data);
+            let source = match layout {
+                InstallLayout::LooseBundles => {
+                    fs::create_dir_all(game.join("Bundles2")).unwrap();
+                    fs::write(game.join("Bundles2/_.index.bin"), &index_bytes).unwrap();
+                    fs::write(game.join("Bundles2/Base.bundle.bin"), &bundle_bytes).unwrap();
+                    game.join("Bundles2/_.index.bin")
+                }
+                InstallLayout::ContentGgpk => {
+                    write_test_ggpk_files(
+                        &game.join("Content.ggpk"),
+                        "Bundles2",
+                        &[
+                            ("_.index.bin", &index_bytes),
+                            ("Base.bundle.bin", &bundle_bytes),
+                        ],
+                    );
+                    game.join("Content.ggpk")
+                }
+            };
+            let original_source = fs::read(&source).unwrap();
+            let backup = BackupStore::for_path(temp.path().join("poe2.bak"));
+            let request = PatchRequest {
+                game_dir: Some(game.clone()),
+                patches: vec![PatchId::Shadow],
+                params: PatchParams::default(),
+            };
+            let report = apply_patches_with_store(request.clone(), backup.clone()).unwrap();
+            assert_eq!(report.changed_files, 1);
+            assert!(backup.has_backup());
+            {
+                let mut store = BundleStore::new(&game);
+                let index = store.open_index().unwrap();
+                assert!(index_is_patched(&index));
+                let patched = store.read_file(&index, path).unwrap();
+                assert_eq!(
+                    crate::patches::decode_utf16(&patched).unwrap(),
+                    "{\"shadows_enabled\": false}"
+                );
+            }
+            assert!(apply_patches_with_store(request, backup.clone()).is_err());
+
+            let restored = restore_backup_with_store(game.clone(), backup.clone()).unwrap();
+            assert_eq!(restored.restored_files, 1);
+            assert!(restored.backup_removed);
+            assert!(!backup.has_backup());
+            assert_eq!(fs::read(&source).unwrap(), original_source);
+            assert!(!game.join("Bundles2/TinyPoe2Smoother").exists());
+            let mut store = BundleStore::new(&game);
+            let index = store.open_index().unwrap();
+            assert!(!index_is_patched(&index));
+            assert_eq!(store.read_file(&index, path).unwrap(), original_data);
+        }
+    }
+
+    fn patch_fixture(path: &str, data: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let mut paths = 1u32.to_le_bytes().to_vec();
+        paths.extend_from_slice(path.as_bytes());
+        paths.push(0);
+        let mut raw = 1u32.to_le_bytes().to_vec();
+        raw.extend_from_slice(&4u32.to_le_bytes());
+        raw.extend_from_slice(b"Base");
+        raw.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        raw.extend_from_slice(&1u32.to_le_bytes());
+        raw.extend_from_slice(&crate::bundle::filepath_hash(path).to_le_bytes());
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        raw.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        raw.extend_from_slice(&1u32.to_le_bytes());
+        raw.extend_from_slice(&0x07E47507B4A92E53u64.to_le_bytes());
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        raw.extend_from_slice(&(paths.len() as u32).to_le_bytes());
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        raw.extend_from_slice(&pack_uncompressed_bundle(&paths).unwrap());
+        (
+            pack_uncompressed_bundle(&raw).unwrap(),
+            pack_uncompressed_bundle(data).unwrap(),
+        )
+    }
+
+    #[test]
+    fn apply_and_restore_reject_a_busy_backup_without_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = fake_install(temp.path(), "game");
+        let backup = BackupStore::for_path(temp.path().join("poe2.bak"));
+        let original = fs::read(game.join("Bundles2/_.index.bin")).unwrap();
+        let lock = backup.lock().unwrap();
+        let request = PatchRequest {
+            game_dir: Some(game.clone()),
+            patches: vec![PatchId::Shadow],
+            params: PatchParams::default(),
+        };
+        assert!(
+            apply_patches_with_store(request, backup.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("Another Apply or Restore")
+        );
+        assert!(
+            restore_backup_with_store(game.clone(), backup.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("Another Apply or Restore")
+        );
+        assert_eq!(
+            fs::read(game.join("Bundles2/_.index.bin")).unwrap(),
+            original
+        );
+        assert!(!backup.has_backup());
+        drop(lock);
+        assert!(backup.lock().is_ok());
     }
 
     #[test]

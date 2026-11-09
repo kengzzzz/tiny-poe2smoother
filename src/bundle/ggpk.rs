@@ -62,11 +62,11 @@ pub(super) struct GgpkPdirEntry {
 }
 
 pub(super) fn ggpk_find_file(ggpk: &GgpkArchive, wanted: &str) -> Result<Option<GgpkFileSpan>> {
-    ggpk_find_record(ggpk, 0, "", wanted)
+    ggpk_find_record(ggpk, 0, "", wanted, &mut Vec::new())
 }
 
 pub(super) fn ggpk_find_pdir(ggpk: &GgpkArchive, wanted: &str) -> Result<Option<GgpkPdirRecord>> {
-    ggpk_find_pdir_record(ggpk, 0, "", wanted, None)
+    ggpk_find_pdir_record(ggpk, 0, "", wanted, None, &mut Vec::new())
 }
 
 fn ggpk_find_pdir_record(
@@ -75,25 +75,30 @@ fn ggpk_find_pdir_record(
     base: &str,
     wanted: &str,
     parent_offset_pos: Option<u64>,
+    ancestors: &mut Vec<u64>,
 ) -> Result<Option<GgpkPdirRecord>> {
-    if offset as usize + 8 > ggpk.mmap.len() {
-        bail!("GGPK record offset {offset} is outside Content.ggpk");
-    }
+    check_traversal_offset(ggpk, offset, ancestors)?;
+    ancestors.push(offset);
     let mut cursor = Cursor::new(ggpk.mmap.as_ref());
     cursor.set_position(offset);
 
     let _record_size = cursor.read_u32::<LittleEndian>()? as u64;
     let record_tag = read_ggpk_record_tag(&mut cursor)?;
-    match record_tag.as_str() {
+    let result = (|| match record_tag.as_str() {
         "GGPK" => {
             let _version = cursor.read_u32::<LittleEndian>()?;
             let records = (_record_size.saturating_sub(12)) / 8;
             for _ in 0..records {
                 let child_offset_pos = cursor.position();
                 let child_offset = cursor.read_u64::<LittleEndian>()?;
-                if let Some(record) =
-                    ggpk_find_pdir_record(ggpk, child_offset, base, wanted, Some(child_offset_pos))?
-                {
+                if let Some(record) = ggpk_find_pdir_record(
+                    ggpk,
+                    child_offset,
+                    base,
+                    wanted,
+                    Some(child_offset_pos),
+                    ancestors,
+                )? {
                     return Ok(Some(record));
                 }
             }
@@ -140,9 +145,14 @@ fn ggpk_find_pdir_record(
                 entry.set_position(entries_start + u64::from(i) * 12 + 4);
                 let offset_pos = entry.position();
                 let child_offset = entry.read_u64::<LittleEndian>()?;
-                if let Some(record) =
-                    ggpk_find_pdir_record(ggpk, child_offset, &path, wanted, Some(offset_pos))?
-                {
+                if let Some(record) = ggpk_find_pdir_record(
+                    ggpk,
+                    child_offset,
+                    &path,
+                    wanted,
+                    Some(offset_pos),
+                    ancestors,
+                )? {
                     return Ok(Some(record));
                 }
             }
@@ -150,7 +160,26 @@ fn ggpk_find_pdir_record(
         }
         "FILE" | "FREE" => Ok(None),
         other => bail!("unsupported GGPK record type {other}"),
+    })();
+    ancestors.pop();
+    result
+}
+
+fn check_traversal_offset(ggpk: &GgpkArchive, offset: u64, ancestors: &[u64]) -> Result<()> {
+    if usize::try_from(offset)
+        .ok()
+        .and_then(|offset| offset.checked_add(8))
+        .is_none_or(|end| end > ggpk.mmap.len())
+    {
+        bail!("GGPK record offset {offset} is outside Content.ggpk");
     }
+    if ancestors.contains(&offset) {
+        bail!("GGPK record cycle at offset {offset}");
+    }
+    if ancestors.len() >= 128 {
+        bail!("GGPK directory nesting exceeds 128 records");
+    }
+    Ok(())
 }
 
 fn ggpk_find_record(
@@ -158,22 +187,22 @@ fn ggpk_find_record(
     offset: u64,
     base: &str,
     wanted: &str,
+    ancestors: &mut Vec<u64>,
 ) -> Result<Option<GgpkFileSpan>> {
-    if offset as usize + 8 > ggpk.mmap.len() {
-        bail!("GGPK record offset {offset} is outside Content.ggpk");
-    }
+    check_traversal_offset(ggpk, offset, ancestors)?;
+    ancestors.push(offset);
     let mut cursor = Cursor::new(ggpk.mmap.as_ref());
     cursor.set_position(offset);
 
     let record_size = cursor.read_u32::<LittleEndian>()? as u64;
     let record_tag = read_ggpk_record_tag(&mut cursor)?;
-    match record_tag.as_str() {
+    let result = (|| match record_tag.as_str() {
         "GGPK" => {
             let _version = cursor.read_u32::<LittleEndian>()?;
             let records = (record_size.saturating_sub(12)) / 8;
             for _ in 0..records {
                 let child_offset = cursor.read_u64::<LittleEndian>()?;
-                if let Some(span) = ggpk_find_record(ggpk, child_offset, base, wanted)? {
+                if let Some(span) = ggpk_find_record(ggpk, child_offset, base, wanted, ancestors)? {
                     return Ok(Some(span));
                 }
             }
@@ -195,7 +224,8 @@ fn ggpk_find_record(
                 entry.set_position(entries_start + u64::from(i) * 12);
                 entry.seek(SeekFrom::Current(4))?;
                 let child_offset = entry.read_u64::<LittleEndian>()?;
-                if let Some(span) = ggpk_find_record(ggpk, child_offset, &path, wanted)? {
+                if let Some(span) = ggpk_find_record(ggpk, child_offset, &path, wanted, ancestors)?
+                {
                     return Ok(Some(span));
                 }
             }
@@ -221,7 +251,9 @@ fn ggpk_find_record(
         }
         "FREE" => Ok(None),
         other => bail!("unsupported GGPK record type {other}"),
-    }
+    })();
+    ancestors.pop();
+    result
 }
 
 fn ggpk_record_name(ggpk: &GgpkArchive, offset: u64) -> Result<String> {
@@ -356,4 +388,83 @@ pub(super) fn ggpk_name_hash(name: &str) -> u32 {
 
 fn path_could_contain(path: &str, wanted: &str) -> bool {
     path.is_empty() || wanted == path || wanted.starts_with(&format!("{path}/"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn root(children: &[u64]) -> Vec<u8> {
+        let mut bytes = ((12 + children.len() * 8) as u32).to_le_bytes().to_vec();
+        bytes.extend_from_slice(b"GGPK");
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        for offset in children {
+            bytes.extend_from_slice(&offset.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn assert_bad_traversal(bytes: &[u8], expected: &str) {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Content.ggpk");
+        fs::write(&path, bytes).unwrap();
+        let archive = GgpkArchive::from_file(&path).unwrap();
+        assert!(
+            ggpk_find_file(&archive, "Bundles2/_.index.bin")
+                .unwrap_err()
+                .to_string()
+                .contains(expected)
+        );
+        assert!(
+            ggpk_find_pdir(&archive, "Bundles2")
+                .unwrap_err()
+                .to_string()
+                .contains(expected)
+        );
+    }
+
+    #[test]
+    fn cyclic_archive_returns_an_error_in_both_walkers() {
+        assert_bad_traversal(&root(&[0]), "cycle");
+        let mut indirect = root(&[20]);
+        indirect.extend_from_slice(&root(&[0]));
+        assert_bad_traversal(&indirect, "cycle");
+    }
+
+    #[test]
+    fn excessively_deep_archive_returns_an_error_in_both_walkers() {
+        let mut bytes = Vec::new();
+        for depth in 0..130 {
+            bytes.extend_from_slice(&root(&[(depth + 1) * 20]));
+        }
+        bytes.extend_from_slice(&8u32.to_le_bytes());
+        bytes.extend_from_slice(b"FREE");
+        assert_bad_traversal(&bytes, "nesting exceeds");
+    }
+
+    #[test]
+    fn overflowing_record_offset_returns_an_error_in_both_walkers() {
+        assert_bad_traversal(&root(&[u64::MAX]), "outside");
+    }
+
+    #[test]
+    fn repeated_sibling_offsets_are_not_cycles() {
+        for record in [
+            ggpk_pdir_record("Other", &[0; 32], &[], false).unwrap(),
+            ggpk_file_record("other.bin", b"data", false).unwrap(),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("Content.ggpk");
+            let mut bytes = root(&[28, 28]);
+            bytes.extend_from_slice(&record);
+            fs::write(&path, bytes).unwrap();
+            let archive = GgpkArchive::from_file(&path).unwrap();
+            assert!(
+                ggpk_find_file(&archive, "Bundles2/_.index.bin")
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(ggpk_find_pdir(&archive, "Bundles2").unwrap().is_none());
+        }
+    }
 }
