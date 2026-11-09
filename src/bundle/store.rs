@@ -3,9 +3,9 @@ use super::compression::{
     visit_bundle_slices, visit_bundle_slices_from,
 };
 use super::ggpk::{
-    GgpkArchive, GgpkFileSpan, GgpkPatchPlan, GgpkPdirEntry, ggpk_file_at, ggpk_file_record,
-    ggpk_find_file, ggpk_find_pdir, ggpk_name_hash, ggpk_pdir_at, ggpk_pdir_record,
-    ggpk_records_freed, ggpk_tail_in_use,
+    GgpkArchive, GgpkFileSpan, GgpkPatchPlan, GgpkPdirEntry, GgpkPdirRecord, ggpk_file_at,
+    ggpk_file_record, ggpk_find_file, ggpk_find_pdir, ggpk_name_hash, ggpk_pdir_at,
+    ggpk_pdir_record, ggpk_records_freed, ggpk_tail_in_use, is_generated_bundle,
 };
 use super::hashing::hash_fnv1a;
 use super::index::{BundleFile, BundleIndex, PathList};
@@ -861,10 +861,7 @@ impl BundleStore {
 
         let mut entries = bundles2.entries.clone();
         // Another tool can replace our index but keep our old bundle entry.
-        entries.retain(|entry| {
-            let name = entry.name.to_ascii_lowercase();
-            !(name.starts_with("tinypoe2smoother_") && name.ends_with(".bundle.bin"))
-        });
+        entries.retain(|entry| !is_generated_bundle(&entry.name));
         let mut replaced_index = false;
         for entry in &mut entries {
             if entry.name.eq_ignore_ascii_case("_.index.bin") {
@@ -980,6 +977,23 @@ impl BundleStore {
         let original = ggpk_pdir_at(ggpk, meta.original_bundles2_offset)?
             .filter(|pdir| pdir.name == live.name && pdir.digest == live.digest)
             .context("the original Bundles2 directory is gone")?;
+        // Some tools change entries without updating digests.
+        let others = |pdir: &GgpkPdirRecord| {
+            let mut offsets = pdir
+                .entries
+                .iter()
+                .filter(|entry| {
+                    !entry.name.eq_ignore_ascii_case("_.index.bin")
+                        && !is_generated_bundle(&entry.name)
+                })
+                .map(|entry| entry.offset)
+                .collect::<Vec<_>>();
+            offsets.sort_unstable();
+            offsets
+        };
+        if others(&live) != others(&original) {
+            bail!("Bundles2 changed after Apply");
+        }
         let index_offset = original
             .entries
             .iter()
@@ -1933,6 +1947,48 @@ pub(crate) mod tests {
             BundleStore::new(&game).read_index_bytes().unwrap(),
             b"old-index"
         );
+    }
+
+    #[test]
+    fn restore_target_refuses_a_bundles2_child_changed_after_apply() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game");
+        fs::create_dir_all(&game).unwrap();
+        let content = game.join("Content.ggpk");
+        write_test_ggpk_files(
+            &content,
+            "Bundles2",
+            &[
+                ("_.index.bin", test_index_bytes(&[]).as_slice()),
+                ("Other.bundle.bin", b"old-other".as_slice()),
+            ],
+        );
+        let meta = patch_test_ggpk(&game, "TinyPoe2Smoother_0", b"new-index");
+        let store = BundleStore::new(&game);
+        store.ggpk_restore_target(meta).unwrap();
+        let live = ggpk_find_pdir(store.ggpk().unwrap(), "Bundles2")
+            .unwrap()
+            .unwrap();
+        drop(store);
+
+        let slot = live
+            .entries
+            .iter()
+            .position(|entry| entry.name == "Other.bundle.bin")
+            .unwrap() as u64;
+        let mut file = fs::OpenOptions::new().write(true).open(&content).unwrap();
+        let moved = file.seek(SeekFrom::End(0)).unwrap();
+        file.write_all(&file_record("Other.bundle.bin", b"new-other"))
+            .unwrap();
+        let entries = live.offset + 48 + utf16_nul_bytes("Bundles2").len() as u64;
+        file.seek(SeekFrom::Start(entries + slot * 12 + 4)).unwrap();
+        file.write_u64::<LittleEndian>(moved).unwrap();
+        drop(file);
+
+        let err = BundleStore::new(&game)
+            .ggpk_restore_target(meta)
+            .unwrap_err();
+        assert!(err.to_string().contains("Bundles2 changed"), "{err:#}");
     }
 
     #[test]

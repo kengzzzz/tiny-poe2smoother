@@ -236,6 +236,11 @@ pub(super) fn ggpk_file_at(ggpk: &GgpkArchive, offset: u64) -> Result<Option<Ggp
     read_file_record(ggpk, offset).map(|(_, span)| Some(span))
 }
 
+pub(super) fn is_generated_bundle(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.starts_with("tinypoe2smoother_") && name.ends_with(".bundle.bin")
+}
+
 fn record_header(data: &[u8], offset: u64) -> Option<(u64, [u8; 4])> {
     let start = usize::try_from(offset).ok()?;
     let bytes = data.get(start..start.checked_add(8)?)?;
@@ -339,10 +344,7 @@ pub(super) fn ggpk_tail_in_use(ggpk: &GgpkArchive, tail_start: u64) -> bool {
 
     let expected: [fn(&[u8; 4], &str) -> bool; 3] = [
         |tag, name| tag == b"FILE" && name.eq_ignore_ascii_case("_.index.bin"),
-        |tag, name| {
-            let name = name.to_ascii_lowercase();
-            tag == b"FILE" && name.starts_with("tinypoe2smoother_") && name.ends_with(".bundle.bin")
-        },
+        |tag, name| tag == b"FILE" && is_generated_bundle(name),
         |tag, name| tag == b"PDIR" && name == "Bundles2",
     ];
     let mut offset = tail_start;
