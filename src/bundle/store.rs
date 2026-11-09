@@ -1998,6 +1998,52 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn restore_target_refuses_an_original_index_inside_free_space() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game");
+        fs::create_dir_all(&game).unwrap();
+        let content = game.join("Content.ggpk");
+        let pad = file_record("Pad.bin", b"pad");
+        let index = file_record("_.index.bin", &test_index_bytes(&[]));
+        let bundles2 = 28 + pdir_record_size("", 1) as u64;
+        let pad_at = bundles2 + pdir_record_size("Bundles2", 1) as u64;
+        let index_at = pad_at + pad.len() as u64;
+        let free_at = index_at + index.len() as u64;
+        let mut out = Vec::new();
+        out.write_u32::<LittleEndian>(28).unwrap();
+        out.extend_from_slice(b"GGPK");
+        out.write_u32::<LittleEndian>(3).unwrap();
+        out.write_u64::<LittleEndian>(28).unwrap();
+        out.write_u64::<LittleEndian>(free_at).unwrap();
+        write_pdir_record(&mut out, "", &[("Bundles2", bundles2)]);
+        write_pdir_record(&mut out, "Bundles2", &[("_.index.bin", index_at)]);
+        out.extend_from_slice(&pad);
+        out.extend_from_slice(&index);
+        out.write_u32::<LittleEndian>(16).unwrap();
+        out.extend_from_slice(b"FREE");
+        out.write_u64::<LittleEndian>(0).unwrap();
+        fs::write(&content, out).unwrap();
+        let meta = patch_test_ggpk(&game, "TinyPoe2Smoother_0", b"new-index");
+        BundleStore::new(&game).ggpk_restore_target(meta).unwrap();
+
+        // Merge the old index into free space but keep its bytes.
+        let mut file = fs::OpenOptions::new().write(true).open(&content).unwrap();
+        file.seek(SeekFrom::Start(pad_at)).unwrap();
+        file.write_u32::<LittleEndian>((free_at - pad_at) as u32)
+            .unwrap();
+        file.write_all(b"FREE").unwrap();
+        file.write_u64::<LittleEndian>(free_at).unwrap();
+        file.seek(SeekFrom::Start(20)).unwrap();
+        file.write_u64::<LittleEndian>(pad_at).unwrap();
+        drop(file);
+
+        let err = BundleStore::new(&game)
+            .ggpk_restore_target(meta)
+            .unwrap_err();
+        assert!(err.to_string().contains("freed"), "{err:#}");
+    }
+
+    #[test]
     fn reapply_replaces_a_leftover_generated_bundle_entry() {
         let temp = tempfile::tempdir().unwrap();
         let game = temp.path().join("game");
