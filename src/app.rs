@@ -18,6 +18,14 @@ use std::path::{Path, PathBuf};
 
 const GGPK_REPAIR: &str = "Run PackCheck.exe in the game folder, then start the game to repair it";
 
+/// The standalone launcher alone never repairs Content.ggpk. PackCheck must run first.
+pub fn repair_hint(layout: InstallLayout) -> &'static str {
+    match layout {
+        InstallLayout::LooseBundles => "Verify the game files in Steam",
+        InstallLayout::ContentGgpk => "Run PackCheck.exe in the game folder, then start the game",
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PatchState {
     Clean,
@@ -161,14 +169,15 @@ fn apply_patches_with_store(request: PatchRequest, backup: BackupStore) -> Resul
     let mut index = match store.open_index() {
         Ok(idx) => idx,
         Err(e) => bail!(
-            "failed to read/decode {}.\n  Cause: {}\nVerify game files with Steam or the standalone launcher",
+            "failed to read/decode {}.\n  Cause: {}\n{}",
             store.index_display_path(),
-            e
+            e,
+            repair_hint(store.layout)
         ),
     };
     ensure_backup_is_for(&backup, &game_dir)?;
     let patch_state = classify_patch_state(backup.has_backup(), index_is_patched(&index));
-    ensure_can_apply(patch_state, backup.path())?;
+    ensure_can_apply(patch_state, backup.path(), store.layout)?;
     if patch_state.has_stale_backup()
         && matches!(store.layout, InstallLayout::ContentGgpk)
         && let Ok(entries) = backup.entries()
@@ -190,9 +199,10 @@ fn apply_patches_with_store(request: PatchRequest, backup: BackupStore) -> Resul
     for change in &patch_set.changes {
         if !store.bundle_exists(&change.bundle_name)? {
             bail!(
-                "bundle file required by '{}' not found: {}.\nVerify game files with Steam or the standalone launcher",
+                "bundle file required by '{}' not found: {}.\n{}",
                 change.path,
-                store.bundle_display_path(&change.bundle_name)
+                store.bundle_display_path(&change.bundle_name),
+                repair_hint(store.layout)
             );
         }
     }
@@ -423,7 +433,11 @@ fn index_is_patched(index: &BundleIndex) -> bool {
         || index.has_bundle_prefix("LibGGPK3/")
 }
 
-fn ensure_can_apply(patch_state: PatchState, backup_path: &Path) -> Result<()> {
+fn ensure_can_apply(
+    patch_state: PatchState,
+    backup_path: &Path,
+    layout: InstallLayout,
+) -> Result<()> {
     match patch_state {
         PatchState::Clean | PatchState::StaleBackup => Ok(()),
         PatchState::Patched => bail!(
@@ -434,7 +448,8 @@ fn ensure_can_apply(patch_state: PatchState, backup_path: &Path) -> Result<()> {
         ),
         PatchState::PatchedMissingBackup => bail!(
             "game index is already patched by tiny-poe2smoother, but no backup was found.\n\
-             Verify game files with Steam or the standalone launcher before applying again"
+             {} before applying again",
+            repair_hint(layout)
         ),
         PatchState::OtherInstallBackup => bail!(
             "the backup belongs to another install.\n\
@@ -937,23 +952,27 @@ mod tests {
     fn stale_backup_does_not_block_apply() {
         let backup_path = Path::new("/tmp/poe2.bak");
 
-        assert!(ensure_can_apply(PatchState::Clean, backup_path).is_ok());
-        assert!(ensure_can_apply(PatchState::StaleBackup, backup_path).is_ok());
+        let layout = InstallLayout::LooseBundles;
+        assert!(ensure_can_apply(PatchState::Clean, backup_path, layout).is_ok());
+        assert!(ensure_can_apply(PatchState::StaleBackup, backup_path, layout).is_ok());
     }
 
     #[test]
     fn currently_patched_index_blocks_apply() {
         let backup_path = Path::new("/tmp/poe2.bak");
 
-        let with_backup = ensure_can_apply(PatchState::Patched, backup_path)
+        let layout = InstallLayout::ContentGgpk;
+        let with_backup = ensure_can_apply(PatchState::Patched, backup_path, layout)
             .unwrap_err()
             .to_string();
-        let without_backup = ensure_can_apply(PatchState::PatchedMissingBackup, backup_path)
-            .unwrap_err()
-            .to_string();
+        let without_backup =
+            ensure_can_apply(PatchState::PatchedMissingBackup, backup_path, layout)
+                .unwrap_err()
+                .to_string();
 
         assert!(with_backup.contains("already patched"));
         assert!(without_backup.contains("no backup was found"));
+        assert!(without_backup.contains("PackCheck"));
     }
 
     #[test]

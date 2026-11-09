@@ -1,5 +1,5 @@
 use eframe::egui;
-use tiny_poe2smoother::app::{AppStatus, PatchState};
+use tiny_poe2smoother::app::{AppStatus, PatchState, repair_hint};
 use tiny_poe2smoother::install::{InstallLayout, display_path, is_game_running};
 use tiny_poe2smoother::patches::{MinimapStyle, PatchId, all_profiles, patch_info, patch_options};
 
@@ -174,7 +174,8 @@ fn install_summary(status: &AppStatus) -> (String, egui::Color32) {
         ),
         PatchState::PatchedMissingBackup => (
             format!(
-                "{layout} · patched but the backup is missing. Verify the game files in Steam or the launcher"
+                "{layout} · patched but the backup is missing. {}",
+                repair_hint(status.install_layout)
             ),
             palette::ERROR,
         ),
