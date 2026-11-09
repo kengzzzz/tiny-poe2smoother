@@ -118,7 +118,11 @@ fn ggpk_find_pdir_record(
                     name,
                     offset,
                     digest,
-                    entries: read_pdir_entries(ggpk, cursor.position(), entries_len)?,
+                    entries: read_pdir_entries(
+                        ggpk,
+                        (cursor.position(), entries_len),
+                        offset + record_size,
+                    )?,
                     parent_offset_pos,
                 }));
             }
@@ -189,11 +193,14 @@ fn lookup_order<'a>(
 
 fn read_pdir_entries(
     ggpk: &GgpkArchive,
-    entries_start: u64,
-    entries_len: u32,
+    entries: (u64, u32),
+    record_end: u64,
 ) -> Result<Vec<GgpkPdirEntry>> {
-    let room = ggpk.mmap.len().saturating_sub(entries_start as usize) / 12;
-    let mut entries = Vec::with_capacity((entries_len as usize).min(room));
+    let (entries_start, entries_len) = entries;
+    if entries_start.saturating_add(u64::from(entries_len) * 12) > record_end {
+        bail!("GGPK directory at {entries_start} lists more entries than it holds");
+    }
+    let mut entries = Vec::with_capacity(entries_len as usize);
     let mut entry = Cursor::new(ggpk.mmap.as_ref());
     entry.set_position(entries_start);
     for _ in 0..entries_len {
@@ -243,7 +250,7 @@ pub(super) fn ggpk_pdir_at(ggpk: &GgpkArchive, offset: u64) -> Result<Option<Ggp
     }
     let mut cursor = Cursor::new(ggpk.mmap.as_ref());
     cursor.set_position(offset);
-    let _record_size = cursor.read_u32::<LittleEndian>()?;
+    let record_size = u64::from(cursor.read_u32::<LittleEndian>()?);
     if read_ggpk_record_tag(&mut cursor)? != "PDIR" {
         return Ok(None);
     }
@@ -256,7 +263,7 @@ pub(super) fn ggpk_pdir_at(ggpk: &GgpkArchive, offset: u64) -> Result<Option<Ggp
         name,
         offset,
         digest,
-        entries: read_pdir_entries(ggpk, cursor.position(), entries_len)?,
+        entries: read_pdir_entries(ggpk, (cursor.position(), entries_len), offset + record_size)?,
         parent_offset_pos: None,
     }))
 }
@@ -849,6 +856,8 @@ mod tests {
                 .is_some()
         );
         assert!(ggpk_find_pdir(&archive, "Bundles2").unwrap().is_some());
+        assert!(ggpk_pdir_at(&archive, 28).is_err());
+        assert!(ggpk_tail_in_use(&archive, archive.mmap.len() as u64 - 8));
     }
 
     #[test]
