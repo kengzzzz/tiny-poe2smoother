@@ -62,14 +62,14 @@ impl BackupStore {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            // A read handle locks too, and an elevated run can leave a read-only lock file.
-            fs::File::open(&path).or_else(|_| {
-                fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(&path)
-            })
+            // An elevated run can leave a read-only lock file. NFS needs a write handle to lock.
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .or_else(|err| fs::File::open(&path).map_err(|_| err))
         };
         let file = open().with_context(|| {
             format!(
