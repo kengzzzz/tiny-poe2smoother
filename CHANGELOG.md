@@ -10,6 +10,7 @@
 - Standalone client: Restore no longer breaks the game when the game files changed after Apply, for example after PackCheck or another mod tool. It asks you to run PackCheck and start the game instead.
 - Standalone client: Restore and Apply no longer cut off game data that the launcher or another tool added after a failed Apply.
 - An Apply that fails now cleans up after itself and no longer leaves an old backup behind.
+- Restore now clears a backup that was cut short, for example by a full disk, instead of failing.
 - Standalone client: Apply no longer keeps an old patch file around that could make patched files unreadable after the game data changed.
 - Standalone client: the app now notices when the launcher repairs the game files, instead of still showing "Backup missing".
 - Standalone client: "Backup missing" now tells you to run PackCheck and start the game. The launcher alone can't repair it.
