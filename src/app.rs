@@ -233,13 +233,20 @@ fn apply_patches_with_store(request: PatchRequest, backup: BackupStore) -> Resul
             .display()
             .to_string(),
     };
-    let write_report =
-        apply_bundle_replacements(&store, &mut index, &patch_set.replacements, Some(&backup))
-            .map_err(|err| {
-                anyhow!(
-                    "failed to write generated bundle to {write_target}.\n  Cause: {err:#}\n  Restore to clean up"
-                )
-            })?;
+    let write_report = apply_bundle_replacements(
+        &store,
+        &mut index,
+        &patch_set.replacements,
+        Some(&backup),
+    )
+    .map_err(|err| {
+        let hint = if backup.has_backup() {
+            "Restore to clean up"
+        } else {
+            "Nothing was changed"
+        };
+        anyhow!("failed to write generated bundle to {write_target}.\n  Cause: {err:#}\n  {hint}")
+    })?;
 
     Ok(ApplyReport {
         game_dir,
@@ -637,37 +644,10 @@ mod tests {
 
     #[test]
     fn apply_and_restore_round_trip_both_layouts() {
-        use crate::bundle::store_tests::write_test_ggpk_files;
-
         for layout in [InstallLayout::LooseBundles, InstallLayout::ContentGgpk] {
             let temp = tempfile::tempdir().unwrap();
             let game = temp.path().join("game");
-            fs::create_dir_all(&game).unwrap();
-            let path = "metadata/environmentsettings/test.env";
-            let original_data: Vec<u8> = "\u{feff}{\"shadows_enabled\": true}"
-                .encode_utf16()
-                .flat_map(u16::to_le_bytes)
-                .collect();
-            let (index_bytes, bundle_bytes) = patch_fixture(path, &original_data);
-            let source = match layout {
-                InstallLayout::LooseBundles => {
-                    fs::create_dir_all(game.join("Bundles2")).unwrap();
-                    fs::write(game.join("Bundles2/_.index.bin"), &index_bytes).unwrap();
-                    fs::write(game.join("Bundles2/Base.bundle.bin"), &bundle_bytes).unwrap();
-                    game.join("Bundles2/_.index.bin")
-                }
-                InstallLayout::ContentGgpk => {
-                    write_test_ggpk_files(
-                        &game.join("Content.ggpk"),
-                        "Bundles2",
-                        &[
-                            ("_.index.bin", &index_bytes),
-                            ("Base.bundle.bin", &bundle_bytes),
-                        ],
-                    );
-                    game.join("Content.ggpk")
-                }
-            };
+            let (source, path, original_data) = write_shadow_fixture(&game, layout);
             let original_source = fs::read(&source).unwrap();
             let backup = BackupStore::for_path(temp.path().join("poe2.bak"));
             let request = PatchRequest {
@@ -700,6 +680,80 @@ mod tests {
             let index = store.open_index().unwrap();
             assert!(!index_is_patched(&index));
             assert_eq!(store.read_file(&index, path).unwrap(), original_data);
+        }
+    }
+
+    fn write_shadow_fixture(
+        game: &Path,
+        layout: InstallLayout,
+    ) -> (PathBuf, &'static str, Vec<u8>) {
+        use crate::bundle::store_tests::write_test_ggpk_files;
+        fs::create_dir_all(game).unwrap();
+        let path = "metadata/environmentsettings/test.env";
+        let original_data: Vec<u8> = "\u{feff}{\"shadows_enabled\": true}"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let (index_bytes, bundle_bytes) = patch_fixture(path, &original_data);
+        let source = match layout {
+            InstallLayout::LooseBundles => {
+                fs::create_dir_all(game.join("Bundles2")).unwrap();
+                fs::write(game.join("Bundles2/_.index.bin"), &index_bytes).unwrap();
+                fs::write(game.join("Bundles2/Base.bundle.bin"), &bundle_bytes).unwrap();
+                game.join("Bundles2/_.index.bin")
+            }
+            InstallLayout::ContentGgpk => {
+                write_test_ggpk_files(
+                    &game.join("Content.ggpk"),
+                    "Bundles2",
+                    &[
+                        ("_.index.bin", &index_bytes),
+                        ("Base.bundle.bin", &bundle_bytes),
+                    ],
+                );
+                game.join("Content.ggpk")
+            }
+        };
+        (source, path, original_data)
+    }
+
+    #[test]
+    fn failed_apply_that_wrote_nothing_leaves_no_backup() {
+        let mut layouts = vec![InstallLayout::ContentGgpk];
+        // Read-only folders still accept new files on Windows.
+        if cfg!(unix) {
+            layouts.push(InstallLayout::LooseBundles);
+        }
+        for layout in layouts {
+            let temp = tempfile::tempdir().unwrap();
+            let game = temp.path().join("game");
+            let (source, _, _) = write_shadow_fixture(&game, layout);
+            let locked = match layout {
+                InstallLayout::ContentGgpk => source.clone(),
+                InstallLayout::LooseBundles => game.join("Bundles2"),
+            };
+            let original = fs::read(&source).unwrap();
+            let mut permissions = fs::metadata(&locked).unwrap().permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(&locked, permissions.clone()).unwrap();
+            let backup = BackupStore::for_path(temp.path().join("poe2.bak"));
+            let request = PatchRequest {
+                game_dir: Some(game.clone()),
+                patches: vec![PatchId::Shadow],
+                params: PatchParams::default(),
+            };
+
+            let err = apply_patches_with_store(request, backup.clone()).unwrap_err();
+
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(false);
+            fs::set_permissions(&locked, permissions).unwrap();
+            assert!(
+                format!("{err:#}").contains("Nothing was changed"),
+                "{err:#}"
+            );
+            assert!(!backup.has_backup());
+            assert_eq!(fs::read(&source).unwrap(), original);
         }
     }
 

@@ -57,7 +57,12 @@ pub fn apply_bundle_replacements(
         let backup =
             backup.ok_or_else(|| anyhow!("standalone GGPK patch requires a backup store"))?;
         backup.ensure_ggpk_backup_meta(&store.game_dir, plan.backup)?;
-        store.apply_ggpk_patch(&plan)?;
+        if let Err(err) = store.apply_ggpk_patch(&plan) {
+            if store.ggpk_untouched(plan.backup) {
+                let _ = backup.remove();
+            }
+            return Err(err);
+        }
         store.remove_legacy_overlay_files()?;
         touched.push(store.content_path.clone());
         return Ok(BundleWriteReport {
@@ -66,18 +71,30 @@ pub fn apply_bundle_replacements(
     }
 
     let custom_path = store.bundle_path(&custom_bundle_name);
-    if let Some(parent) = custom_path.parent() {
-        fs::create_dir_all(parent)?;
+    let drop_backup = || {
+        if let Some(backup) = backup {
+            let _ = backup.remove();
+        }
+    };
+    let write_bundle = || -> Result<()> {
+        if let Some(parent) = custom_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        atomic_write(&custom_path, &out).with_context(|| {
+            format!(
+                "failed to write generated bundle at {}",
+                custom_path.display()
+            )
+        })
+    };
+    if let Err(err) = write_bundle() {
+        drop_backup();
+        return Err(err);
     }
-    atomic_write(&custom_path, &out).with_context(|| {
-        format!(
-            "failed to write generated bundle at {}",
-            custom_path.display()
-        )
-    })?;
 
     if let Err(e) = atomic_write(&store.index_path, &index_bytes) {
         let _ = fs::remove_file(&custom_path);
+        drop_backup();
         return Err(e.context("failed to replace index. Generated bundle has been cleaned up"));
     }
     touched.push(custom_path);

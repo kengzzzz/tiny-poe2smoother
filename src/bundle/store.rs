@@ -907,6 +907,18 @@ impl BundleStore {
         Ok(())
     }
 
+    pub(super) fn ggpk_untouched(&self, meta: GgpkBackupMeta) -> bool {
+        let check = || -> Result<bool> {
+            let mut file = fs::File::open(&self.content_path)?;
+            if file.metadata()?.len() != meta.appended_start {
+                return Ok(false);
+            }
+            file.seek(SeekFrom::Start(meta.bundles2_offset_pos))?;
+            Ok(file.read_u64::<LittleEndian>()? == meta.original_bundles2_offset)
+        };
+        check().unwrap_or(false)
+    }
+
     /// Fails when Content.ggpk changed after Apply.
     pub fn ggpk_restore_target(&self, meta: GgpkBackupMeta) -> Result<BundleIndex> {
         let ggpk = self.ggpk()?;
