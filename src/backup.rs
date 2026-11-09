@@ -58,16 +58,23 @@ impl BackupStore {
     /// Hold the handle until done. Never delete the lock file.
     pub(crate) fn lock(&self) -> Result<fs::File> {
         let path = self.path.with_extension("lock");
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .with_context(|| format!("failed to open operation lock {}", path.display()))?;
+        let open = || {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+        };
+        let file = open().with_context(|| {
+            format!(
+                "failed to open {}.\n  Check disk space and permissions",
+                path.display()
+            )
+        })?;
         file.try_lock().map_err(|err| match err {
             fs::TryLockError::WouldBlock => {
                 anyhow!("Another Apply or Restore is running. Close the other window and retry")
@@ -364,6 +371,22 @@ mod tests {
         drop(lock);
         child(false);
         assert!(store.path().with_extension("lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_explains_a_folder_it_cannot_create() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        let err = BackupStore::for_path(temp.path().join("app/poe2.bak"))
+            .lock()
+            .unwrap_err();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            format!("{err:#}").contains("Check disk space and permissions"),
+            "{err:#}"
+        );
     }
 
     #[test]
