@@ -16,7 +16,7 @@ pub struct BundleWriteReport {
 }
 
 pub fn apply_bundle_replacements(
-    store: &BundleStore,
+    store: &mut BundleStore,
     index: &mut BundleIndex,
     replacements: &HashMap<String, Vec<(BundleFile, Vec<u8>)>>,
     backup: Option<&BackupStore>,
@@ -56,8 +56,17 @@ pub fn apply_bundle_replacements(
         let plan = store.prepare_ggpk_patch(&custom_bundle_name, &out, &index_bytes)?;
         let backup =
             backup.ok_or_else(|| anyhow!("standalone GGPK patch requires a backup store"))?;
-        backup.ensure_ggpk_backup_meta(&store.game_dir, plan.backup)?;
-        store.apply_ggpk_patch(&plan)?;
+        backup
+            .ensure_ggpk_backup_meta(&store.game_dir, plan.backup)
+            .inspect_err(|_| {
+                let _ = backup.remove();
+            })?;
+        if let Err(err) = store.apply_ggpk_patch(&plan) {
+            if store.ggpk_untouched(plan.backup) {
+                let _ = backup.remove();
+            }
+            return Err(err);
+        }
         store.remove_legacy_overlay_files()?;
         touched.push(store.content_path.clone());
         return Ok(BundleWriteReport {
@@ -66,18 +75,34 @@ pub fn apply_bundle_replacements(
     }
 
     let custom_path = store.bundle_path(&custom_bundle_name);
-    if let Some(parent) = custom_path.parent() {
-        fs::create_dir_all(parent)?;
+    let drop_backup = || {
+        // Keep the backup so Restore can retry a folder we couldn't remove.
+        if crate::backup::remove_generated_bundles(&store.game_dir).is_ok()
+            && let Some(backup) = backup
+        {
+            let _ = backup.remove();
+        }
+    };
+    let write_bundle = || -> Result<()> {
+        if let Some(parent) = custom_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        atomic_write(&custom_path, &out).with_context(|| {
+            format!(
+                "failed to write generated bundle at {}",
+                custom_path.display()
+            )
+        })
+    };
+    if let Err(err) = write_bundle() {
+        drop_backup();
+        return Err(err);
     }
-    atomic_write(&custom_path, &out).with_context(|| {
-        format!(
-            "failed to write generated bundle at {}",
-            custom_path.display()
-        )
-    })?;
 
     if let Err(e) = atomic_write(&store.index_path, &index_bytes) {
         let _ = fs::remove_file(&custom_path);
+        drop_backup();
         return Err(e.context("failed to replace index. Generated bundle has been cleaned up"));
     }
     touched.push(custom_path);

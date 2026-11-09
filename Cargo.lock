@@ -2892,7 +2892,7 @@ dependencies = [
 
 [[package]]
 name = "tiny-poe2smoother"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -2907,7 +2907,6 @@ dependencies = [
  "serde",
  "sysinfo",
  "tempfile",
- "thiserror 2.0.21",
  "tracing",
  "tracing-subscriber",
  "windows-sys 0.61.2",

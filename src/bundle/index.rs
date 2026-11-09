@@ -207,7 +207,8 @@ impl BundleIndex {
         Ok(index)
     }
 
-    fn parse_records(raw_decompressed: Vec<u8>) -> Result<Self> {
+    /// Checks the whole index but skips the path list.
+    pub(super) fn parse_records(raw_decompressed: Vec<u8>) -> Result<Self> {
         let mut cursor = Cursor::new(raw_decompressed.as_slice());
         let bundle_count = cursor.read_u32::<LittleEndian>()? as usize;
         // Capped so a corrupt cache can't force a huge allocation.

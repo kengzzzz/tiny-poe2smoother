@@ -55,6 +55,39 @@ impl BackupStore {
         self.path.exists()
     }
 
+    /// Hold the handle until done. Never delete the lock file.
+    pub(crate) fn lock(&self) -> Result<fs::File> {
+        let path = self.path.with_extension("lock");
+        let open = || {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            // An elevated run can leave a read-only lock file. NFS needs a write handle to lock.
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .or_else(|err| fs::File::open(&path).map_err(|_| err))
+        };
+        let file = open().with_context(|| {
+            format!(
+                "failed to open {}.\n  Check disk space and permissions",
+                path.display()
+            )
+        })?;
+        file.try_lock().map_err(|err| match err {
+            fs::TryLockError::WouldBlock => {
+                anyhow!("Another Apply or Restore is running. Close the other window and retry")
+            }
+            fs::TryLockError::Error(err) => {
+                anyhow::Error::new(err).context(format!("failed to lock {}", path.display()))
+            }
+        })?;
+        Ok(file)
+    }
+
     pub fn remove(&self) -> Result<()> {
         match fs::remove_file(&self.path) {
             Ok(()) => Ok(()),
@@ -305,6 +338,73 @@ fn read_chunk(cursor: &mut Cursor<&[u8]>, len: u64) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operation_lock_is_shared_between_processes() {
+        const CHILD_PATH: &str = "TINY_SMOOTHER_TEST_LOCK_PATH";
+        const CHILD_LOCKED: &str = "TINY_SMOOTHER_TEST_EXPECT_LOCKED";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let store = BackupStore::for_path(PathBuf::from(path));
+            let expected_locked = std::env::var(CHILD_LOCKED).unwrap() == "true";
+            assert_eq!(store.lock().is_err(), expected_locked);
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let store = BackupStore::for_path(temp.path().join("poe2.bak"));
+        let child = |locked: bool| {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "backup::tests::operation_lock_is_shared_between_processes",
+                ])
+                .env(CHILD_PATH, store.path())
+                .env(CHILD_LOCKED, locked.to_string())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        let lock = store.lock().unwrap();
+        child(true);
+        drop(lock);
+        child(false);
+        assert!(store.path().with_extension("lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_explains_a_folder_it_cannot_create() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        let err = BackupStore::for_path(temp.path().join("app/poe2.bak"))
+            .lock()
+            .unwrap_err();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            format!("{err:#}").contains("Check disk space and permissions"),
+            "{err:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_works_with_a_read_only_lock_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let store = BackupStore::for_path(temp.path().join("poe2.bak"));
+        let lock_path = store.path().with_extension("lock");
+        fs::write(&lock_path, b"").unwrap();
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o444)).unwrap();
+
+        let lock = store.lock().unwrap();
+        assert!(store.lock().is_err());
+        drop(lock);
+    }
 
     #[test]
     fn backup_round_trip() {
