@@ -1010,9 +1010,11 @@ impl BundleStore {
         if ggpk_records_freed(ggpk, &[original.offset, index_offset]) {
             bail!("the original Bundles2 directory was freed");
         }
-        decompress_bundle(&ggpk.mmap[span.begin..span.begin + span.len])
-            .and_then(BundleIndex::parse_records)
-            .context("the original index is damaged")
+        // Read in order first. A parallel decode from a cold mapping seeks on HDDs.
+        let bytes = ggpk.mmap[span.begin..span.begin + span.len].to_vec();
+        let raw = decompress_bundle(&bytes).context("the original index is damaged")?;
+        drop(bytes);
+        BundleIndex::parse_records(raw).context("the original index is damaged")
     }
 
     /// Cuts our appended records once nothing uses them.
