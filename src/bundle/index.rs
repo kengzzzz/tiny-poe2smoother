@@ -195,7 +195,7 @@ impl BundleIndex {
         index
     }
 
-    /// Reads only the bundle name table of a decompressed index.
+    /// Reads only the bundle names.
     pub fn bundle_names(raw_decompressed: &[u8]) -> Result<Vec<&str>> {
         let mut cursor = Cursor::new(raw_decompressed);
         let count = cursor.read_u32::<LittleEndian>()? as usize;

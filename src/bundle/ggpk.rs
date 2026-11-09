@@ -149,8 +149,7 @@ fn ggpk_find_pdir_record(
     result
 }
 
-/// Each entry's offset slot and child offset. Entries whose stored hash matches the next path
-/// component come first, so a cold disk reads a few records instead of every sibling.
+/// Entries with a matching name hash come first, so a cold disk reads less.
 fn lookup_order(
     ggpk: &GgpkArchive,
     entries_start: u64,
@@ -288,7 +287,6 @@ fn u64_at(data: &[u8], offset: u64) -> Option<u64> {
     ))
 }
 
-/// The header's children, or None when one is unreadable.
 fn header_children(data: &[u8]) -> Option<Vec<(u64, u64, [u8; 4])>> {
     let (header_size, _) = record_header(data, 0)?;
     (0..header_size.saturating_sub(12) / 8)
@@ -300,7 +298,6 @@ fn header_children(data: &[u8]) -> Option<Vec<(u64, u64, [u8; 4])>> {
         .collect()
 }
 
-/// Start and end of every FREE record, or None when the chain is broken.
 fn free_spans(data: &[u8]) -> Option<Vec<(u64, u64)>> {
     let mut next = header_children(data)?
         .into_iter()
@@ -319,7 +316,7 @@ fn free_spans(data: &[u8]) -> Option<Vec<(u64, u64)>> {
     Some(spans)
 }
 
-/// True when a record at one of `offsets` overlaps a FREE record, or the chain is broken.
+/// Also true when the FREE chain is broken.
 pub(super) fn ggpk_records_freed(ggpk: &GgpkArchive, offsets: &[u64]) -> bool {
     let data = ggpk.mmap.as_ref();
     let Some(free) = free_spans(data) else {
@@ -334,8 +331,7 @@ pub(super) fn ggpk_records_freed(ggpk: &GgpkArchive, offsets: &[u64]) -> bool {
     })
 }
 
-/// True when cutting the file at `tail_start` would lose data. Only our appended index, bundle
-/// and Bundles2 records may sit there, and only the root or Bundles2 may point at them.
+/// True when cutting at `tail_start` could lose data. Only our three records may sit there.
 pub(super) fn ggpk_tail_in_use(ggpk: &GgpkArchive, tail_start: u64) -> bool {
     let data = ggpk.mmap.as_ref();
     let len = data.len() as u64;
@@ -385,7 +381,7 @@ pub(super) fn ggpk_tail_in_use(ggpk: &GgpkArchive, tail_start: u64) -> bool {
         if offset >= len {
             return false;
         }
-        // An interrupted Apply can leave the last record cut short or the rest zero filled.
+        // A killed Apply can leave a cut or zero-filled record.
         let Some((size, tag)) = record_header(data, offset) else {
             return offset == tail_start;
         };
@@ -395,7 +391,7 @@ pub(super) fn ggpk_tail_in_use(ggpk: &GgpkArchive, tail_start: u64) -> bool {
         if (&tag != b"FILE" && &tag != b"PDIR") || size < 8 {
             return true;
         }
-        // Our FILE records keep an all-zero digest. Other tools write a real one.
+        // Only our FILE records have an all-zero digest.
         let digest = data.get(offset as usize + 12..).unwrap_or_default();
         if &tag == b"FILE" && digest.iter().take(32).any(|&byte| byte != 0) {
             return true;
@@ -693,8 +689,7 @@ mod tests {
         bytes
     }
 
-    /// An archive whose Bundles2 lists `referenced`, followed by `records`. Returns the bytes
-    /// and each record's offset.
+    /// Returns the bytes and each record's offset.
     fn build(
         records: &[Vec<u8>],
         referenced: &[usize],

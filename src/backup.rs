@@ -55,7 +55,7 @@ impl BackupStore {
         self.path.exists()
     }
 
-    /// Hold the handle for the whole operation. Deleting the file would let another window lock a new one.
+    /// Hold the handle until done. Never delete the lock file.
     pub(crate) fn lock(&self) -> Result<fs::File> {
         let path = self.path.with_extension("lock");
         if let Some(parent) = path.parent() {

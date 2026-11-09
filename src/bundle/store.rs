@@ -40,7 +40,7 @@ struct CacheKey {
     source: String,
     size: u64,
     mtime: u128,
-    // Mapped writes on Windows keep Content.ggpk's size and mtime, so the live index counts too.
+    // Windows mapped writes keep size and mtime, so key on the index record too.
     index_record: Option<IndexRecord>,
 }
 
@@ -860,7 +860,7 @@ impl BundleStore {
         let new_bundles2_offset = custom_offset + u64::try_from(custom_record.len())?;
 
         let mut entries = bundles2.entries.clone();
-        // Another tool can replace our index but keep our old bundle entry.
+        // Another tool may have kept our old bundle entry.
         entries.retain(|entry| !is_generated_bundle(&entry.name));
         let mut replaced_index = false;
         for entry in &mut entries {
@@ -922,7 +922,7 @@ impl BundleStore {
             .write_all(&plan.append_bytes)
             .and_then(|()| file.sync_all())
         {
-            // Drop our partial append now, so a later trim never has to guess what it owns.
+            // Undo our partial write so a later trim never has to guess.
             self.ggpk = None;
             let _ = file.set_len(plan.backup.appended_start);
             return Err(err.into());
@@ -964,7 +964,7 @@ impl BundleStore {
         check().unwrap_or(false)
     }
 
-    /// Returns the original index, decompressed. Fails when Content.ggpk changed after Apply.
+    /// Fails if Content.ggpk changed after Apply.
     pub fn ggpk_restore_target(&self, meta: GgpkBackupMeta) -> Result<Vec<u8>> {
         let ggpk = self.ggpk()?;
         let live = ggpk_find_pdir(ggpk, "Bundles2")?.context("Bundles2 directory not found")?;
@@ -1001,7 +1001,7 @@ impl BundleStore {
             .map(|entry| entry.offset)
             .context("the original index is gone")?;
         let span = ggpk_file_at(ggpk, index_offset)?.context("the original index is gone")?;
-        // Freeing a record next to free space can leave its old bytes readable.
+        // Freed records can keep their old bytes.
         if ggpk_records_freed(ggpk, &[original.offset, index_offset]) {
             bail!("the original Bundles2 directory was freed");
         }
@@ -1009,7 +1009,7 @@ impl BundleStore {
             .context("the original index is damaged")
     }
 
-    /// Trims appended records once nothing in Content.ggpk uses them.
+    /// Cuts our appended records once nothing uses them.
     pub fn trim_restored_ggpk_tail(&mut self, meta: GgpkBackupMeta) -> Result<bool> {
         // An interrupted Apply can leave a partial append.
         let len = fs::metadata(&self.content_path)?.len();

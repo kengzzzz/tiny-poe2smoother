@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 const GGPK_REPAIR: &str = "Run PackCheck.exe in the game folder, then start the game to repair it";
 
-/// The standalone launcher alone never repairs Content.ggpk. PackCheck must run first.
+/// The launcher alone can't repair Content.ggpk. PackCheck must run first.
 pub fn repair_hint(layout: InstallLayout) -> &'static str {
     match layout {
         InstallLayout::LooseBundles => "Verify the game files in Steam",
