@@ -823,6 +823,11 @@ impl BundleStore {
         let new_bundles2_offset = custom_offset + u64::try_from(custom_record.len())?;
 
         let mut entries = bundles2.entries.clone();
+        // A launcher repair can replace our index but keep our old bundle entry.
+        entries.retain(|entry| {
+            let name = entry.name.to_ascii_lowercase();
+            !(name.starts_with("tinypoe2smoother_") && name.ends_with(".bundle.bin"))
+        });
         let mut replaced_index = false;
         for entry in &mut entries {
             if entry.name.eq_ignore_ascii_case("_.index.bin") {
@@ -1841,6 +1846,45 @@ pub(crate) mod tests {
         assert_eq!(
             BundleStore::new(&game).read_index_bytes().unwrap(),
             b"old-index"
+        );
+    }
+
+    #[test]
+    fn reapply_replaces_a_leftover_generated_bundle_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game");
+        fs::create_dir_all(&game).unwrap();
+        write_test_ggpk_files(
+            &game.join("Content.ggpk"),
+            "Bundles2",
+            &[("_.index.bin", b"old-index".as_slice())],
+        );
+        for (bundle, index) in [
+            (b"first-bundle", b"first-index"),
+            (b"later-bundle", b"later-index"),
+        ] {
+            let store = BundleStore::new(&game);
+            let plan = store
+                .prepare_ggpk_patch("TinyPoe2Smoother_0", bundle, index)
+                .unwrap();
+            store.apply_ggpk_patch(&plan).unwrap();
+        }
+
+        let store = BundleStore::new(&game);
+        let bundles2 = ggpk_find_pdir(store.ggpk().unwrap(), "Bundles2")
+            .unwrap()
+            .unwrap();
+        let generated = bundles2
+            .entries
+            .iter()
+            .filter(|entry| entry.name == "TinyPoe2Smoother_0.bundle.bin")
+            .count();
+        assert_eq!(generated, 1);
+        assert_eq!(
+            store
+                .read_storage_file("Bundles2/TinyPoe2Smoother_0.bundle.bin")
+                .unwrap(),
+            b"later-bundle"
         );
     }
 
