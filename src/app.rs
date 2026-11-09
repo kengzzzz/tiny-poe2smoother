@@ -280,12 +280,6 @@ fn restore_backup_with_store(game_dir: PathBuf, backup: BackupStore) -> Result<R
         let entries = backup
             .entries()
             .with_context(|| format!("failed to read backup {}", backup.path().display()))?;
-        if entries.is_empty() {
-            bail!(
-                "backup exists but is empty at {}.\n  Check file integrity",
-                backup.path().display()
-            );
-        }
         let mut store = BundleStore::new(&game_dir);
         let patched = index_is_patched(&store.open_index().with_context(|| {
             format!(
@@ -308,6 +302,12 @@ fn restore_backup_with_store(game_dir: PathBuf, backup: BackupStore) -> Result<R
                 restored_files: 0,
                 backup_removed: true,
             });
+        }
+        if entries.is_empty() {
+            bail!(
+                "backup exists but is empty at {}.\n  Check file integrity",
+                backup.path().display()
+            );
         }
         let overlay_restore = matches!(
             detect_install_layout(&game_dir)?,
@@ -771,6 +771,31 @@ mod tests {
             assert!(!backup.has_backup());
             assert_eq!(fs::read(&source).unwrap(), original);
         }
+    }
+
+    #[test]
+    fn restore_clears_a_cut_off_backup_on_an_unpatched_install() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game");
+        write_shadow_fixture(&game, InstallLayout::LooseBundles);
+        let backup = BackupStore::for_path(temp.path().join("poe2.bak"));
+        let index = fs::read(game.join("Bundles2/_.index.bin")).unwrap();
+        backup
+            .ensure_original_bytes(&game, &[(PathBuf::from("Bundles2/_.index.bin"), index)])
+            .unwrap();
+        let len = fs::metadata(backup.path()).unwrap().len();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(backup.path())
+            .unwrap()
+            .set_len(len - 4)
+            .unwrap();
+        assert!(backup.entries().unwrap().is_empty());
+
+        let report = restore_backup_with_store(game, backup.clone()).unwrap();
+
+        assert!(report.backup_removed);
+        assert!(!backup.has_backup());
     }
 
     #[cfg(unix)]
