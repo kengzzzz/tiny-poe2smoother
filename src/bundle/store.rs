@@ -924,7 +924,12 @@ impl BundleStore {
         {
             // Undo our partial write so a later trim never has to guess.
             self.ggpk = None;
-            let _ = file.set_len(plan.backup.appended_start);
+            if file
+                .metadata()
+                .is_ok_and(|meta| meta.len() <= plan.backup.appended_end)
+            {
+                let _ = file.set_len(plan.backup.appended_start);
+            }
             return Err(err.into());
         }
 
