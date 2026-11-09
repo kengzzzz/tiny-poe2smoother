@@ -38,6 +38,7 @@ impl GgpkArchive {
 pub(super) struct GgpkFileSpan {
     pub(super) begin: usize,
     pub(super) len: usize,
+    pub(super) digest: [u8; 32],
 }
 
 pub(super) struct GgpkPatchPlan {
@@ -179,7 +180,8 @@ fn read_file_record(ggpk: &GgpkArchive, offset: u64) -> Result<(String, GgpkFile
         bail!("GGPK record at {offset} is not a file");
     }
     let _name_length = cursor.read_u32::<LittleEndian>()?;
-    cursor.seek(SeekFrom::Current(32))?;
+    let mut digest = [0u8; 32];
+    cursor.read_exact(&mut digest)?;
     let name = read_ggpk_string(&mut cursor, ggpk.use_utf32())?;
     let data_start = cursor.position() as usize;
     let record_end = usize::try_from(offset + record_size)?;
@@ -191,6 +193,7 @@ fn read_file_record(ggpk: &GgpkArchive, offset: u64) -> Result<(String, GgpkFile
         GgpkFileSpan {
             begin: data_start,
             len: record_end - data_start,
+            digest,
         },
     ))
 }

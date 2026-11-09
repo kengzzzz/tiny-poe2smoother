@@ -40,9 +40,18 @@ struct CacheKey {
     source: String,
     size: u64,
     mtime: u128,
+    // Mapped writes on Windows keep Content.ggpk's size and mtime, so the live index counts too.
+    index_record: Option<IndexRecord>,
 }
 
-const CACHE_MAGIC: &[u8; 4] = b"2SI6";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IndexRecord {
+    begin: u64,
+    len: u64,
+    digest: [u8; 32],
+}
+
+const CACHE_MAGIC: &[u8; 4] = b"2SI7";
 const CACHE_MIGRATION_MARKER: &str = "index-cache-v3.migrated";
 
 static SHARED_INDEX: Mutex<Option<(CacheKey, Weak<BundleIndex>)>> = Mutex::new(None);
@@ -163,12 +172,25 @@ fn parse_index_cache(mut reader: impl Read, len: u64, key: &CacheKey) -> Option<
     }
     let mut remaining = len.checked_sub(4)?;
     let cached_source = read_cache_section(&mut reader, &mut remaining)?;
-    remaining = remaining.checked_sub(24)?;
+    remaining = remaining.checked_sub(25)?;
     let cached_size = reader.read_u64::<LittleEndian>().ok()?;
     let cached_mtime = reader.read_u128::<LittleEndian>().ok()?;
+    let cached_record = match reader.read_u8().ok()? {
+        0 => None,
+        1 => {
+            remaining = remaining.checked_sub(48)?;
+            let begin = reader.read_u64::<LittleEndian>().ok()?;
+            let len = reader.read_u64::<LittleEndian>().ok()?;
+            let mut digest = [0u8; 32];
+            reader.read_exact(&mut digest).ok()?;
+            Some(IndexRecord { begin, len, digest })
+        }
+        _ => return None,
+    };
     if cached_source != key.source.as_bytes()
         || cached_size != key.size
         || cached_mtime != key.mtime
+        || cached_record != key.index_record
     {
         return None;
     }
@@ -240,15 +262,28 @@ fn read_path_blocks(
     Some(PathList::from_blocks(blocks, len))
 }
 
+fn write_cache_header(writer: &mut impl Write, key: &CacheKey) -> std::io::Result<()> {
+    writer.write_all(CACHE_MAGIC)?;
+    write_cache_section(writer, key.source.as_bytes())?;
+    writer.write_u64::<LittleEndian>(key.size)?;
+    writer.write_u128::<LittleEndian>(key.mtime)?;
+    match key.index_record {
+        Some(record) => {
+            writer.write_u8(1)?;
+            writer.write_u64::<LittleEndian>(record.begin)?;
+            writer.write_u64::<LittleEndian>(record.len)?;
+            writer.write_all(&record.digest)
+        }
+        None => writer.write_u8(0),
+    }
+}
+
 fn write_index_cache(
     writer: &mut impl Write,
     index: &BundleIndex,
     key: &CacheKey,
 ) -> std::io::Result<()> {
-    writer.write_all(CACHE_MAGIC)?;
-    write_cache_section(writer, key.source.as_bytes())?;
-    writer.write_u64::<LittleEndian>(key.size)?;
-    writer.write_u128::<LittleEndian>(key.mtime)?;
+    write_cache_header(writer, key)?;
     write_cache_section(writer, &index.raw_decompressed)?;
     // Paths compress about 4x, which halves the read on every cached start.
     let blocks = index.paths().blocks();
@@ -272,17 +307,13 @@ fn cache_writes() -> MutexGuard<'static, Vec<(PathBuf, JoinHandle<()>)>> {
     CACHE_WRITES.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn source_key(source_path: &std::path::Path, source: &str) -> Result<CacheKey> {
-    let meta = fs::metadata(source_path)?;
-    let mtime = meta
-        .modified()?
-        .duration_since(SystemTime::UNIX_EPOCH)?
-        .as_nanos();
-    Ok(CacheKey {
-        source: source.to_string(),
-        size: meta.len(),
-        mtime,
-    })
+fn file_meta(path: &std::path::Path) -> Result<Option<(u64, u128)>> {
+    let meta = fs::metadata(path)?;
+    Ok(meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| (meta.len(), d.as_nanos())))
 }
 
 /// Runs after the index is returned. It holds no game file handle or mapping, so Apply
@@ -330,12 +361,7 @@ impl CacheWrite {
                 writer.flush()
             },
             // The game may have updated while writing, so don't publish a stale snapshot.
-            || {
-                source_key(&self.source_path, &self.key.source)
-                    .ok()
-                    .as_ref()
-                    == Some(&self.key)
-            },
+            || file_meta(&self.source_path).ok().flatten() == Some((self.key.size, self.key.mtime)),
         )
     }
 }
@@ -441,25 +467,36 @@ impl BundleStore {
         }
     }
 
-    fn cache_key(&self) -> Result<Option<CacheKey>> {
-        let source_path = if matches!(self.layout, InstallLayout::ContentGgpk) {
-            &self.content_path
+    fn source_meta(&self) -> Result<Option<(u64, u128)>> {
+        if matches!(self.layout, InstallLayout::ContentGgpk) {
+            file_meta(&self.content_path)
         } else if self.index_path.exists() {
-            &self.index_path
+            file_meta(&self.index_path)
         } else {
+            Ok(None)
+        }
+    }
+
+    fn cache_key(&self) -> Result<Option<CacheKey>> {
+        let Some((size, mtime)) = self.source_meta()? else {
             return Ok(None);
         };
-        let meta = fs::metadata(source_path)?;
-        let size = meta.len();
-        Ok(meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-            .map(|d| CacheKey {
-                source: self.cache_source.clone(),
-                size,
-                mtime: d.as_nanos(),
-            }))
+        let mut index_record = None;
+        if matches!(self.layout, InstallLayout::ContentGgpk)
+            && let Some(ggpk) = self.ggpk.as_deref()
+        {
+            index_record = ggpk_find_file(ggpk, "Bundles2/_.index.bin")?.map(|span| IndexRecord {
+                begin: span.begin as u64,
+                len: span.len as u64,
+                digest: span.digest,
+            });
+        }
+        Ok(Some(CacheKey {
+            source: self.cache_source.clone(),
+            size,
+            mtime,
+            index_record,
+        }))
     }
 
     fn cache_path(&self) -> PathBuf {
@@ -472,10 +509,10 @@ impl BundleStore {
     /// Reopens held storage and returns the cache key for that snapshot. A GGPK
     /// can be replaced while an old mmap stays readable.
     fn refresh_source_snapshot(&mut self) -> Result<Option<CacheKey>> {
-        let key_before = self.cache_key()?;
         if matches!(self.layout, InstallLayout::ContentGgpk) {
+            let meta_before = self.source_meta()?;
             let ggpk = GgpkArchive::from_file(&self.content_path)?;
-            if self.cache_key()? != key_before {
+            if self.source_meta()? != meta_before {
                 bail!(
                     "game data changed while opening Content.ggpk. \
                      Wait for the standalone launcher to finish updating, then retry"
@@ -483,7 +520,7 @@ impl BundleStore {
             }
             self.ggpk = Some(Arc::new(ggpk));
         }
-        Ok(key_before)
+        self.cache_key()
     }
 
     fn ensure_source_unchanged(&self, source_key: Option<&CacheKey>, phase: &str) -> Result<()> {
@@ -1032,6 +1069,11 @@ pub(crate) mod tests {
             source: "src".to_string(),
             size: 1,
             mtime: 2,
+            index_record: Some(IndexRecord {
+                begin: 3,
+                len: 4,
+                digest: [5; 32],
+            }),
         }
     }
 
@@ -1052,10 +1094,7 @@ pub(crate) mod tests {
 
         // Valid magic + matching key, then corrupt lengths.
         let mut header = Vec::new();
-        header.extend_from_slice(CACHE_MAGIC);
-        write_cache_section(&mut header, key.source.as_bytes()).unwrap();
-        header.write_u64::<LittleEndian>(key.size).unwrap();
-        header.write_u128::<LittleEndian>(key.mtime).unwrap();
+        write_cache_header(&mut header, &key).unwrap();
 
         // Absurd raw_decompressed length: must be rejected, not allocated.
         let mut absurd_len = header.clone();
@@ -1177,6 +1216,43 @@ pub(crate) mod tests {
 
         assert!(!store.cache_path().exists());
         assert!(store.read_cache().is_none());
+    }
+
+    #[test]
+    fn ggpk_cache_misses_when_the_index_is_rewritten_in_place() {
+        let _slot = SHARED_SLOT_TESTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game");
+        fs::create_dir_all(&game).unwrap();
+        let content = game.join("Content.ggpk");
+        write_test_ggpk(
+            &content,
+            "Bundles2/_.index.bin",
+            &test_index_bytes(&["aaaa"]),
+        );
+        let cache = temp.path().join("cache");
+        let mut store = BundleStore::new_with_cache_dir(game.clone(), cache.clone());
+        assert!(store.open_shared_index().unwrap().has_bundle_prefix("aaaa"));
+        BundleStore::flush_cache_writes();
+        let span = ggpk_find_file(store.ggpk().unwrap(), "Bundles2/_.index.bin")
+            .unwrap()
+            .unwrap();
+        drop(store);
+
+        let mtime = fs::metadata(&content).unwrap().modified().unwrap();
+        let digest_pos = span.begin as u64 - utf16_nul_bytes("_.index.bin").len() as u64 - 32;
+        let mut file = fs::OpenOptions::new().write(true).open(&content).unwrap();
+        file.seek(SeekFrom::Start(span.begin as u64)).unwrap();
+        file.write_all(&test_index_bytes(&["bbbb"])).unwrap();
+        file.seek(SeekFrom::Start(digest_pos)).unwrap();
+        file.write_all(&[7; 32]).unwrap();
+        file.set_modified(mtime).unwrap();
+        drop(file);
+
+        let mut fresh = BundleStore::new_with_cache_dir(game, cache);
+        assert!(fresh.open_shared_index().unwrap().has_bundle_prefix("bbbb"));
     }
 
     #[test]

@@ -10,6 +10,7 @@
 - Standalone client: Restore and Apply no longer cut off game data that the launcher or another tool added after a failed Apply.
 - An Apply that fails before changing anything no longer leaves an old backup behind.
 - Standalone client: Apply no longer keeps an old patch file around that could make patched files unreadable after the game data changed.
+- Standalone client: the app now notices when the launcher repairs the game files, instead of still showing "Backup missing".
 - The effects editor no longer runs off the screen when the game isn't found or the window is small.
 - The effects summary on the main screen now updates right away when you switch to another game folder.
 
