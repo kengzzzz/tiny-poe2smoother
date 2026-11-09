@@ -126,12 +126,9 @@ fn ggpk_find_pdir_record(
                 return Ok(None);
             }
 
-            let entries_start = cursor.position();
-            for i in 0..entries_len {
-                let mut entry = Cursor::new(ggpk.mmap.as_ref());
-                entry.set_position(entries_start + u64::from(i) * 12 + 4);
-                let offset_pos = entry.position();
-                let child_offset = entry.read_u64::<LittleEndian>()?;
+            for (offset_pos, child_offset) in
+                lookup_order(ggpk, cursor.position(), entries_len, &path, wanted)?
+            {
                 if let Some(record) = ggpk_find_pdir_record(
                     ggpk,
                     child_offset,
@@ -150,6 +147,39 @@ fn ggpk_find_pdir_record(
     })();
     ancestors.pop();
     result
+}
+
+/// Each entry's offset slot and child offset. Entries whose stored hash matches the next path
+/// component come first, so a cold disk reads a few records instead of every sibling.
+fn lookup_order(
+    ggpk: &GgpkArchive,
+    entries_start: u64,
+    entries_len: u32,
+    path: &str,
+    wanted: &str,
+) -> Result<Vec<(u64, u64)>> {
+    let next = wanted
+        .get(path.len()..)
+        .unwrap_or_default()
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    let next_hash = ggpk_name_hash(next);
+    let mut cursor = Cursor::new(ggpk.mmap.as_ref());
+    cursor.set_position(entries_start);
+    let (mut hits, mut misses) = (Vec::new(), Vec::new());
+    for _ in 0..entries_len {
+        let hash = cursor.read_u32::<LittleEndian>()?;
+        let entry = (cursor.position(), cursor.read_u64::<LittleEndian>()?);
+        if hash == next_hash {
+            hits.push(entry);
+        } else {
+            misses.push(entry);
+        }
+    }
+    hits.append(&mut misses);
+    Ok(hits)
 }
 
 fn read_pdir_entries(
@@ -432,26 +462,9 @@ fn ggpk_find_record(
                 return Ok(None);
             }
 
-            let entries = (0..entries_len)
-                .map(|_| {
-                    Ok((
-                        cursor.read_u32::<LittleEndian>()?,
-                        cursor.read_u64::<LittleEndian>()?,
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let rest = wanted.get(path.len()..).unwrap_or_default();
-            let next = rest
-                .trim_start_matches('/')
-                .split('/')
-                .next()
-                .unwrap_or_default();
-            let next_hash = ggpk_name_hash(next);
-            // Try entries with the right name hash first. A cold disk then reads a few
-            // records instead of every sibling.
-            let hits = entries.iter().filter(|&&(hash, _)| hash == next_hash);
-            let misses = entries.iter().filter(|&&(hash, _)| hash != next_hash);
-            for &(_, child_offset) in hits.chain(misses) {
+            for (_, child_offset) in
+                lookup_order(ggpk, cursor.position(), entries_len, &path, wanted)?
+            {
                 if let Some(span) = ggpk_find_record(ggpk, child_offset, &path, wanted, ancestors)?
                 {
                     return Ok(Some(span));
@@ -767,6 +780,42 @@ mod tests {
         assert!(!tail_in_use(&bytes, offsets[1]));
         bytes[20..28].copy_from_slice(&offsets[0].to_le_bytes());
         assert!(tail_in_use(&bytes, offsets[1]));
+    }
+
+    #[test]
+    fn both_walkers_pick_the_same_duplicate_directory() {
+        let entry = |name_hash, offset| GgpkPdirEntry {
+            name: String::new(),
+            name_hash,
+            offset,
+        };
+        let dir = |file| ggpk_pdir_record("Bundles2", &[0; 32], &[entry(0, file)], false).unwrap();
+        let root_size = ggpk_pdir_record("", &[0; 32], &[entry(0, 0), entry(0, 0)], false)
+            .unwrap()
+            .len() as u64;
+        let first = 28 + root_size;
+        let second = first + dir(0).len() as u64;
+        let first_file = second + dir(0).len() as u64;
+        let index = |data: &[u8]| ggpk_file_record("_.index.bin", data, false).unwrap();
+        let second_file = first_file + index(b"aaaa").len() as u64;
+        let root_entries = [entry(0, first), entry(ggpk_name_hash("Bundles2"), second)];
+        let mut bytes = root(&[28, 28]);
+        bytes.extend(ggpk_pdir_record("", &[0; 32], &root_entries, false).unwrap());
+        bytes.extend(dir(first_file));
+        bytes.extend(dir(second_file));
+        bytes.extend(index(b"aaaa"));
+        bytes.extend(index(b"bbbb"));
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Content.ggpk");
+        fs::write(&path, bytes).unwrap();
+        let archive = GgpkArchive::from_file(&path).unwrap();
+
+        let span = ggpk_find_file(&archive, "Bundles2/_.index.bin")
+            .unwrap()
+            .unwrap();
+        assert_eq!(&archive.mmap[span.begin..span.begin + span.len], b"bbbb");
+        let pdir = ggpk_find_pdir(&archive, "Bundles2").unwrap().unwrap();
+        assert_eq!(pdir.offset, second);
     }
 
     #[test]
