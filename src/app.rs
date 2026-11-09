@@ -227,6 +227,9 @@ fn apply_patches_with_store(request: PatchRequest, backup: BackupStore) -> Resul
 
         backup
             .ensure_original_bytes(&game_dir, &rel_paths)
+            .inspect_err(|_| {
+                let _ = backup.remove();
+            })
             .with_context(|| {
                 format!(
                     "failed to create backup at {}.\n  Check disk space and permissions",

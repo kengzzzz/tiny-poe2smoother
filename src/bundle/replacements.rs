@@ -56,7 +56,11 @@ pub fn apply_bundle_replacements(
         let plan = store.prepare_ggpk_patch(&custom_bundle_name, &out, &index_bytes)?;
         let backup =
             backup.ok_or_else(|| anyhow!("standalone GGPK patch requires a backup store"))?;
-        backup.ensure_ggpk_backup_meta(&store.game_dir, plan.backup)?;
+        backup
+            .ensure_ggpk_backup_meta(&store.game_dir, plan.backup)
+            .inspect_err(|_| {
+                let _ = backup.remove();
+            })?;
         if let Err(err) = store.apply_ggpk_patch(&plan) {
             if store.ggpk_untouched(plan.backup) {
                 let _ = backup.remove();
