@@ -5,7 +5,7 @@ use super::compression::{
 use super::ggpk::{
     GgpkArchive, GgpkFileSpan, GgpkPatchPlan, GgpkPdirEntry, ggpk_file_at, ggpk_file_record,
     ggpk_find_file, ggpk_find_pdir, ggpk_name_hash, ggpk_pdir_at, ggpk_pdir_record,
-    ggpk_tail_in_use,
+    ggpk_records_freed, ggpk_tail_in_use,
 };
 use super::hashing::hash_fnv1a;
 use super::index::{BundleFile, BundleIndex, PathList};
@@ -860,7 +860,7 @@ impl BundleStore {
         let new_bundles2_offset = custom_offset + u64::try_from(custom_record.len())?;
 
         let mut entries = bundles2.entries.clone();
-        // A launcher repair can replace our index but keep our old bundle entry.
+        // Another tool can replace our index but keep our old bundle entry.
         entries.retain(|entry| {
             let name = entry.name.to_ascii_lowercase();
             !(name.starts_with("tinypoe2smoother_") && name.ends_with(".bundle.bin"))
@@ -974,13 +974,17 @@ impl BundleStore {
         let original = ggpk_pdir_at(ggpk, meta.original_bundles2_offset)?
             .filter(|pdir| pdir.name == live.name && pdir.digest == live.digest)
             .context("the original Bundles2 directory is gone")?;
-        let span = original
+        let index_offset = original
             .entries
             .iter()
             .find(|entry| entry.name.eq_ignore_ascii_case("_.index.bin"))
-            .and_then(|entry| ggpk_file_at(ggpk, entry.offset).transpose())
-            .transpose()?
+            .map(|entry| entry.offset)
             .context("the original index is gone")?;
+        let span = ggpk_file_at(ggpk, index_offset)?.context("the original index is gone")?;
+        // Freeing a record next to free space can leave its old bytes readable.
+        if ggpk_records_freed(ggpk, &[original.offset, index_offset]) {
+            bail!("the original Bundles2 directory was freed");
+        }
         let bytes = &ggpk.mmap[span.begin..span.begin + span.len];
         BundleIndex::parse(decompress_bundle(bytes)?).context("the original index is damaged")
     }
@@ -995,7 +999,7 @@ impl BundleStore {
         if ggpk_tail_in_use(
             &GgpkArchive::from_file(&self.content_path)?,
             meta.appended_start,
-        )? {
+        ) {
             return Ok(false);
         }
         // Fails on Windows while any process maps the file.

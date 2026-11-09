@@ -236,59 +236,94 @@ pub(super) fn ggpk_file_at(ggpk: &GgpkArchive, offset: u64) -> Result<Option<Ggp
     read_file_record(ggpk, offset).map(|(_, span)| Some(span))
 }
 
+fn record_header(data: &[u8], offset: u64) -> Option<(u64, [u8; 4])> {
+    let start = usize::try_from(offset).ok()?;
+    let bytes = data.get(start..start.checked_add(8)?)?;
+    Some((
+        u64::from(u32::from_le_bytes(bytes[..4].try_into().ok()?)),
+        bytes[4..8].try_into().ok()?,
+    ))
+}
+
+fn u64_at(data: &[u8], offset: u64) -> Option<u64> {
+    let start = usize::try_from(offset).ok()?;
+    Some(u64::from_le_bytes(
+        data.get(start..start.checked_add(8)?)?.try_into().ok()?,
+    ))
+}
+
+/// The header's children, or None when one is unreadable.
+fn header_children(data: &[u8]) -> Option<Vec<(u64, u64, [u8; 4])>> {
+    let (header_size, _) = record_header(data, 0)?;
+    (0..header_size.saturating_sub(12) / 8)
+        .map(|i| {
+            let offset = u64_at(data, 12 + i * 8)?;
+            let (size, tag) = record_header(data, offset)?;
+            Some((offset, offset.saturating_add(size), tag))
+        })
+        .collect()
+}
+
+/// Start and end of every FREE record, or None when the chain is broken.
+fn free_spans(data: &[u8]) -> Option<Vec<(u64, u64)>> {
+    let mut next = header_children(data)?
+        .into_iter()
+        .find(|&(_, _, tag)| &tag == b"FREE")
+        .map_or(0, |(offset, _, _)| offset);
+    let mut spans = Vec::new();
+    let mut seen = HashSet::new();
+    while next != 0 {
+        let (size, tag) = record_header(data, next)?;
+        if &tag != b"FREE" || !seen.insert(next) {
+            return None;
+        }
+        spans.push((next, next.saturating_add(size)));
+        next = u64_at(data, next + 8)?;
+    }
+    Some(spans)
+}
+
+/// True when a record at one of `offsets` overlaps a FREE record, or the chain is broken.
+pub(super) fn ggpk_records_freed(ggpk: &GgpkArchive, offsets: &[u64]) -> bool {
+    let data = ggpk.mmap.as_ref();
+    let Some(free) = free_spans(data) else {
+        return true;
+    };
+    offsets.iter().any(|&offset| {
+        record_header(data, offset).is_none_or(|(size, _)| {
+            let end = offset.saturating_add(size);
+            free.iter()
+                .any(|&(free_start, free_end)| offset < free_end && free_start < end)
+        })
+    })
+}
+
 /// True when cutting the file at `tail_start` would lose data. Only our appended index, bundle
-/// and Bundles2 records may sit there, and only the root and Bundles2 can point at those names.
-pub(super) fn ggpk_tail_in_use(ggpk: &GgpkArchive, tail_start: u64) -> Result<bool> {
+/// and Bundles2 records may sit there, and only the root or Bundles2 may point at them.
+pub(super) fn ggpk_tail_in_use(ggpk: &GgpkArchive, tail_start: u64) -> bool {
     let data = ggpk.mmap.as_ref();
     let len = data.len() as u64;
-    let header = |offset: u64| -> Option<(u64, [u8; 4])> {
-        let start = usize::try_from(offset).ok()?;
-        let bytes = data.get(start..start.checked_add(8)?)?;
-        Some((
-            u64::from(u32::from_le_bytes(bytes[..4].try_into().ok()?)),
-            bytes[4..8].try_into().ok()?,
-        ))
-    };
-    let u64_at = |offset: u64| -> Result<u64> {
-        let start = usize::try_from(offset)?;
-        let bytes = data
-            .get(start..start + 8)
-            .context("GGPK pointer outside the file")?;
-        Ok(u64::from_le_bytes(bytes.try_into()?))
+    let crosses = |offset: u64| {
+        record_header(data, offset).is_none_or(|(size, _)| offset.saturating_add(size) > tail_start)
     };
 
-    let Some((header_size, _)) = header(0) else {
-        return Ok(true);
+    let Some(children) = header_children(data) else {
+        return true;
     };
-    let mut root = None;
-    let mut free = None;
-    for i in 0..header_size.saturating_sub(12) / 8 {
-        let child = u64_at(12 + i * 8)?;
-        match header(child) {
-            Some((size, _)) if child.saturating_add(size) > tail_start => return Ok(true),
-            Some((_, tag)) if &tag == b"PDIR" => root = Some(child),
-            Some((_, tag)) if &tag == b"FREE" => free = Some(child),
-            Some(_) => {}
-            None => return Ok(true),
-        }
+    if children.iter().any(|&(_, end, _)| end > tail_start)
+        || free_spans(data).is_none_or(|free| free.iter().any(|&(_, end)| end > tail_start))
+    {
+        return true;
     }
-
-    let mut seen = HashSet::new();
-    while let Some(offset) = free.filter(|&offset| offset != 0) {
-        let Some((size, tag)) = header(offset) else {
-            return Ok(true);
-        };
-        if &tag != b"FREE" || offset.saturating_add(size) > tail_start || !seen.insert(offset) {
-            return Ok(true);
-        }
-        free = Some(u64_at(offset + 8)?);
-    }
-
-    let Some(root) = root.and_then(|offset| ggpk_pdir_at(ggpk, offset).ok().flatten()) else {
-        return Ok(true);
+    let Some(root) = children
+        .iter()
+        .find(|&&(_, _, tag)| &tag == b"PDIR")
+        .and_then(|&(offset, _, _)| ggpk_pdir_at(ggpk, offset).ok().flatten())
+    else {
+        return true;
     };
-    if root.entries.iter().any(|entry| entry.offset >= tail_start) {
-        return Ok(true);
+    if root.entries.iter().any(|entry| crosses(entry.offset)) {
+        return true;
     }
     let Some(bundles2) = root
         .entries
@@ -296,14 +331,10 @@ pub(super) fn ggpk_tail_in_use(ggpk: &GgpkArchive, tail_start: u64) -> Result<bo
         .find(|entry| entry.name == "Bundles2")
         .and_then(|entry| ggpk_pdir_at(ggpk, entry.offset).ok().flatten())
     else {
-        return Ok(true);
+        return true;
     };
-    if bundles2
-        .entries
-        .iter()
-        .any(|entry| entry.offset >= tail_start)
-    {
-        return Ok(true);
+    if bundles2.entries.iter().any(|entry| crosses(entry.offset)) {
+        return true;
     }
 
     let expected: [fn(&[u8; 4], &str) -> bool; 3] = [
@@ -317,27 +348,32 @@ pub(super) fn ggpk_tail_in_use(ggpk: &GgpkArchive, tail_start: u64) -> Result<bo
     let mut offset = tail_start;
     for matches in expected {
         if offset >= len {
-            return Ok(false);
+            return false;
         }
         // An interrupted Apply can leave the last record cut short or the rest zero filled.
-        let Some((size, tag)) = header(offset) else {
-            return Ok(false);
+        let Some((size, tag)) = record_header(data, offset) else {
+            return offset == tail_start;
         };
         if size == 0 && tag == [0; 4] {
-            return Ok(data[offset as usize..].iter().any(|&byte| byte != 0));
+            return data[offset as usize..].iter().any(|&byte| byte != 0);
         }
         if (&tag != b"FILE" && &tag != b"PDIR") || size < 8 {
-            return Ok(true);
+            return true;
+        }
+        // Our FILE records keep an all-zero digest. Other tools write a real one.
+        let digest = data.get(offset as usize + 12..).unwrap_or_default();
+        if &tag == b"FILE" && digest.iter().take(32).any(|&byte| byte != 0) {
+            return true;
         }
         let complete = offset.saturating_add(size) <= len;
         match ggpk_record_name(ggpk, offset) {
             Ok(name) if matches(&tag, &name) => {}
-            Ok(_) => return Ok(true),
-            Err(_) => return Ok(complete),
+            Ok(_) => return true,
+            Err(_) => return complete,
         }
         offset = offset.saturating_add(size);
     }
-    Ok(offset < len)
+    offset < len
 }
 
 fn check_traversal_offset(ggpk: &GgpkArchive, offset: u64, ancestors: &[u64]) -> Result<()> {
@@ -608,30 +644,115 @@ mod tests {
         assert_bad_traversal(&root(&[u64::MAX]), "outside");
     }
 
-    #[test]
-    fn a_free_record_in_the_tail_counts_as_in_use() {
-        let bundles2 = ggpk_pdir_record("Bundles2", &[0; 32], &[], false).unwrap();
-        let root_size = ggpk_pdir_record("", &[0; 32], &[], false).unwrap().len() + 12;
-        let entry = GgpkPdirEntry {
-            name: "Bundles2".into(),
-            name_hash: ggpk_name_hash("Bundles2"),
-            offset: (28 + root_size) as u64,
-        };
-        let root_pdir = ggpk_pdir_record("", &[0; 32], &[entry], false).unwrap();
-        let free = (28 + root_size + bundles2.len()) as u64;
-        let mut bytes = root(&[28, free]);
-        bytes.extend_from_slice(&root_pdir);
-        bytes.extend_from_slice(&bundles2);
-        bytes.extend_from_slice(&16u32.to_le_bytes());
+    fn free(size: u32) -> Vec<u8> {
+        let mut bytes = size.to_le_bytes().to_vec();
         bytes.extend_from_slice(b"FREE");
         bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes
+    }
+
+    fn file(name: &str, digest: u8, data: &[u8]) -> Vec<u8> {
+        let mut bytes = ggpk_file_record(name, data, false).unwrap();
+        bytes[12..44].fill(digest);
+        bytes
+    }
+
+    /// An archive whose Bundles2 lists `referenced`, followed by `records`. Returns the bytes
+    /// and each record's offset.
+    fn build(
+        records: &[Vec<u8>],
+        referenced: &[usize],
+        free_head: Option<usize>,
+    ) -> (Vec<u8>, Vec<u64>) {
+        let entry = |offset| GgpkPdirEntry {
+            name: String::new(),
+            name_hash: 0,
+            offset,
+        };
+        let root_size = ggpk_pdir_record("", &[0; 32], &[entry(0)], false)
+            .unwrap()
+            .len() as u64;
+        let bundles2_size = ggpk_pdir_record(
+            "Bundles2",
+            &[0; 32],
+            &vec![entry(0); referenced.len()],
+            false,
+        )
+        .unwrap()
+        .len() as u64;
+        let mut next = 28 + root_size + bundles2_size;
+        let offsets = records
+            .iter()
+            .map(|record| {
+                next += record.len() as u64;
+                next - record.len() as u64
+            })
+            .collect::<Vec<_>>();
+        let entries = referenced
+            .iter()
+            .map(|&i| entry(offsets[i]))
+            .collect::<Vec<_>>();
+        let mut bytes = root(&[28, free_head.map_or(0, |i| offsets[i])]);
+        bytes.extend(ggpk_pdir_record("", &[0; 32], &[entry(28 + root_size)], false).unwrap());
+        bytes.extend(ggpk_pdir_record("Bundles2", &[0; 32], &entries, false).unwrap());
+        bytes.extend(records.concat());
+        (bytes, offsets)
+    }
+
+    fn tail_in_use(bytes: &[u8], tail_start: u64) -> bool {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("Content.ggpk");
-        fs::write(&path, &bytes).unwrap();
-        let archive = GgpkArchive::from_file(&path).unwrap();
+        fs::write(&path, bytes).unwrap();
+        ggpk_tail_in_use(&GgpkArchive::from_file(&path).unwrap(), tail_start)
+    }
 
-        assert!(ggpk_tail_in_use(&archive, free).unwrap());
-        assert!(!ggpk_tail_in_use(&archive, bytes.len() as u64).unwrap());
+    #[test]
+    fn a_free_record_in_the_tail_counts_as_in_use() {
+        let (bytes, offsets) = build(&[free(16)], &[], Some(0));
+        assert!(tail_in_use(&bytes, offsets[0]));
+        assert!(!tail_in_use(&bytes, bytes.len() as u64));
+
+        let index = file("_.index.bin", 0, &free(16));
+        let (mut bytes, offsets) = build(&[free(16), index], &[], Some(0));
+        let len = bytes.len() as u64;
+        assert!(!tail_in_use(&bytes, offsets[1]));
+        let link = offsets[0] as usize + 8;
+        bytes[link..link + 8].copy_from_slice(&(len - 16).to_le_bytes());
+        assert!(tail_in_use(&bytes, offsets[1]));
+    }
+
+    #[test]
+    fn a_live_record_that_crosses_the_cut_counts_as_in_use() {
+        let index = file("_.index.bin", 0, &[0; 32]);
+        for (referenced, in_use) in [(&[][..], false), (&[0][..], true)] {
+            let (bytes, _) = build(std::slice::from_ref(&index), referenced, None);
+            assert_eq!(tail_in_use(&bytes, bytes.len() as u64 - 16), in_use);
+        }
+    }
+
+    #[test]
+    fn only_our_records_may_sit_in_the_tail() {
+        for (digest, in_use) in [(0, false), (7, true)] {
+            let (bytes, offsets) = build(&[file("_.index.bin", digest, b"index")], &[], None);
+            assert_eq!(tail_in_use(&bytes, offsets[0]), in_use);
+        }
+        let (bytes, offsets) = build(&[file("_.index.bin", 0, b"index"), vec![1; 4]], &[], None);
+        assert!(!tail_in_use(&bytes, offsets[0]));
+        assert!(tail_in_use(&bytes, offsets[1]));
+    }
+
+    #[test]
+    fn records_inside_free_space_count_as_freed() {
+        let orphan = ggpk_pdir_record("Bundles2", &[0; 32], &[], false).unwrap();
+        let (bytes, offsets) = build(&[free(16 + orphan.len() as u32), orphan], &[], Some(0));
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Content.ggpk");
+        fs::write(&path, bytes).unwrap();
+        let archive = GgpkArchive::from_file(&path).unwrap();
+        let live = ggpk_find_pdir(&archive, "Bundles2").unwrap().unwrap();
+
+        assert!(ggpk_records_freed(&archive, &[offsets[1]]));
+        assert!(!ggpk_records_freed(&archive, &[live.offset]));
     }
 
     #[test]
