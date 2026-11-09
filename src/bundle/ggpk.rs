@@ -340,7 +340,9 @@ pub(super) fn ggpk_tail_in_use(ggpk: &GgpkArchive, tail_start: u64) -> bool {
     let data = ggpk.mmap.as_ref();
     let len = data.len() as u64;
     let crosses = |offset: u64| {
-        record_header(data, offset).is_none_or(|(size, _)| offset.saturating_add(size) > tail_start)
+        offset >= tail_start
+            || record_header(data, offset)
+                .is_none_or(|(size, _)| offset.saturating_add(size) > tail_start)
     };
 
     let Some(children) = header_children(data) else {
