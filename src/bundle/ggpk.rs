@@ -84,12 +84,12 @@ fn ggpk_find_pdir_record(
     let mut cursor = Cursor::new(ggpk.mmap.as_ref());
     cursor.set_position(offset);
 
-    let _record_size = cursor.read_u32::<LittleEndian>()? as u64;
+    let record_size = cursor.read_u32::<LittleEndian>()? as u64;
     let record_tag = read_ggpk_record_tag(&mut cursor)?;
     let result = (|| match record_tag.as_str() {
         "GGPK" => {
             let _version = cursor.read_u32::<LittleEndian>()?;
-            let records = (_record_size.saturating_sub(12)) / 8;
+            let records = (record_size.saturating_sub(12)) / 8;
             for _ in 0..records {
                 let child_offset_pos = cursor.position();
                 let child_offset = cursor.read_u64::<LittleEndian>()?;
@@ -126,8 +126,9 @@ fn ggpk_find_pdir_record(
                 return Ok(None);
             }
 
+            let entries = (cursor.position(), entries_len);
             for (offset_pos, child_offset) in
-                lookup_order(ggpk, cursor.position(), entries_len, &path, wanted)?
+                lookup_order(ggpk, entries, offset + record_size, &path, wanted)
             {
                 if let Some(record) = ggpk_find_pdir_record(
                     ggpk,
@@ -149,14 +150,15 @@ fn ggpk_find_pdir_record(
     result
 }
 
-/// Entries with a matching name hash come first, so a cold disk reads less.
-fn lookup_order(
-    ggpk: &GgpkArchive,
-    entries_start: u64,
-    entries_len: u32,
+/// Hash matches first, so a cold disk reads less. Capped by the record size.
+fn lookup_order<'a>(
+    ggpk: &'a GgpkArchive,
+    entries: (u64, u32),
+    record_end: u64,
     path: &str,
     wanted: &str,
-) -> Result<Vec<(u64, u64)>> {
+) -> impl Iterator<Item = (u64, u64)> + 'a {
+    let (entries_start, entries_len) = entries;
     let next = wanted
         .get(path.len()..)
         .unwrap_or_default()
@@ -165,20 +167,24 @@ fn lookup_order(
         .next()
         .unwrap_or_default();
     let next_hash = ggpk_name_hash(next);
-    let mut cursor = Cursor::new(ggpk.mmap.as_ref());
-    cursor.set_position(entries_start);
-    let (mut hits, mut misses) = (Vec::new(), Vec::new());
-    for _ in 0..entries_len {
-        let hash = cursor.read_u32::<LittleEndian>()?;
-        let entry = (cursor.position(), cursor.read_u64::<LittleEndian>()?);
-        if hash == next_hash {
-            hits.push(entry);
-        } else {
-            misses.push(entry);
-        }
-    }
-    hits.append(&mut misses);
-    Ok(hits)
+    let data: &[u8] = ggpk.mmap.as_ref();
+    let room = record_end
+        .min(data.len() as u64)
+        .saturating_sub(entries_start)
+        / 12;
+    let entry = move |i: u64| {
+        let at = (entries_start + i * 12) as usize;
+        let hash = u32::from_le_bytes(data[at..at + 4].try_into().expect("12-byte entry"));
+        let child = u64::from_le_bytes(data[at + 4..at + 12].try_into().expect("12-byte entry"));
+        (hash, at as u64 + 4, child)
+    };
+    let pass = move |hit: bool| {
+        (0..u64::from(entries_len).min(room))
+            .map(entry)
+            .filter(move |&(hash, _, _)| (hash == next_hash) == hit)
+            .map(|(_, slot, child)| (slot, child))
+    };
+    pass(true).chain(pass(false))
 }
 
 fn read_pdir_entries(
@@ -460,8 +466,9 @@ fn ggpk_find_record(
                 return Ok(None);
             }
 
+            let entries = (cursor.position(), entries_len);
             for (_, child_offset) in
-                lookup_order(ggpk, cursor.position(), entries_len, &path, wanted)?
+                lookup_order(ggpk, entries, offset + record_size, &path, wanted)
             {
                 if let Some(span) = ggpk_find_record(ggpk, child_offset, &path, wanted, ancestors)?
                 {
@@ -813,6 +820,24 @@ mod tests {
         assert_eq!(&archive.mmap[span.begin..span.begin + span.len], b"bbbb");
         let pdir = ggpk_find_pdir(&archive, "Bundles2").unwrap().unwrap();
         assert_eq!(pdir.offset, second);
+    }
+
+    #[test]
+    fn a_bad_entry_count_does_not_hide_the_index() {
+        let index = file("_.index.bin", 0, b"index");
+        let (mut bytes, _) = build(&[index], &[0], None);
+        bytes[28 + 12..28 + 16].copy_from_slice(&0x0100_0000u32.to_le_bytes());
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Content.ggpk");
+        fs::write(&path, bytes).unwrap();
+        let archive = GgpkArchive::from_file(&path).unwrap();
+
+        assert!(
+            ggpk_find_file(&archive, "Bundles2/_.index.bin")
+                .unwrap()
+                .is_some()
+        );
+        assert!(ggpk_find_pdir(&archive, "Bundles2").unwrap().is_some());
     }
 
     #[test]
