@@ -62,12 +62,14 @@ impl BackupStore {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&path)
+            // A read handle locks too, and an elevated run can leave a read-only lock file.
+            fs::File::open(&path).or_else(|_| {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&path)
+            })
         };
         let file = open().with_context(|| {
             format!(
@@ -387,6 +389,21 @@ mod tests {
             format!("{err:#}").contains("Check disk space and permissions"),
             "{err:#}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_works_with_a_read_only_lock_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let store = BackupStore::for_path(temp.path().join("poe2.bak"));
+        let lock_path = store.path().with_extension("lock");
+        fs::write(&lock_path, b"").unwrap();
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o444)).unwrap();
+
+        let lock = store.lock().unwrap();
+        assert!(store.lock().is_err());
+        drop(lock);
     }
 
     #[test]
