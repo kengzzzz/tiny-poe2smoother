@@ -9,6 +9,9 @@ const EDGE_GAIN: f32 = 12.0;
 /// The minimap shaders double visibility, so a floor of 0.5 already looks fully explored.
 const VISIBILITY_GAIN: f32 = 2.0;
 
+/// Near full reveal, rounding makes the border glow flicker.
+const EDGE_GLOW_CUTOFF: f32 = 0.95;
+
 const FULLY_REVEALED: &str = "res_color = float4(1.0f, 0.0f, 0.0f, 1.0f);";
 
 static FLOOR_LINE: LazyLock<Regex> =
@@ -18,6 +21,12 @@ static WALKABLE_COLOR: LazyLock<Regex> =
 static EDGE_LERP: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"float4 walkability_map_color = lerp\(walkable_color, float4\([^)]*\), walkable_to_edge_ratio\);",
+    )
+    .unwrap()
+});
+static UNEXPLORED_EDGE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"float unexplored_edge = (?:0\.0f|saturate\([^\r\n]* \* 4\.0f \* saturate\(2\.0f - 2\.0f \* walkable_dist\)\));",
     )
     .unwrap()
 });
@@ -81,10 +90,31 @@ pub(super) fn recolor(text: &str, style: &MinimapStyle) -> String {
         "float4 walkability_map_color = lerp(walkable_color, {}, walkable_to_edge_ratio);",
         hlsl_float4([r * EDGE_GAIN, g * EDGE_GAIN, b * EDGE_GAIN, a])
     );
+    let glow = unexplored_edge(style.reveal);
     let text = WALKABLE_COLOR.replace(text, regex::NoExpand(&walkable));
-    EDGE_LERP
-        .replace(&text, regex::NoExpand(&edge))
+    let text = EDGE_LERP.replace(&text, regex::NoExpand(&edge));
+    UNEXPLORED_EDGE
+        .replace(&text, regex::NoExpand(&glow))
         .into_owned()
+}
+
+/// Without this, Reveal near 50% turns all unexplored terrain blue.
+fn unexplored_edge(reveal: f32) -> String {
+    let Some(scale) = edge_scale(reveal) else {
+        return "float unexplored_edge = 0.0f;".to_string();
+    };
+    let edge = format!(
+        "saturate((visibility - {}f) * {}f)",
+        hlsl_float(reveal),
+        hlsl_float(scale)
+    );
+    format!(
+        "float unexplored_edge = saturate({edge} * (1.0f - {edge}) * 4.0f * saturate(2.0f - 2.0f * walkable_dist));"
+    )
+}
+
+fn edge_scale(reveal: f32) -> Option<f32> {
+    (reveal < EDGE_GLOW_CUTOFF).then(|| 1.0 / (1.0 - reveal))
 }
 
 fn hlsl_float4(values: [f32; 4]) -> String {
@@ -108,7 +138,17 @@ mod tests {
     use super::*;
 
     const VISIBILITY: &str = "void main()\r\n{\r\n\tif (revealed)\r\n\t\tres_color = float4(1.0f, 0.0f, 0.0f, 1.0f);\r\n\treturn res_color;\r\n}";
-    const BLENDING: &str = "\tfloat4 walkable_color = float4(1.0f, 1.0f, 1.0f, 0.01f);\r\n\tfloat4 walkability_map_color = lerp(walkable_color, float4(0.5f, 0.5f, 1.0f, 0.5f), walkable_to_edge_ratio);\r\n";
+    const BLENDING: &str = "\tfloat4 walkable_color = float4(1.0f, 1.0f, 1.0f, 0.01f);\r\n\tfloat4 walkability_map_color = lerp(walkable_color, float4(0.5f, 0.5f, 1.0f, 0.5f), walkable_to_edge_ratio);\r\n\tfloat unexplored_edge = saturate(visibility * (1.0f - visibility) * 4.0f * saturate(2.0f - 2.0f * walkable_dist));\r\n";
+
+    fn shader_glow(reveal: f32, visibility: f32) -> f32 {
+        let Some(scale) = edge_scale(reveal) else {
+            return 0.0;
+        };
+        let offset: f32 = hlsl_float(reveal).parse().unwrap();
+        let scale: f32 = hlsl_float(scale).parse().unwrap();
+        let edge = ((visibility - offset) * scale).clamp(0.0, 1.0);
+        (edge * (1.0 - edge) * 4.0).clamp(0.0, 1.0).powf(25.0)
+    }
 
     #[test]
     fn default_style_reproduces_the_fixed_patch_lines() {
@@ -119,7 +159,7 @@ mod tests {
         );
         assert_eq!(
             recolor(BLENDING, &style),
-            "\tfloat4 walkable_color = float4(0.0f, 0.0f, 0.0f, 0.3f);\r\n\tfloat4 walkability_map_color = lerp(walkable_color, float4(12.0f, 12.0f, 12.0f, 0.1f), walkable_to_edge_ratio);\r\n"
+            "\tfloat4 walkable_color = float4(0.0f, 0.0f, 0.0f, 0.3f);\r\n\tfloat4 walkability_map_color = lerp(walkable_color, float4(12.0f, 12.0f, 12.0f, 0.1f), walkable_to_edge_ratio);\r\n\tfloat unexplored_edge = saturate(saturate((visibility - 0.36f) * 1.5625f) * (1.0f - saturate((visibility - 0.36f) * 1.5625f)) * 4.0f * saturate(2.0f - 2.0f * walkable_dist));\r\n"
         );
     }
 
@@ -147,6 +187,39 @@ mod tests {
         assert!(recolored.contains(
             "lerp(walkable_color, float4(6.0f, 0.0f, 12.0f, 1.0f), walkable_to_edge_ratio)"
         ));
+        assert_eq!(recolored.matches("float unexplored_edge").count(), 1);
+        assert!(recolored.contains("(visibility - 0.36f) * 1.5625f"));
+
+        let full = MinimapStyle {
+            reveal: 1.0,
+            ..MinimapStyle::DEFAULT
+        };
+        let no_glow = recolor(&recolored, &full);
+        assert!(no_glow.contains("\tfloat unexplored_edge = 0.0f;\r\n"));
+        let back = recolor(&no_glow, &MinimapStyle::DEFAULT);
+        assert_eq!(back, recolor(BLENDING, &MinimapStyle::DEFAULT));
+    }
+
+    #[test]
+    fn border_glow_stays_off_unexplored_and_explored_terrain() {
+        for step in 0..=100 {
+            let reveal = step as f32 / 100.0;
+            let stored: f32 = hlsl_float(reveal / VISIBILITY_GAIN).parse().unwrap();
+            let floor = stored * VISIBILITY_GAIN;
+            for visibility in [floor - 1.0 / 255.0, floor, floor + 1.0 / 255.0] {
+                let glow = shader_glow(reveal, visibility.clamp(0.0, 1.0));
+                assert!(
+                    glow < 0.01,
+                    "reveal {reveal} visibility {visibility} glow {glow}"
+                );
+            }
+            let explored = shader_glow(reveal, 1.0);
+            assert!(explored < 1e-6, "reveal {reveal} explored glow {explored}");
+            if reveal < EDGE_GLOW_CUTOFF {
+                let border = shader_glow(reveal, (1.0 + reveal) / 2.0);
+                assert!(border > 0.99, "reveal {reveal} border glow {border}");
+            }
+        }
     }
 
     #[test]

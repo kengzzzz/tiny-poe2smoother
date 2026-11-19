@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+- Minimap: unexplored areas no longer turn blue when Reveal is set around 50%.
+
 ## 0.8.1 - 2026-11-09
 
 ### Changes
