@@ -216,7 +216,7 @@ mod tests {
             let explored = shader_glow(reveal, 1.0);
             assert!(explored < 1e-6, "reveal {reveal} explored glow {explored}");
             if reveal < EDGE_GLOW_CUTOFF {
-                let border = shader_glow(reveal, (1.0 + reveal) / 2.0);
+                let border = shader_glow(reveal, f32::midpoint(1.0, reveal));
                 assert!(border > 0.99, "reveal {reveal} border glow {border}");
             }
         }

@@ -497,7 +497,7 @@ mod tests {
     use super::*;
 
     fn names(list: &[&str]) -> Vec<String> {
-        list.iter().map(|name| name.to_string()).collect()
+        list.iter().map(ToString::to_string).collect()
     }
 
     #[test]
@@ -551,7 +551,7 @@ mod tests {
         edited.set(PatchId::Atmosphere, "bloom", true);
         assert!(!clarity.matches(&selected, &edited));
 
-        let mut extra = selected.clone();
+        let mut extra = selected;
         extra.insert(PatchId::Camera);
         assert!(!clarity.matches(&extra, &options));
     }

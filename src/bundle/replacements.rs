@@ -6,7 +6,6 @@ use crate::backup::BackupStore;
 use crate::install::InstallLayout;
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::HashMap;
-use std::convert::TryFrom;
 use std::fs;
 use std::path::PathBuf;
 

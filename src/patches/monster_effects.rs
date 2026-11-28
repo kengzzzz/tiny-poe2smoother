@@ -69,7 +69,7 @@ fn search_aliases_for(monster_keys: &[String]) -> Vec<String> {
     MONSTER_SEARCH_ALIASES
         .iter()
         .filter(|(key, _)| monster_keys.iter().any(|k| k == key))
-        .flat_map(|(_, aliases)| aliases.iter().map(|alias| alias.to_string()))
+        .flat_map(|(_, aliases)| aliases.iter().map(ToString::to_string))
         .collect()
 }
 
@@ -892,7 +892,7 @@ fn strip_ext(path: &str) -> &str {
 fn normalize_key(value: &str) -> String {
     value
         .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
+        .filter(char::is_ascii_alphanumeric)
         .flat_map(char::to_lowercase)
         .collect()
 }
@@ -1637,7 +1637,7 @@ epk = "Metadata\Effects\Utility\epks\pack.epk"
         let graph: BTreeMap<String, Vec<String>> = [
             // The target file was never read, but the reference alone counts.
             (root.clone(), vec![mid.clone()]),
-            (mid.clone(), vec![target.clone()]),
+            (mid.clone(), vec![target]),
             (dead.clone(), Vec::new()),
             (loop_a.clone(), vec![loop_b.clone()]),
             (loop_b.clone(), vec![loop_a.clone()]),
@@ -1810,7 +1810,7 @@ epk = "Metadata\Effects\Utility\epks\pack.epk"
     fn merge_entry(display: &str, keys: &[&str], named: bool) -> MonsterEffectCatalogEntry {
         MonsterEffectCatalogEntry {
             display: display.to_string(),
-            monster_keys: keys.iter().map(|key| key.to_string()).collect(),
+            monster_keys: keys.iter().map(ToString::to_string).collect(),
             family: family_of(keys[0]),
             search_aliases: Vec::new(),
             derived_context: Vec::new(),

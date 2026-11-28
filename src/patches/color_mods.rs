@@ -185,11 +185,7 @@ impl ColorMatcher {
         }
         let needles: Vec<Vec<u8>> = colors
             .keys()
-            .map(|id| {
-                id.encode_utf16()
-                    .flat_map(|unit| unit.to_le_bytes())
-                    .collect()
-            })
+            .map(|id| id.encode_utf16().flat_map(u16::to_le_bytes).collect())
             .collect();
         let prefilter = AhoCorasick::new(&needles).ok()?;
         Some(Self { colors, prefilter })
@@ -204,7 +200,7 @@ impl ColorMatcher {
         let mut changed = false;
         let mut state = State::Seeking;
 
-        for line in lines.iter_mut() {
+        for line in &mut lines {
             // A new block resets the state. `no_description` lines never match.
             if line.starts_with("description") {
                 state = State::Header;

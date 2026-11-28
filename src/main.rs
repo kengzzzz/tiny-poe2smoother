@@ -596,8 +596,8 @@ impl GuiApp {
         });
     }
 
-    fn select_game_dir(&mut self, path: PathBuf) {
-        self.game_dir_input = display_path(&path);
+    fn select_game_dir(&mut self, path: &Path) {
+        self.game_dir_input = display_path(path);
         self.spawn_status();
     }
 
@@ -792,7 +792,7 @@ impl GuiApp {
         self.catalog_error = None;
         let (tx, rx) = mpsc::channel();
         self.catalog_task = Some(rx);
-        self.stat_catalog_dir = game_dir.clone();
+        self.stat_catalog_dir.clone_from(&game_dir);
         let busy = CatalogThread::start(&self.catalog_threads);
         thread::spawn(move || {
             let _busy = busy;
@@ -921,7 +921,7 @@ impl GuiApp {
         self.effect_catalog_error = None;
         let (tx, rx) = mpsc::channel();
         self.effect_catalog_task = Some(rx);
-        self.effect_catalog_dir = game_dir.clone();
+        self.effect_catalog_dir.clone_from(&game_dir);
         let busy = CatalogThread::start(&self.catalog_threads);
         thread::spawn(move || {
             let _busy = busy;
@@ -1023,7 +1023,7 @@ impl GuiApp {
 
     fn effective_effect_level(&self, folder: &str) -> EffectLevel {
         // Catalog folders are already lowercase, so the caption's per-folder calls don't allocate.
-        let folder: Cow<str> = if folder.bytes().any(|b| b.is_ascii_uppercase()) {
+        let folder: Cow<'_, str> = if folder.bytes().any(|b| b.is_ascii_uppercase()) {
             Cow::Owned(folder.to_ascii_lowercase())
         } else {
             Cow::Borrowed(folder)
@@ -1044,7 +1044,6 @@ impl GuiApp {
 
     /// Particles alone needs the editor too, since Full scopes protect particles.
     fn effects_editor_accessible(&self) -> bool {
-        use tiny_poe2smoother::patches::PatchId;
         self.selected_patches.contains(&PatchId::Effects)
             || self.selected_patches.contains(&PatchId::Particles)
     }
@@ -1175,7 +1174,7 @@ impl GuiApp {
         self.other_catalog_error = None;
         let (tx, rx) = mpsc::channel();
         self.other_catalog_task = Some(rx);
-        self.other_catalog_dir = game_dir.clone();
+        self.other_catalog_dir.clone_from(&game_dir);
         let busy = CatalogThread::start(&self.catalog_threads);
         thread::spawn(move || {
             let _busy = busy;
@@ -1267,7 +1266,6 @@ impl GuiApp {
             for folder in folders {
                 self.effect_overrides.insert(folder, level);
             }
-            true
         } else {
             if !self.expand_effect_ancestors_for_removal(&folders) {
                 return false;
@@ -1275,8 +1273,8 @@ impl GuiApp {
             for folder in folders {
                 self.effect_overrides.remove(&folder);
             }
-            true
         }
+        true
     }
 
     /// Spans Skills and Others folders, since `supports` can cover both. Returns false
@@ -1388,7 +1386,7 @@ impl GuiApp {
         self.monster_catalog_error = None;
         let (tx, rx) = mpsc::channel();
         self.monster_catalog_task = Some(rx);
-        self.monster_catalog_dir = game_dir.clone();
+        self.monster_catalog_dir.clone_from(&game_dir);
         let busy = CatalogThread::start(&self.catalog_threads);
         thread::spawn(move || {
             let _busy = busy;
@@ -1577,10 +1575,11 @@ fn monster_effect_catalog_rows(entries: Vec<MonsterEffectCatalogEntry>) -> Vec<M
 }
 
 fn hover_key_list(keys: &[String]) -> String {
+    use std::fmt::Write;
     const MAX_HOVER_KEYS: usize = 12;
     let mut hover = keys[..keys.len().min(MAX_HOVER_KEYS)].join("\n");
     if keys.len() > MAX_HOVER_KEYS {
-        hover.push_str(&format!("\n… {} more", keys.len() - MAX_HOVER_KEYS));
+        let _ = write!(hover, "\n… {} more", keys.len() - MAX_HOVER_KEYS);
     }
     hover
 }
@@ -1796,7 +1795,7 @@ mod tests {
             ..GuiApp::default()
         };
 
-        app.select_game_dir(PathBuf::from("custom-install"));
+        app.select_game_dir(Path::new("custom-install"));
         finish_status_task(&mut app);
 
         assert_eq!(app.game_dir_input, "custom-install");
@@ -1820,7 +1819,7 @@ mod tests {
     #[test]
     fn choosing_another_install_drops_lists_from_the_old_one() {
         let mut app = app_with_lists_for("install-a");
-        app.select_game_dir(PathBuf::from("install-b"));
+        app.select_game_dir(Path::new("install-b"));
         assert!(app.effect_catalog.is_none());
         assert!(app.other_catalog.is_none());
         assert!(app.monster_catalog.is_none());
@@ -1888,10 +1887,7 @@ mod tests {
             app.game_dir_input,
             r"D:\SteamLibrary\steamapps\common\Path of Exile 2"
         );
-        assert_eq!(
-            app.selected_patches,
-            [PatchId::Atmosphere].into_iter().collect()
-        );
+        assert_eq!(app.selected_patches, HashSet::from([PatchId::Atmosphere]));
         assert!(app.options.enabled(PatchId::Atmosphere, "fog"));
         assert!(!app.options.enabled(PatchId::Atmosphere, "rain"));
         assert_eq!(app.zoom, 2.4);
@@ -1906,10 +1902,7 @@ mod tests {
             zoom: 2.4,
             ..GuiPrefs::default()
         });
-        assert_eq!(
-            app.selected_patches,
-            [PatchId::Atmosphere].into_iter().collect()
-        );
+        assert_eq!(app.selected_patches, HashSet::from([PatchId::Atmosphere]));
         assert!(app.options.any_enabled(PatchId::Atmosphere));
         assert!(app.options.enabled(PatchId::Atmosphere, "bloom"));
     }
@@ -1967,7 +1960,7 @@ mod tests {
     #[test]
     fn patch_request_rejects_patches_with_every_option_off() {
         let mut app = GuiApp {
-            selected_patches: [PatchId::PostProcess].into_iter().collect(),
+            selected_patches: HashSet::from([PatchId::PostProcess]),
             ..GuiApp::default()
         };
         for key in ["vignette", "depth_of_field", "desaturation"] {
@@ -2297,7 +2290,7 @@ mod tests {
     #[test]
     fn patch_request_embeds_overrides() {
         let mut app = GuiApp {
-            selected_patches: [PatchId::Effects].into_iter().collect(),
+            selected_patches: HashSet::from([PatchId::Effects]),
             ..GuiApp::default()
         };
         // All-Full is left to the apply-side check. The override is embedded verbatim.
@@ -2318,7 +2311,7 @@ mod tests {
     }
 
     fn monster_row(display: &str, keys: &[&str]) -> MonsterCatalogRow {
-        let monster_keys: Vec<String> = keys.iter().map(|key| key.to_string()).collect();
+        let monster_keys: Vec<String> = keys.iter().map(ToString::to_string).collect();
         MonsterCatalogRow {
             hover: Default::default(),
             display_lower: display.to_lowercase(),
@@ -2380,7 +2373,7 @@ mod tests {
     #[test]
     fn patch_request_embeds_monster_overrides() {
         let mut app = GuiApp {
-            selected_patches: [PatchId::Effects].into_iter().collect(),
+            selected_patches: HashSet::from([PatchId::Effects]),
             ..GuiApp::default()
         };
         app.monster_overrides.insert(
@@ -2551,8 +2544,8 @@ mod tests {
             display: display.to_string(),
             monster_keys: vec![key.to_string()],
             family: family.to_string(),
-            search_aliases: aliases.iter().map(|alias| alias.to_string()).collect(),
-            derived_context: context.iter().map(|name| name.to_string()).collect(),
+            search_aliases: aliases.iter().map(ToString::to_string).collect(),
+            derived_context: context.iter().map(ToString::to_string).collect(),
             named,
         }
     }

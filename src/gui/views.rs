@@ -136,7 +136,7 @@ fn draw_install_row(app: &mut GuiApp, ui: &mut egui::Ui) {
         if ui.button("Browse…").clicked()
             && let Some(path) = rfd::FileDialog::new().pick_folder()
         {
-            app.select_game_dir(path);
+            app.select_game_dir(&path);
         }
         if ui
             .button("Detect")
@@ -185,8 +185,7 @@ fn install_summary(status: &AppStatus) -> (String, egui::Color32) {
                 status
                     .backup_owner
                     .as_deref()
-                    .map(display_path)
-                    .unwrap_or_else(|| "another install".to_string())
+                    .map_or_else(|| "another install".to_string(), display_path)
             ),
             palette::WARNING,
         ),
@@ -290,7 +289,7 @@ fn draw_patch(app: &mut GuiApp, ui: &mut egui::Ui, patch: PatchId) {
         PatchId::ColorMods => draw_color_mods_row(app, ui),
         PatchId::Effects => draw_effects_row(app, ui),
         PatchId::Particles if !app.selected_patches.contains(&PatchId::Effects) => {
-            draw_effects_row(app, ui)
+            draw_effects_row(app, ui);
         }
         PatchId::MtxSoft => draw_mtx_row(app, ui),
         _ => {}

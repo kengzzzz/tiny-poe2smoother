@@ -42,6 +42,59 @@ rfd = "0.17.2"
 [build-dependencies]
 cc = { version = "1.10.0", features = ["parallel"] }
 
+[lints.rust]
+non_ascii_idents = "forbid"
+future_incompatible = { level = "deny", priority = -1 }
+keyword_idents = { level = "warn", priority = -1 }
+rust_2018_idioms = { level = "warn", priority = -1 }
+deprecated_in_future = "warn"
+redundant_imports = "warn"
+single_use_lifetimes = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+unused_import_braces = "warn"
+unused_lifetimes = "warn"
+unused_qualifications = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+todo = "warn"
+branches_sharing_code = "warn"
+clone_on_ref_ptr = "warn"
+equatable_if_let = "warn"
+float_cmp_const = "warn"
+iter_on_empty_collections = "warn"
+iter_on_single_items = "warn"
+mem_forget = "warn"
+needless_pass_by_ref_mut = "warn"
+or_fun_call = "warn"
+redundant_clone = "warn"
+significant_drop_in_scrutinee = "warn"
+unnecessary_self_imports = "warn"
+use_self = "warn"
+useless_let_if_seq = "warn"
+verbose_file_reads = "warn"
+assert_is_empty = "allow"
+case_sensitive_file_extension_comparisons = "allow"
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+default_trait_access = "allow"
+doc_markdown = "allow"
+implicit_hasher = "allow"
+items_after_statements = "allow"
+match_same_arms = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+return_self_not_must_use = "allow"
+similar_names = "allow"
+single_match_else = "allow"
+struct_excessive_bools = "allow"
+too_many_lines = "allow"
+unnecessary_wraps = "allow"
+unreadable_literal = "allow"
+
 [profile.dev]
 debug = "line-tables-only"
 

@@ -49,7 +49,7 @@ fn build_ooz() {
             assert_clang_for_lto(&build);
             build.flag("-flto");
         }
-        Ok("none") | Ok("") | Err(_) => {}
+        Ok("none" | "") | Err(_) => {}
         Ok(other) => panic!("OOZ_LTO must be none|thin|full, got {other:?}"),
     }
     for file in [
@@ -95,9 +95,9 @@ fn assert_clang_for_lto(build: &cc::Build) {
     let tool = build.get_compiler();
     assert!(
         tool.is_like_clang(),
-        "OOZ_LTO requires a clang-family compiler (set CXX=clang++); got {:?}. \
+        "OOZ_LTO requires a clang-family compiler (set CXX=clang++); got {}. \
          GCC -flto emits GIMPLE bitcode that lld cannot consume.",
-        tool.path()
+        tool.path().display()
     );
 }
 

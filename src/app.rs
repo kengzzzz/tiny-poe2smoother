@@ -149,10 +149,10 @@ pub fn preview_patches(request: PatchRequest) -> Result<PatchPreview> {
 }
 
 pub fn apply_patches(request: PatchRequest) -> Result<ApplyReport> {
-    apply_patches_with_store(request, BackupStore::from_default_location()?)
+    apply_patches_with_store(request, &BackupStore::from_default_location()?)
 }
 
-fn apply_patches_with_store(request: PatchRequest, backup: BackupStore) -> Result<ApplyReport> {
+fn apply_patches_with_store(request: PatchRequest, backup: &BackupStore) -> Result<ApplyReport> {
     crate::timing!("apply_patches_total");
     let _lock = backup.lock()?;
     let game_dir = resolve_game_dir(request.game_dir)?;
@@ -175,7 +175,7 @@ fn apply_patches_with_store(request: PatchRequest, backup: BackupStore) -> Resul
             repair_hint(store.layout)
         ),
     };
-    ensure_backup_is_for(&backup, &game_dir)?;
+    ensure_backup_is_for(backup, &game_dir)?;
     let patch_state = classify_patch_state(backup.has_backup(), index_is_patched(&index));
     ensure_can_apply(patch_state, backup.path(), store.layout)?;
     if patch_state.has_stale_backup()
@@ -250,7 +250,7 @@ fn apply_patches_with_store(request: PatchRequest, backup: BackupStore) -> Resul
         &mut store,
         &mut index,
         &patch_set.replacements,
-        Some(&backup),
+        Some(backup),
     )
     .map_err(|err| {
         let hint = if backup.has_backup() {
@@ -272,13 +272,13 @@ fn apply_patches_with_store(request: PatchRequest, backup: BackupStore) -> Resul
 pub fn restore_backup(game_dir: Option<PathBuf>) -> Result<RestoreReport> {
     let game_dir = resolve_game_dir(game_dir)?;
     let backup = BackupStore::from_default_location()?;
-    restore_backup_with_store(game_dir, backup)
+    restore_backup_with_store(game_dir, &backup)
 }
 
-fn restore_backup_with_store(game_dir: PathBuf, backup: BackupStore) -> Result<RestoreReport> {
+fn restore_backup_with_store(game_dir: PathBuf, backup: &BackupStore) -> Result<RestoreReport> {
     let _lock = backup.lock()?;
     ensure_game_not_running(&game_dir)?;
-    ensure_backup_is_for(&backup, &game_dir)?;
+    ensure_backup_is_for(backup, &game_dir)?;
     let restored_files = if backup.has_backup() {
         let entries = backup
             .entries()
@@ -316,8 +316,7 @@ fn restore_backup_with_store(game_dir: PathBuf, backup: BackupStore) -> Result<R
             detect_install_layout(&game_dir)?,
             InstallLayout::ContentGgpk
         );
-        let mut restored_ggpk_index = 0;
-        if overlay_restore {
+        let restored_ggpk_index = if overlay_restore {
             let meta = ggpk_backup_meta(&entries)?.ok_or_else(|| {
                 anyhow!(
                     "the backup at {} has no Content.ggpk data, so it can't restore this install.\n  {GGPK_REPAIR}",
@@ -338,8 +337,10 @@ fn restore_backup_with_store(game_dir: PathBuf, backup: BackupStore) -> Result<R
                 anyhow!("failed to restore {index_display_path}.\n  Cause: {err:#}")
             })?;
             store.remove_legacy_overlay_files()?;
-            restored_ggpk_index = 1;
-        }
+            1
+        } else {
+            0
+        };
         restored_ggpk_index
             + backup
                 .restore(&entries, &game_dir, overlay_restore)
@@ -622,7 +623,6 @@ pub fn inspect_path(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backup::BackupStore;
     use crate::bundle::pack_uncompressed_bundle;
     use std::fs;
 
@@ -654,7 +654,7 @@ mod tests {
             )
             .unwrap();
 
-        let report = restore_backup_with_store(game, backup.clone()).unwrap();
+        let report = restore_backup_with_store(game, &backup).unwrap();
 
         assert_eq!(report.restored_files, 0);
         assert!(report.backup_removed);
@@ -674,7 +674,7 @@ mod tests {
                 patches: vec![PatchId::Shadow],
                 params: PatchParams::default(),
             };
-            let report = apply_patches_with_store(request.clone(), backup.clone()).unwrap();
+            let report = apply_patches_with_store(request.clone(), &backup).unwrap();
             assert_eq!(report.changed_files, 1);
             assert!(backup.has_backup());
             {
@@ -687,9 +687,9 @@ mod tests {
                     "{\"shadows_enabled\": false}"
                 );
             }
-            assert!(apply_patches_with_store(request, backup.clone()).is_err());
+            assert!(apply_patches_with_store(request, &backup).is_err());
 
-            let restored = restore_backup_with_store(game.clone(), backup.clone()).unwrap();
+            let restored = restore_backup_with_store(game.clone(), &backup).unwrap();
             assert_eq!(restored.restored_files, 1);
             assert!(restored.backup_removed);
             assert!(!backup.has_backup());
@@ -762,7 +762,7 @@ mod tests {
                 params: PatchParams::default(),
             };
 
-            let err = apply_patches_with_store(request, backup.clone()).unwrap_err();
+            let err = apply_patches_with_store(request, &backup).unwrap_err();
 
             #[allow(clippy::permissions_set_readonly_false)]
             permissions.set_readonly(false);
@@ -798,7 +798,7 @@ mod tests {
             .unwrap();
         assert!(backup.entries().unwrap().is_empty());
 
-        let report = restore_backup_with_store(game, backup.clone()).unwrap();
+        let report = restore_backup_with_store(game, &backup).unwrap();
 
         assert!(report.backup_removed);
         assert!(!backup.has_backup());
@@ -816,12 +816,12 @@ mod tests {
         fs::set_permissions(&generated, fs::Permissions::from_mode(0o555)).unwrap();
         let backup = BackupStore::for_path(temp.path().join("poe2.bak"));
         let request = PatchRequest {
-            game_dir: Some(game.clone()),
+            game_dir: Some(game),
             patches: vec![PatchId::Shadow],
             params: PatchParams::default(),
         };
 
-        let err = apply_patches_with_store(request, backup.clone()).unwrap_err();
+        let err = apply_patches_with_store(request, &backup).unwrap_err();
 
         assert!(
             format!("{err:#}").contains("Nothing was changed"),
@@ -848,7 +848,7 @@ mod tests {
             params: PatchParams::default(),
         };
 
-        let err = apply_patches_with_store(request, backup.clone()).unwrap_err();
+        let err = apply_patches_with_store(request, &backup).unwrap_err();
 
         fs::set_permissions(&bundles2, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
@@ -856,7 +856,7 @@ mod tests {
             "{err:#}"
         );
         assert!(backup.has_backup());
-        restore_backup_with_store(game.clone(), backup.clone()).unwrap();
+        restore_backup_with_store(game, &backup).unwrap();
         assert!(!bundles2.join("TinyPoe2Smoother").exists());
         assert!(!backup.has_backup());
     }
@@ -899,13 +899,13 @@ mod tests {
             params: PatchParams::default(),
         };
         assert!(
-            apply_patches_with_store(request, backup.clone())
+            apply_patches_with_store(request, &backup)
                 .unwrap_err()
                 .to_string()
                 .contains("Another Apply or Restore")
         );
         assert!(
-            restore_backup_with_store(game.clone(), backup.clone())
+            restore_backup_with_store(game.clone(), &backup)
                 .unwrap_err()
                 .to_string()
                 .contains("Another Apply or Restore")
@@ -947,7 +947,7 @@ mod tests {
         let backup = BackupStore::for_path(temp.path().join("poe2.bak"));
         backup.ensure_ggpk_backup_meta(&game, meta).unwrap();
 
-        let report = restore_backup_with_store(game.clone(), backup.clone()).unwrap();
+        let report = restore_backup_with_store(game.clone(), &backup).unwrap();
 
         assert_eq!(report.restored_files, 1);
         assert!(report.backup_removed);
@@ -982,7 +982,7 @@ mod tests {
 
     fn assert_restore_refused(game: &Path, backup: &BackupStore) {
         let before = fs::read(game.join("Content.ggpk")).unwrap();
-        let err = restore_backup_with_store(game.to_path_buf(), backup.clone()).unwrap_err();
+        let err = restore_backup_with_store(game.to_path_buf(), backup).unwrap_err();
         assert!(format!("{err:#}").contains("PackCheck"), "{err:#}");
         assert!(backup.has_backup());
         assert_eq!(fs::read(game.join("Content.ggpk")).unwrap(), before);
@@ -1046,7 +1046,7 @@ mod tests {
         let mut raw = 1u32.to_le_bytes().to_vec();
         raw.extend_from_slice(&3u32.to_le_bytes());
         raw.extend_from_slice(b"foo");
-        let damaged = crate::bundle::pack_uncompressed_bundle(&raw).unwrap();
+        let damaged = pack_uncompressed_bundle(&raw).unwrap();
         let temp = tempfile::tempdir().unwrap();
         let (game, backup, _) = patched_test_ggpk(temp.path(), &damaged);
 
@@ -1196,7 +1196,7 @@ mod tests {
             )
             .unwrap();
 
-        let report = restore_backup_with_store(game, backup.clone()).unwrap();
+        let report = restore_backup_with_store(game, &backup).unwrap();
         assert!(report.backup_removed);
         assert!(!leftover.exists());
         assert!(!backup.has_backup());
@@ -1253,7 +1253,7 @@ mod tests {
             )
             .unwrap();
 
-        let err = restore_backup_with_store(b.clone(), backup.clone()).unwrap_err();
+        let err = restore_backup_with_store(b.clone(), &backup).unwrap_err();
         assert!(
             err.to_string().contains("belongs to another install"),
             "{err}"
@@ -1261,7 +1261,7 @@ mod tests {
         assert!(backup.has_backup());
 
         fs::remove_dir_all(&a).unwrap();
-        let report = restore_backup_with_store(b, backup.clone()).unwrap();
+        let report = restore_backup_with_store(b, &backup).unwrap();
         assert!(report.backup_removed);
         assert!(!backup.has_backup());
     }

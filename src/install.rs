@@ -118,7 +118,7 @@ pub fn is_game_running(game_dir: Option<&Path>) -> bool {
         if !ours.insert(pid) {
             break;
         }
-        next = system.process(pid).and_then(|process| process.parent());
+        next = system.process(pid).and_then(sysinfo::Process::parent);
     }
     system.processes().iter().any(|(pid, process)| {
         if ours.contains(pid) || process.thread_kind().is_some() {
@@ -352,14 +352,14 @@ fn registry_steam_roots() -> Vec<PathBuf> {
                 RRF_RT_REG_SZ | flags,
                 std::ptr::null_mut(),
                 buf.as_mut_ptr().cast(),
-                &mut bytes,
+                &raw mut bytes,
             )
         };
         if status != 0 {
             return None;
         }
         let len = (bytes as usize / 2).saturating_sub(1);
-        let path = PathBuf::from(std::ffi::OsString::from_wide(&buf[..len]));
+        let path = PathBuf::from(OsString::from_wide(&buf[..len]));
         (!path.as_os_str().is_empty()).then_some(path)
     }
 
@@ -387,14 +387,14 @@ fn standalone_candidates() -> Vec<PathBuf> {
             push_standalone_candidates_from_program_files(
                 &mut out,
                 &mut seen,
-                PathBuf::from(program_files_x86),
+                Path::new(&program_files_x86),
             );
         }
         if let Some(program_files) = std::env::var_os("ProgramFiles") {
             push_standalone_candidates_from_program_files(
                 &mut out,
                 &mut seen,
-                PathBuf::from(program_files),
+                Path::new(&program_files),
             );
         }
     }
@@ -402,24 +402,24 @@ fn standalone_candidates() -> Vec<PathBuf> {
     #[cfg(not(target_os = "windows"))]
     {
         if let Some(prefix) = std::env::var_os("WINEPREFIX") {
-            push_wine_standalone_candidates(&mut out, &mut seen, PathBuf::from(prefix));
+            push_wine_standalone_candidates(&mut out, &mut seen, Path::new(&prefix));
         }
         if let Some(home) = dirs::home_dir() {
-            push_wine_standalone_candidates(&mut out, &mut seen, home.join(".wine"));
+            push_wine_standalone_candidates(&mut out, &mut seen, &home.join(".wine"));
             if let Some(user) = home.file_name().and_then(|name| name.to_str()) {
                 push_mounted_windows_standalone_candidates(
                     &mut out,
                     &mut seen,
-                    PathBuf::from("/run/media").join(user),
+                    &Path::new("/run/media").join(user),
                 );
                 push_mounted_windows_standalone_candidates(
                     &mut out,
                     &mut seen,
-                    PathBuf::from("/media").join(user),
+                    &Path::new("/media").join(user),
                 );
             }
         }
-        push_mounted_windows_standalone_candidates(&mut out, &mut seen, PathBuf::from("/mnt"));
+        push_mounted_windows_standalone_candidates(&mut out, &mut seen, Path::new("/mnt"));
     }
 
     out
@@ -429,13 +429,13 @@ fn standalone_candidates() -> Vec<PathBuf> {
 fn push_wine_standalone_candidates(
     out: &mut Vec<PathBuf>,
     seen: &mut HashSet<PathBuf>,
-    prefix: PathBuf,
+    prefix: &Path,
 ) {
     for program_dir in ["Program Files (x86)", "Program Files"] {
         push_standalone_candidates_from_program_files(
             out,
             seen,
-            prefix.join("drive_c").join(program_dir),
+            &prefix.join("drive_c").join(program_dir),
         );
     }
 }
@@ -444,11 +444,11 @@ fn push_wine_standalone_candidates(
 fn push_mounted_windows_standalone_candidates(
     out: &mut Vec<PathBuf>,
     seen: &mut HashSet<PathBuf>,
-    mount_root: PathBuf,
+    mount_root: &Path,
 ) {
-    push_mounted_windows_drive_candidates(out, seen, &mount_root);
+    push_mounted_windows_drive_candidates(out, seen, mount_root);
 
-    let Ok(entries) = std::fs::read_dir(&mount_root) else {
+    let Ok(entries) = std::fs::read_dir(mount_root) else {
         return;
     };
     for entry in entries.flatten() {
@@ -463,14 +463,14 @@ fn push_mounted_windows_drive_candidates(
     drive_root: &Path,
 ) {
     for program_dir in ["Program Files (x86)", "Program Files"] {
-        push_standalone_candidates_from_program_files(out, seen, drive_root.join(program_dir));
+        push_standalone_candidates_from_program_files(out, seen, &drive_root.join(program_dir));
     }
 }
 
 fn push_standalone_candidates_from_program_files(
     out: &mut Vec<PathBuf>,
     seen: &mut HashSet<PathBuf>,
-    program_files: PathBuf,
+    program_files: &Path,
 ) {
     let ggg_dir = program_files.join("Grinding Gear Games");
     for dir in STANDALONE_DIRS {
@@ -688,7 +688,7 @@ mod tests {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
 
-        push_standalone_candidates_from_program_files(&mut out, &mut seen, program_files);
+        push_standalone_candidates_from_program_files(&mut out, &mut seen, &program_files);
 
         assert!(out.contains(&expected));
     }
@@ -705,7 +705,7 @@ mod tests {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
 
-        push_standalone_candidates_from_program_files(&mut out, &mut seen, program_files);
+        push_standalone_candidates_from_program_files(&mut out, &mut seen, &program_files);
 
         assert!(out.contains(&game));
     }
@@ -722,7 +722,7 @@ mod tests {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
 
-        push_standalone_candidates_from_program_files(&mut out, &mut seen, program_files);
+        push_standalone_candidates_from_program_files(&mut out, &mut seen, &program_files);
 
         assert!(!out.contains(&similar));
     }
@@ -739,7 +739,7 @@ mod tests {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
 
-        push_standalone_candidates_from_program_files(&mut out, &mut seen, program_files);
+        push_standalone_candidates_from_program_files(&mut out, &mut seen, &program_files);
 
         assert!(!out.contains(&similar));
     }
@@ -766,7 +766,7 @@ mod tests {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
 
-        push_standalone_candidates_from_program_files(&mut out, &mut seen, program_files);
+        push_standalone_candidates_from_program_files(&mut out, &mut seen, &program_files);
 
         assert!(!out.contains(&unrelated));
     }
@@ -783,7 +783,7 @@ mod tests {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
 
-        push_standalone_candidates_from_program_files(&mut out, &mut seen, program_files);
+        push_standalone_candidates_from_program_files(&mut out, &mut seen, &program_files);
 
         assert_eq!(out.iter().filter(|path| *path == &game).count(), 1);
     }
@@ -802,7 +802,7 @@ mod tests {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
 
-        push_mounted_windows_standalone_candidates(&mut out, &mut seen, temp.path().to_path_buf());
+        push_mounted_windows_standalone_candidates(&mut out, &mut seen, temp.path());
 
         assert!(out.contains(&game));
     }
@@ -947,7 +947,7 @@ mod tests {
             .iter()
             .map(|program| program.name.as_str())
             .collect();
-        names.sort();
+        names.sort_unstable();
         assert_eq!(names, ["client.exe", "pathofexile.exe"]);
         let ours = game
             .programs

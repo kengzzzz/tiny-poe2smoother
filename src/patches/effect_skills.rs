@@ -29,7 +29,7 @@ impl<'de> Deserialize<'de> for EffectLevel {
 
 struct EffectLevelVisitor;
 
-impl<'de> Visitor<'de> for EffectLevelVisitor {
+impl Visitor<'_> for EffectLevelVisitor {
     type Value = EffectLevel;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -649,14 +649,11 @@ fn same_display_tiebreak_key<'a>(
     } else {
         2
     };
-    let variant_penalty = if candidate.active_skill_id.starts_with("new_")
-        || candidate.active_skill_id.ends_with("_new")
-        || candidate.active_skill_id.contains("_new_")
-    {
-        1
-    } else {
-        0
-    };
+    let variant_penalty = u8::from(
+        candidate.active_skill_id.starts_with("new_")
+            || candidate.active_skill_id.ends_with("_new")
+            || candidate.active_skill_id.contains("_new_"),
+    );
     (
         folder_relation,
         variant_penalty,
@@ -738,7 +735,7 @@ fn effect_folder_from_metadata_path(path: &str) -> Option<String> {
 
 fn normalize_label_key(s: &str) -> String {
     s.chars()
-        .filter(|c| c.is_ascii_alphanumeric())
+        .filter(char::is_ascii_alphanumeric)
         .flat_map(char::to_lowercase)
         .collect()
 }
@@ -1041,7 +1038,7 @@ mod tests {
     }
 
     fn effect_paths(paths: &[&str]) -> Vec<String> {
-        paths.iter().map(|path| path.to_string()).collect()
+        paths.iter().map(ToString::to_string).collect()
     }
 
     fn row<'a>(

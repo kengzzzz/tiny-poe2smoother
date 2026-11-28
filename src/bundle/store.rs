@@ -15,7 +15,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use rayon::prelude::*;
 use std::collections::HashMap;
-use std::convert::TryFrom;
 use std::fs;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -119,22 +118,16 @@ fn retire_legacy_caches_with(
     };
     let mut complete = true;
     for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => {
-                complete = false;
-                continue;
-            }
+        let Ok(entry) = entry else {
+            complete = false;
+            continue;
         };
         if !is_legacy_cache_name(&entry.file_name()) {
             continue;
         }
-        let file_type = match entry.file_type() {
-            Ok(file_type) => file_type,
-            Err(_) => {
-                complete = false;
-                continue;
-            }
+        let Ok(file_type) = entry.file_type() else {
+            complete = false;
+            continue;
         };
         if !file_type.is_file() {
             continue;
@@ -481,16 +474,17 @@ impl BundleStore {
         let Some((size, mtime)) = self.source_meta()? else {
             return Ok(None);
         };
-        let mut index_record = None;
-        if matches!(self.layout, InstallLayout::ContentGgpk)
+        let index_record = if matches!(self.layout, InstallLayout::ContentGgpk)
             && let Some(ggpk) = self.ggpk.as_deref()
         {
-            index_record = ggpk_find_file(ggpk, "Bundles2/_.index.bin")?.map(|span| IndexRecord {
+            ggpk_find_file(ggpk, "Bundles2/_.index.bin")?.map(|span| IndexRecord {
                 begin: span.begin as u64,
                 len: span.len as u64,
                 digest: span.digest,
-            });
-        }
+            })
+        } else {
+            None
+        };
         Ok(Some(CacheKey {
             source: self.cache_source.clone(),
             size,
@@ -630,7 +624,7 @@ impl BundleStore {
             }
             None => {
                 let index = Arc::new(self.rebuild_index(Some(&key))?);
-                if let Some(job) = self.cache_write(index.clone(), &key) {
+                if let Some(job) = self.cache_write(Arc::clone(&index), &key) {
                     job.spawn();
                 }
                 index
@@ -1376,7 +1370,7 @@ pub(crate) mod tests {
         let handles: Vec<_> = (0..8)
             .map(|_| {
                 let mut store = store.clone();
-                let barrier = barrier.clone();
+                let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     barrier.wait();
                     store.open_shared_index().unwrap()
@@ -1653,11 +1647,11 @@ pub(crate) mod tests {
         let current = cache_dir.join("index-cache-v3-0123456789abcdef.bin");
         fs::write(&legacy, b"legacy").unwrap();
         fs::write(&current, b"current").unwrap();
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let barrier = Arc::new(std::sync::Barrier::new(8));
         let handles: Vec<_> = (0..8)
             .map(|_| {
                 let cache_dir = cache_dir.clone();
-                let barrier = barrier.clone();
+                let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     barrier.wait();
                     retire_legacy_caches(&cache_dir);
@@ -1689,7 +1683,7 @@ pub(crate) mod tests {
 
         let direct = BundleStore::new_with_cache_dir(game.clone(), cache_dir.clone());
         let verbatim = BundleStore::new_with_cache_dir(canonical.clone(), cache_dir.clone());
-        let alternate_store = BundleStore::new_with_cache_dir(alternate.clone(), cache_dir.clone());
+        let alternate_store = BundleStore::new_with_cache_dir(alternate.clone(), cache_dir);
 
         assert_eq!(direct.game_dir, game);
         assert_eq!(verbatim.game_dir, canonical);
@@ -1945,7 +1939,7 @@ pub(crate) mod tests {
         assert_eq!(fs::metadata(&content).unwrap().len(), original_len);
         assert!(!half_restored.trim_restored_ggpk_tail(meta).unwrap());
 
-        let partial = (meta.appended_start + meta.appended_end) / 2;
+        let partial = u64::midpoint(meta.appended_start, meta.appended_end);
         let file = fs::OpenOptions::new().write(true).open(&content).unwrap();
         file.set_len(partial).unwrap();
         drop(file);

@@ -853,17 +853,17 @@ mod tests {
             draw_effects_skills_tab(&mut app, ui);
         })
         .drop_without_applying_deltas();
-        assert_eq!(ctx.data(|d| d.count::<TextEditState>()), 1);
+        assert_eq!(ctx.data(egui::util::IdTypeMap::count::<TextEditState>), 1);
         ctx.run_ui(egui::RawInput::default(), |ui| {
             draw_effects_others_tab(&mut app, ui);
         })
         .drop_without_applying_deltas();
-        assert_eq!(ctx.data(|d| d.count::<TextEditState>()), 2);
+        assert_eq!(ctx.data(egui::util::IdTypeMap::count::<TextEditState>), 2);
         ctx.run_ui(egui::RawInput::default(), |ui| {
             draw_effects_monsters_tab(&mut app, ui);
         })
         .drop_without_applying_deltas();
-        assert_eq!(ctx.data(|d| d.count::<TextEditState>()), 3);
+        assert_eq!(ctx.data(egui::util::IdTypeMap::count::<TextEditState>), 3);
     }
 
     #[test]
@@ -928,7 +928,7 @@ mod tests {
     }
 
     fn monster_row(display: &str, keys: &[&str], named: bool) -> crate::MonsterCatalogRow {
-        let monster_keys: Vec<String> = keys.iter().map(|key| key.to_string()).collect();
+        let monster_keys: Vec<String> = keys.iter().map(ToString::to_string).collect();
         crate::MonsterCatalogRow {
             hover: Default::default(),
             display_lower: display.to_lowercase(),

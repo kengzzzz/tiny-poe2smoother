@@ -108,7 +108,7 @@ pub(super) fn remove_function_calls(data: &str, func: &str) -> String {
             end += 1;
         }
         if depth == 0 && end < data.len() && data.as_bytes()[end] == b';' {
-            data.replace_range(start..end + 1, "");
+            data.replace_range(start..=end, "");
             pos = start;
         } else {
             pos = found + 1;
@@ -254,14 +254,14 @@ pub(super) fn strip_client_blocks(data: &str, keep: &HashSet<&str>) -> String {
         };
         result.push_str(&body[pos..name_start]);
         if keep.contains(name.as_str()) {
-            result.push_str(&body[name_start..close + 1]);
+            result.push_str(&body[name_start..=close]);
         }
         pos = close + 1;
     }
     result.push_str(&body[pos..]);
     format!(
         "{}{}{}",
-        &data[..client_open + 1],
+        &data[..=client_open],
         result,
         &data[client_close..]
     )
@@ -279,7 +279,7 @@ pub(super) fn empty_named_blocks(data: &str, names: &HashSet<&str>) -> String {
         if names.contains(name.as_str()) && !out[open + 1..close].trim().is_empty() {
             let replacement = format!("{name} {{}}");
             let advance = name_start + replacement.len();
-            out.replace_range(name_start..close + 1, &replacement);
+            out.replace_range(name_start..=close, &replacement);
             // Skip past the emptied block so it never matches again.
             pos = advance;
         } else {
@@ -305,7 +305,7 @@ mod tests {
     fn effects_keeps_selected_client_blocks() {
         let input =
             "version 3\nclient\n{\n  AnimatedRender\n  {\n  }\n  ParticleEffects\n  {\n  }\n}";
-        let keep = ["AnimatedRender"].into_iter().collect();
+        let keep = HashSet::from(["AnimatedRender"]);
         let out = strip_client_blocks(input, &keep);
         assert!(out.contains("AnimatedRender"));
         assert!(!out.contains("ParticleEffects"));

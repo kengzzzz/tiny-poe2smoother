@@ -133,7 +133,7 @@ fn collect_patch_targets(
         if patch_targets.is_empty() {
             let full_filter_removed_all_effects =
                 matches!(patch, PatchId::Effects | PatchId::Particles)
-                    && effects.is_some_and(|f| f.has_full())
+                    && effects.is_some_and(EffectsFilter::has_full)
                     && index.paths().iter().any(|path| {
                         patch_targets_path(patch, path) && index.file_by_path(path).is_some()
                     });
@@ -259,10 +259,7 @@ mod tests {
 
         assert_eq!(patch_set.changes.len(), 1);
         assert_eq!(
-            patch_set
-                .replacements
-                .get("env.bundle.bin")
-                .map(|entries| entries.len()),
+            patch_set.replacements.get("env.bundle.bin").map(Vec::len),
             Some(1)
         );
     }

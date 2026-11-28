@@ -3,7 +3,6 @@ use super::hashing::{HashMode, hash_path};
 use anyhow::{Context, Result, anyhow, bail};
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt, WriteBytesExt};
 use rayon::prelude::*;
-use std::convert::TryFrom;
 use std::io::Cursor;
 
 const FILE_RECORD_SIZE: usize = 20;

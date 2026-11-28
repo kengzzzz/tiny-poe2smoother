@@ -84,7 +84,7 @@ fn ggpk_find_pdir_record(
     let mut cursor = Cursor::new(ggpk.mmap.as_ref());
     cursor.set_position(offset);
 
-    let record_size = cursor.read_u32::<LittleEndian>()? as u64;
+    let record_size = u64::from(cursor.read_u32::<LittleEndian>()?);
     let record_tag = read_ggpk_record_tag(&mut cursor)?;
     let result = (|| match record_tag.as_str() {
         "GGPK" => {
@@ -461,7 +461,7 @@ fn ggpk_find_record(
     let mut cursor = Cursor::new(ggpk.mmap.as_ref());
     cursor.set_position(offset);
 
-    let record_size = cursor.read_u32::<LittleEndian>()? as u64;
+    let record_size = u64::from(cursor.read_u32::<LittleEndian>()?);
     let record_tag = read_ggpk_record_tag(&mut cursor)?;
     let result = (|| match record_tag.as_str() {
         "GGPK" => {
@@ -549,7 +549,7 @@ fn read_ggpk_string(cursor: &mut Cursor<&[u8]>, utf32: bool) -> Result<String> {
             if value == 0 {
                 break;
             }
-            chars.push(std::char::from_u32(value).ok_or_else(|| {
+            chars.push(char::from_u32(value).ok_or_else(|| {
                 anyhow!("GGPK path contains invalid UTF-32 scalar value {value:#x}")
             })?);
         }

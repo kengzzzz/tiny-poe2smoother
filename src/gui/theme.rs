@@ -80,7 +80,10 @@ pub fn install_fonts(ctx: &egui::Context) {
 }
 
 pub fn install_style(ctx: &egui::Context) {
-    use palette::*;
+    use palette::{
+        ACCENT, ACCENT_ACTIVE, BG_ACTIVE, BG_APP, BG_CARD, BG_ELEVATED, BORDER, BORDER_FAINT, TEXT,
+        TEXT_FAINT,
+    };
 
     // Otherwise egui follows the OS theme and uses its stock light style.
     ctx.set_theme(egui::Theme::Dark);
